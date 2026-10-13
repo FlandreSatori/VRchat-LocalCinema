@@ -1,0 +1,47 @@
+[package]
+name = "vrchat-localcinema"
+version = "1.0.0"
+description = "VRchat-LocalCinema - local media library with HTTP sharing"
+authors = ["you"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# 生产构建必需：未启用时 tauri 处于 dev 模式，webview 会加载 devUrl (localhost:1420)
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-autostart = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["limit"] }
+http-range-header = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+mime_guess = "2"
+network-interface = "2"
+percent-encoding = "2"
+opener = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
