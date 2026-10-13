@@ -33,13 +33,33 @@ pub fn resolve_tool(configured: &str, default_name: &str) -> Option<PathBuf> {
     which(default_name)
 }
 
-fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+pub(crate) fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     cmd
+}
+
+/// 用 ffprobe 获取完整媒体流参数（JSON），用于兼容性判定与视频信息展示
+pub async fn probe_media_json(ffprobe: &Path, file: &Path) -> AppResult<serde_json::Value> {
+    let output = run_with_timeout(
+        ffprobe,
+        &[
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ],
+        file,
+        Duration::from_secs(30),
+    )
+    .await?;
+    serde_json::from_slice(&output)
+        .map_err(|e| AppError::Msg(format!("解析 ffprobe 输出失败: {}", e)))
 }
 
 /// 用 ffprobe 获取视频时长（毫秒）

@@ -56,6 +56,87 @@ fn default_port() -> u16 {
     17001
 }
 
+fn default_easytier_protocols() -> Vec<String> {
+    vec!["tcp".to_string(), "ws".to_string()]
+}
+
+fn default_room_name() -> String {
+    "VRchat".to_string()
+}
+
+fn default_room_password() -> String {
+    "123".to_string()
+}
+
+fn default_easytier_listen_port() -> u16 {
+    11010
+}
+
+/// EasyTier 组网配置，对应 easytier-core 的命令行参数
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct EasytierConfig {
+    /// 启用的协议类型：tcp / udp / ws / wss / quic
+    pub protocols: Vec<String>,
+    /// 中转服务器（对等节点）地址，为空表示仅监听
+    pub peer_url: String,
+    /// 房间名，对应 --network-name
+    pub room_name: String,
+    /// 房间密码，对应 --network-secret
+    pub room_password: String,
+    /// 成员名，对应 --hostname
+    pub member_name: String,
+    /// 虚拟 IPv4，对应 --ipv4（DHCP 开启时忽略）
+    pub ipv4: String,
+    /// 虚拟 IPv6，对应 --ipv6
+    pub ipv6: String,
+    /// 自动分配虚拟 IP（DHCP），对应 -d
+    pub dhcp: bool,
+    /// KCP 代理，对应 --enable-kcp-proxy
+    pub kcp_proxy: bool,
+    /// 禁用 KCP 输入，对应 --disable-kcp-input
+    pub kcp_input: bool,
+    /// QUIC 代理，对应 --enable-quic-proxy
+    pub quic_proxy: bool,
+    /// 禁用 QUIC 输入，对应 --disable-quic-input
+    pub quic_input: bool,
+    /// 低延迟模式，对应 --latency-first
+    pub latency_first: bool,
+    /// 传输数据压缩算法：none / zstd，对应 --compression
+    pub compression: String,
+    /// UPnP / NAT 打洞，关闭时禁用 UDP 打洞
+    pub upnp: bool,
+    /// 多线程，对应 --multi-thread
+    pub multi_thread: bool,
+    /// 监听起始端口
+    pub listen_port: u16,
+}
+
+impl Default for EasytierConfig {
+    fn default() -> Self {
+        Self {
+            protocols: default_easytier_protocols(),
+            peer_url: String::new(),
+            room_name: default_room_name(),
+            room_password: default_room_password(),
+            member_name: String::new(),
+            ipv4: String::new(),
+            ipv6: String::new(),
+            // 对齐 EasytierGame：DHCP 与 KCP 代理默认开启
+            dhcp: true,
+            kcp_proxy: true,
+            quic_proxy: false,
+            kcp_input: false,
+            quic_input: false,
+            latency_first: false,
+            compression: "none".to_string(),
+            upnp: true,
+            multi_thread: true,
+            listen_port: default_easytier_listen_port(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +149,9 @@ pub struct Settings {
     pub default_url_mode: UrlMode,
     /// 手动输入的 EasyTier 虚拟 IPv4
     pub easytier_ip: String,
+    /// 手动指定的局域网网卡 IP；空表示自动（EasyTier 运行时优先虚拟 IP，其次物理网卡）
+    #[serde(default)]
+    pub lan_adapter_ip: String,
     /// 默认外部播放器路径，空表示未设置
     pub default_player_path: String,
     /// 播放器附加参数模板，{path} 会被替换为文件路径；为空则仅传文件路径
@@ -79,6 +163,14 @@ pub struct Settings {
     /// 外部 ffmpeg/ffprobe 路径，空表示自动从 PATH 查找
     pub ffmpeg_path: String,
     pub ffprobe_path: String,
+    /// easytier-core 路径，空表示自动检测（内置优先，其次系统 PATH）
+    pub easytier_core_path: String,
+    /// easytier-cli 路径，空表示自动检测（内置优先，其次系统 PATH）
+    pub easytier_cli_path: String,
+    /// 从对等节点下载的媒体存放目录，空表示 data_dir/downloads
+    pub download_dir: String,
+    /// EasyTier 组网配置
+    pub easytier: EasytierConfig,
 }
 
 impl Default for Settings {
@@ -89,6 +181,7 @@ impl Default for Settings {
             port: default_port(),
             default_url_mode: UrlMode::Localhost,
             easytier_ip: String::new(),
+            lan_adapter_ip: String::new(),
             default_player_path: String::new(),
             default_player_args: String::new(),
             thumb_dir: String::new(),
@@ -96,6 +189,10 @@ impl Default for Settings {
             close_behavior: CloseBehavior::Exit,
             ffmpeg_path: String::new(),
             ffprobe_path: String::new(),
+            easytier_core_path: String::new(),
+            easytier_cli_path: String::new(),
+            download_dir: String::new(),
+            easytier: EasytierConfig::default(),
         }
     }
 }
@@ -150,6 +247,12 @@ pub struct AppPaths {
     pub log_dir: PathBuf,
     pub settings_file: PathBuf,
     pub db_file: PathBuf,
+    /// 随发布包分发的内置组件目录（exe 同级 components）
+    pub bundled_dir: PathBuf,
+    /// 可写的内置组件安装目录（data_dir/components），自动下载的组件安装到这里
+    pub components_dir: PathBuf,
+    /// 默认的对等节点媒体下载目录
+    pub download_dir: PathBuf,
     pub portable: bool,
 }
 
@@ -178,6 +281,9 @@ pub fn resolve_paths(exe_path: &Path) -> AppPaths {
         log_dir: data_dir.join("logs"),
         settings_file: data_dir.join("settings.json"),
         db_file: data_dir.join("library.db"),
+        bundled_dir: exe_dir.join("components"),
+        components_dir: data_dir.join("components"),
+        download_dir: data_dir.join("downloads"),
         data_dir,
         portable,
     }

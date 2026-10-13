@@ -1,4 +1,8 @@
 pub mod commands;
+pub mod compat;
+pub mod components;
+pub mod convert_queue;
+pub mod easytier;
 pub mod error;
 pub mod external_player;
 pub mod http_server;
@@ -67,7 +71,8 @@ pub fn run() {
             } else {
                 std::path::PathBuf::from(settings_fixed.thumb_dir.trim())
             };
-            let server = HttpServer::new(db.clone(), &thumb_dir);
+            let hls_dir = paths.data_dir.join("hls");
+            let server = HttpServer::new(db.clone(), &thumb_dir, &hls_dir);
 
             let state = AppState {
                 paths: paths.clone(),
@@ -75,8 +80,14 @@ pub fn run() {
                 db,
                 server: server.clone(),
                 recent_logs,
+                easytier: easytier::EasytierManager::new(),
+                convert_queue: convert_queue::ConvertQueue::default(),
+                hls_jobs: RwLock::new(std::collections::HashSet::new()),
             };
             app.manage(state);
+
+            // 转码队列执行器
+            commands::spawn_convert_worker(app.handle().clone());
 
             // 自动启动 HTTP 服务
             let handle = app.handle().clone();
@@ -108,8 +119,9 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
-                    // 退出前停止 HTTP 服务
+                    // 退出前停止 HTTP 服务与组网进程
                     state.server.stop();
+                    state.easytier.stop();
                 }
             }
         })
@@ -137,7 +149,39 @@ pub fn run() {
             commands::get_app_paths,
             commands::open_data_dir,
             commands::clear_thumbnail_cache,
+            commands::get_convert_cache_info,
+            commands::open_convert_dir,
+            commands::clear_convert_cache,
             commands::get_close_behavior,
+            commands::get_components_status,
+            commands::download_component,
+            commands::open_component_page,
+            commands::get_easytier_status,
+            commands::start_easytier,
+            commands::stop_easytier,
+            commands::get_room_info,
+            commands::reset_network_adapter,
+            commands::fetch_peer_media,
+            commands::download_peer_media,
+            commands::transcode_media,
+            commands::transcode_output_exists,
+            commands::segment_transcode,
+            commands::list_segments,
+            commands::list_convert_tasks,
+            commands::convert_task_start,
+            commands::convert_task_cancel,
+            commands::convert_task_remove,
+            commands::convert_task_clear,
+            // HLS 边转边播已停用（容易出现 Live 进度条/音画不同步等问题），改为分段转码
+            // commands::make_hls,
+            // commands::get_hls_status,
+            // commands::build_hls_url,
+            commands::list_folders,
+            commands::create_folder,
+            commands::rename_folder,
+            commands::delete_folder,
+            commands::rename_media,
+            commands::move_media,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -161,6 +205,7 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => {
                 let state = app.state::<AppState>();
                 state.server.stop();
+                state.easytier.stop();
                 app.exit(0);
             }
             _ => {}

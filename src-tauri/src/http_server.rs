@@ -32,6 +32,7 @@ pub struct ServerStatus {
 struct MediaState {
     db: Arc<Mutex<Db>>,
     thumb_dir: PathBuf,
+    hls_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -42,7 +43,7 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    pub fn new(db: Arc<Mutex<Db>>, thumb_dir: &Path) -> Self {
+    pub fn new(db: Arc<Mutex<Db>>, thumb_dir: &Path, hls_dir: &Path) -> Self {
         Self {
             status: Arc::new(RwLock::new(ServerStatus {
                 running: false,
@@ -53,6 +54,7 @@ impl HttpServer {
             state: MediaState {
                 db,
                 thumb_dir: thumb_dir.to_path_buf(),
+                hls_dir: hls_dir.to_path_buf(),
             },
             tx: Arc::new(RwLock::new(None)),
         }
@@ -75,9 +77,9 @@ impl HttpServer {
             .parse()
             .map_err(|e| crate::error::AppError::Msg(format!("解析绑定地址失败: {}", e)))?;
         // 预先检测端口是否可用
-        let test_listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| crate::error::AppError::Msg(format!("端口 {} 已被占用或无法绑定: {}", port, e)))?;
+        let test_listener = TcpListener::bind(addr).await.map_err(|e| {
+            crate::error::AppError::Msg(format!("端口 {} 已被占用或无法绑定: {}", port, e))
+        })?;
         drop(test_listener);
         // 重建 listener
         let listener = TcpListener::bind(addr)
@@ -90,6 +92,10 @@ impl HttpServer {
             .route("/media/{id}/{*file_name}", get(serve_media))
             .route("/media/{id}", get(serve_media_short))
             .route("/thumb/{*thumb_name}", get(serve_thumb))
+            .route("/api/media", get(api_media))
+            .route("/api/node", get(api_node))
+            .route("/download/{id}", get(serve_download))
+            .route("/hls/{id}/{*file}", get(serve_hls))
             .route("/", get(|| async { "VRchat-LocalCinema" }))
             .route("/{file_name}", get(serve_media_basename))
             .layer(ConcurrencyLimitLayer::new(64))
@@ -154,6 +160,77 @@ impl HttpServer {
     }
 }
 
+/// 返回对等节点的媒体清单（用于房间内互相浏览媒体库）
+async fn api_media(State(state): State<MediaState>) -> Response<Body> {
+    let summaries = {
+        let db = state.db.lock().unwrap();
+        db.list_summaries()
+    };
+    match summaries {
+        Ok(items) => {
+            let body = serde_json::json!({ "items": items });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json; charset=utf-8"),
+                )
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+        Err(e) => internal_error(&e.to_string()),
+    }
+}
+
+/// 返回本节点的基本信息
+async fn api_node() -> Response<Body> {
+    let body = serde_json::json!({
+        "app": "VRchat-LocalCinema",
+        "hostname": crate::easytier::default_member_name(),
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        )
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// 以附件形式下载媒体文件
+async fn serve_download(
+    State(state): State<MediaState>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let item = {
+        let db = state.db.lock().unwrap();
+        match db.get(&id) {
+            Ok(Some(v)) => v,
+            _ => return not_found(),
+        }
+    };
+    let path = PathBuf::from(&item.file_path);
+    if !crate::media_library::safe_registered_file(&path) {
+        return not_found();
+    }
+    let mut resp = serve_file(&path, &method, &headers).await;
+    if resp.status().is_success() {
+        let encoded: String = percent_encoding::utf8_percent_encode(
+            &item.file_name,
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+        .to_string();
+        let value = format!("attachment; filename*=UTF-8''{}", encoded);
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+        }
+    }
+    resp
+}
+
 async fn serve_media_basename(
     State(state): State<MediaState>,
     AxumPath(file_name): AxumPath<String>,
@@ -163,21 +240,85 @@ async fn serve_media_basename(
     if !crate::url_builder::valid_basename(&file_name) {
         return not_found();
     }
-    let item = {
+    enum Target {
+        Media(PathBuf),
+        Hls { id: String, path: PathBuf },
+    }
+    // 在锁内先完成路径解析，避免跨 await 持有互斥锁
+    let target = {
         let db = state.db.lock().unwrap();
         match db.resolve_basename(&file_name) {
-            Ok(Some(item)) => item,
-            Ok(None) => return not_found(),
-            Err(e) => return Response::builder()
-                .status(StatusCode::CONFLICT)
-                .body(Body::from(e.to_string())).unwrap(),
+            Ok(Some(item)) => Target::Media(PathBuf::from(item.file_path)),
+            Ok(None) => {
+                // 未匹配到媒体文件时回退查找 HLS 播放列表（根路径短链接）
+                if file_name.to_ascii_lowercase().ends_with(".m3u8") {
+                    match db.resolve_hls_playlist(&file_name) {
+                        Ok(Some(hls_item)) => Target::Hls {
+                            id: hls_item.id.clone(),
+                            path: state.hls_dir.join(&hls_item.id).join("index.m3u8"),
+                        },
+                        Ok(None) => return not_found(),
+                        Err(e) => {
+                            return Response::builder()
+                                .status(StatusCode::CONFLICT)
+                                .body(Body::from(e.to_string()))
+                                .unwrap()
+                        }
+                    }
+                } else {
+                    return not_found();
+                }
+            }
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::CONFLICT)
+                    .body(Body::from(e.to_string()))
+                    .unwrap()
+            }
         }
     };
-    let path = PathBuf::from(item.file_path);
-    if !crate::media_library::safe_registered_file(&path) {
-        return not_found();
+    match target {
+        Target::Hls { id, path } => {
+            if !path.is_file() {
+                return not_found();
+            }
+            // ffmpeg 转码期间会逐段重写 index.m3u8，静态改写会被覆盖，
+            // 因此在 HTTP 层读取时动态把相对分片 URI 补全为 /hls/{id}/ 前缀
+            let content = match tokio::fs::read_to_string(&path).await {
+                Ok(c) => c,
+                Err(_) => return not_found(),
+            };
+            let mut out = String::with_capacity(content.len() + 64);
+            for line in content.lines() {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with('#')
+                    && !trimmed.contains("://")
+                    && !trimmed.starts_with('/')
+                {
+                    out.push_str(&format!("/hls/{}/{}", id, trimmed));
+                } else {
+                    out.push_str(trimmed);
+                }
+                out.push('\n');
+            }
+            let mut resp = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+                .body(Body::from(out))
+                .unwrap();
+            if method == Method::HEAD {
+                *resp.body_mut() = Body::empty();
+            }
+            resp
+        }
+        Target::Media(path) => {
+            if !crate::media_library::safe_registered_file(&path) {
+                return not_found();
+            }
+            serve_file(&path, &method, &headers).await
+        }
     }
-    serve_file(&path, &method, &headers).await
 }
 
 async fn serve_media(
@@ -220,7 +361,12 @@ async fn serve_thumb(
         .as_ref()
         .and_then(|p| p.extension())
         .and_then(|e| e.to_str())
-        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png" | "webp"))
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp"
+            )
+        })
         .unwrap_or(false);
     if !allowed {
         return not_found().into_response();
@@ -230,6 +376,47 @@ async fn serve_thumb(
         return not_found().into_response();
     }
     serve_file(&path, &method, &headers).await.into_response()
+}
+
+/// 提供 HLS 播放列表与分片：/hls/{id}/index.m3u8、/hls/{id}/segNNN.ts
+async fn serve_hls(
+    State(state): State<MediaState>,
+    AxumPath((id, file)): AxumPath<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // id 必须是 UUID（36 位，含连字符），防止路径遍历
+    if id.len() != 36 || !id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+        return not_found().into_response();
+    }
+    // 文件名仅允许字母数字/点/下划线/连字符，且不允许隐藏文件
+    if file.is_empty()
+        || file.starts_with('.')
+        || !file
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return not_found().into_response();
+    }
+    let dir = state.hls_dir.join(&id);
+    let path = dir.join(&file);
+    if !path.starts_with(&state.hls_dir) || !path.is_file() {
+        return not_found().into_response();
+    }
+    let mut resp = serve_file(&path, &method, &headers).await;
+    // m3u8 必须使用标准 MIME，部分播放器据此识别
+    if file.to_ascii_lowercase().ends_with(".m3u8") {
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.apple.mpegurl"),
+        );
+    } else if file.to_ascii_lowercase().ends_with(".ts") {
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("video/mp2t"),
+        );
+    }
+    resp.into_response()
 }
 
 fn sanitize_thumb_path(base: &Path, input: &str) -> Option<PathBuf> {
@@ -292,7 +479,11 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
     if total_len == 0 {
         let mut hdr = HeaderMap::new();
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        hdr.insert(header::CONTENT_TYPE, HeaderValue::from_str(&mime.to_string()).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+        hdr.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&mime.to_string())
+                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+        );
         return Response::builder()
             .status(StatusCode::OK)
             .body(Body::empty())
@@ -327,7 +518,11 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                     let content_range = format!("bytes {}-{}/{}", start, end, total_len);
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime.to_string()).unwrap_or(HeaderValue::from_static("application/octet-stream")))
+                        .header(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_str(&mime.to_string())
+                                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+                        )
                         .header(header::CONTENT_LENGTH, HeaderValue::from(length))
                         .header(
                             header::CONTENT_RANGE,
@@ -344,7 +539,8 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header(
                     header::CONTENT_RANGE,
-                    HeaderValue::from_str(&format!("bytes */{}", total_len)).unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
+                    HeaderValue::from_str(&format!("bytes */{}", total_len))
+                        .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
                 )
                 .body(Body::empty())
                 .unwrap();
@@ -355,7 +551,11 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
     if *method == Method::HEAD {
         return Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime.to_string()).unwrap_or(HeaderValue::from_static("application/octet-stream")))
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&mime.to_string())
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            )
             .header(header::CONTENT_LENGTH, HeaderValue::from(total_len))
             .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
             .body(Body::empty())
@@ -365,7 +565,11 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
     let stream = ReaderStream::new(file);
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, HeaderValue::from_str(&mime.to_string()).unwrap_or(HeaderValue::from_static("application/octet-stream")))
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&mime.to_string())
+                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+        )
         .header(header::CONTENT_LENGTH, HeaderValue::from(total_len))
         .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
         .body(Body::from_stream(stream))

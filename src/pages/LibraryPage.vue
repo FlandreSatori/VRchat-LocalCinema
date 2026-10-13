@@ -1,15 +1,49 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { Film, Plus, Search, AlertTriangle, Loader2 } from 'lucide-vue-next'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import {
+  Film,
+  Plus,
+  Search,
+  AlertTriangle,
+  Loader2,
+  Folder as FolderIcon,
+  Pencil,
+  Trash2,
+  ChevronRight,
+  FolderPlus,
+  CornerUpLeft,
+} from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Button from '../components/ui/Button.vue'
 import Input from '../components/ui/Input.vue'
 import Select from '../components/ui/Select.vue'
+import Dialog from '../components/ui/Dialog.vue'
+import ContextMenu from '../components/ui/ContextMenu.vue'
 import MediaCard from '../components/MediaCard.vue'
 import UrlDialog from '../components/UrlDialog.vue'
-import type { MediaItem } from '../lib/api'
-import { mediaStore, serverStore, importMediaPaths, removeMediaItem } from '../lib/store'
+import type { MenuEntry } from '../lib/menu'
+import type { MediaItem, Folder, UnlistenFn } from '../lib/api'
+import { BUILTIN_INCOMPATIBLE_ID } from '../lib/api'
+import {
+  mediaStore,
+  folderStore,
+  serverStore,
+  importMediaPaths,
+  removeMediaItem,
+  loadFolders,
+} from '../lib/store'
+import {
+  createFolder,
+  renameFolder,
+  deleteFolder,
+  renameMedia,
+  moveMedia,
+  segmentTranscode,
+  transcodeOutputExists,
+  onSegmentReady,
+} from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
+import { formatDuration } from '../lib/format'
 
 const search = ref('')
 const sortBy = ref<'addedAt' | 'title' | 'fileSize' | 'durationMs'>('addedAt')
@@ -17,8 +51,12 @@ const sortOrder = ref<'asc' | 'desc'>('desc')
 const statusFilter = ref<'all' | 'ok' | 'missing'>('all')
 const importing = ref(false)
 
+/// 当前所在文件夹；null = 根目录
+const currentFolderId = ref<string | null>(null)
+
 const urlDialogOpen = ref(false)
 const urlDialogItem = ref<MediaItem | null>(null)
+const urlDialogFormat = ref<'whole' | 'segment'>('whole')
 
 const sortOptions = [
   { value: 'addedAt', label: '添加时间' },
@@ -36,9 +74,63 @@ const statusOptions = [
   { value: 'missing', label: '失效' },
 ]
 
+// ---------- 资源管理器导航 ----------
+
+const folderMap = computed(() => {
+  const map: Record<string, Folder> = {}
+  folderStore.folders.forEach((f) => (map[f.id] = f))
+  return map
+})
+
+const breadcrumbs = computed(() => {
+  const crumbs: Folder[] = []
+  let cur = currentFolderId.value ? folderMap.value[currentFolderId.value] : null
+  while (cur) {
+    crumbs.unshift(cur)
+    cur = cur.parentId ? folderMap.value[cur.parentId] : null
+  }
+  return crumbs
+})
+
+const childFolders = computed(() =>
+  folderStore.folders
+    .filter((f) => f.parentId === currentFolderId.value)
+    .sort((a, b) =>
+      a.id === BUILTIN_INCOMPATIBLE_ID
+        ? -1
+        : b.id === BUILTIN_INCOMPATIBLE_ID
+          ? 1
+          : a.createdAt - b.createdAt
+    )
+)
+
+function folderMediaCount(fid: string): number {
+  return mediaStore.items.filter((m) => m.folderId === fid).length
+}
+
+function enterFolder(f: Folder) {
+  currentFolderId.value = f.id
+}
+
+function goUp() {
+  const cur = currentFolderId.value ? folderMap.value[currentFolderId.value] : null
+  currentFolderId.value = cur?.parentId ?? null
+}
+
+const searching = computed(() => search.value.trim().length > 0)
+
+/// 搜索时隐藏文件夹，只显示全库匹配的视频
+const visibleFolders = computed(() => (searching.value ? [] : childFolders.value))
+
+const baseItems = computed(() =>
+  searching.value
+    ? mediaStore.items
+    : mediaStore.items.filter((m) => m.folderId === currentFolderId.value)
+)
+
 const filtered = computed(() => {
   const q = search.value.trim().toLowerCase()
-  let list = mediaStore.items
+  let list = baseItems.value
   if (statusFilter.value !== 'all') {
     list = list.filter((m) => m.status === statusFilter.value)
   }
@@ -75,6 +167,8 @@ function setStatusFilter(v: string) {
   statusFilter.value = v as typeof statusFilter.value
 }
 
+// ---------- 导入 ----------
+
 async function doImport(paths: string[]) {
   if (!paths.length || importing.value) return
   importing.value = true
@@ -104,14 +198,230 @@ async function importViaDialog() {
   }
 }
 
-function openUrlDialog(item: MediaItem) {
+// ---------- 文件夹管理对话框 ----------
+
+const folderDialog = reactive<{
+  open: boolean
+  mode: 'create' | 'rename'
+  folder: Folder | null
+  name: string
+}>({ open: false, mode: 'create', folder: null, name: '' })
+
+function openCreateFolder() {
+  folderDialog.mode = 'create'
+  folderDialog.folder = null
+  folderDialog.name = ''
+  folderDialog.open = true
+}
+
+function openRenameFolder(f: Folder) {
+  folderDialog.mode = 'rename'
+  folderDialog.folder = f
+  folderDialog.name = f.name
+  folderDialog.open = true
+}
+
+async function submitFolderDialog() {
+  const name = folderDialog.name.trim()
+  if (!name) {
+    toast.error('文件夹名不能为空')
+    return
+  }
+  try {
+    if (folderDialog.mode === 'create') {
+      await createFolder(name, currentFolderId.value)
+      await loadFolders(true)
+      toast.success(`已创建文件夹「${name}」`)
+    } else if (folderDialog.folder) {
+      await renameFolder(folderDialog.folder.id, name)
+      await loadFolders(true)
+      toast.success('文件夹已重命名')
+    }
+    folderDialog.open = false
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+function folderMenu(f: Folder): MenuEntry[] {
+  if (f.id === BUILTIN_INCOMPATIBLE_ID) return []
+  return [
+    { type: 'item', label: '重命名', icon: Pencil, onSelect: () => openRenameFolder(f) },
+    { type: 'item', label: '删除文件夹', icon: Trash2, danger: true, onSelect: () => doDeleteFolder(f) },
+  ]
+}
+
+async function doDeleteFolder(f: Folder) {
+  if (!confirm(`确定删除文件夹「${f.name}」吗？\n其中的视频将移回上一级（不会删除磁盘文件）。`)) return
+  try {
+    await deleteFolder(f.id)
+    await loadFolders(true)
+    // 若当前位于被删子树内则退回根目录
+    let cur = currentFolderId.value
+    while (cur) {
+      if (cur === f.id) {
+        currentFolderId.value = null
+        break
+      }
+      cur = folderMap.value[cur]?.parentId ?? null
+    }
+    toast.success('文件夹已删除')
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+// ---------- 文件重命名 / 移动对话框 ----------
+
+const fileDialog = reactive<{
+  open: boolean
+  mode: 'rename' | 'move'
+  item: MediaItem | null
+  name: string
+  target: string
+}>({ open: false, mode: 'rename', item: null, name: '', target: '__root__' })
+
+const moveTargetOptions = computed(() => [
+  { value: '__root__', label: '根目录' },
+  ...folderStore.folders.map((f) => ({ value: f.id, label: f.name })),
+])
+
+function openRenameFile(item: MediaItem) {
+  fileDialog.mode = 'rename'
+  fileDialog.item = item
+  fileDialog.name = item.fileName
+  fileDialog.open = true
+}
+
+function openMoveFile(item: MediaItem) {
+  fileDialog.mode = 'move'
+  fileDialog.item = item
+  fileDialog.target = item.folderId ?? '__root__'
+  fileDialog.open = true
+}
+
+async function submitFileDialog() {
+  if (!fileDialog.item) return
+  try {
+    if (fileDialog.mode === 'rename') {
+      const name = fileDialog.name.trim()
+      if (!name || name === fileDialog.item.fileName) {
+        fileDialog.open = false
+        return
+      }
+      const updated = await renameMedia(fileDialog.item.id, name)
+      mediaItemUpdated(updated)
+      toast.success('已重命名（播放链接已同步更新）')
+    } else {
+      const target = fileDialog.target === '__root__' ? null : fileDialog.target
+      const updated = await moveMedia(fileDialog.item.id, target)
+      mediaItemUpdated(updated)
+      toast.success('已移动')
+    }
+    fileDialog.open = false
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+function mediaItemUpdated(item: MediaItem) {
+  const idx = mediaStore.items.findIndex((m) => m.id === item.id)
+  if (idx >= 0) mediaStore.items[idx] = item
+  else mediaStore.items.unshift(item)
+}
+
+// ---------- 其它 ----------
+
+function openUrlDialog(item: MediaItem, format: 'whole' | 'segment' = 'whole') {
   urlDialogItem.value = item
+  urlDialogFormat.value = format
   urlDialogOpen.value = true
 }
 
 function onRemoved(id: string) {
   removeMediaItem(id)
 }
+
+/// 从转码产物「快捷方式」卡片跳转到源视频所在位置
+function gotoSource(sourceId: string) {
+  const src = mediaStore.items.find((m) => m.id === sourceId)
+  if (!src) {
+    toast.error('源视频已被移除')
+    return
+  }
+  currentFolderId.value = src.folderId
+  toast.info(`已跳转到源视频「${src.title}」所在位置`)
+}
+
+// ---------- 分段转码 ----------
+
+/// 分段转码确认对话框（第一段时长可调整，默认总时长 10% 向上取整到 5 分钟）
+const segmentDialog = reactive<{
+  open: boolean
+  item: MediaItem | null
+  minutes: number
+}>({ open: false, item: null, minutes: 5 })
+
+function defaultFirstSegmentMinutes(totalMs: number): number {
+  const FIVE_MIN = 5
+  const raw = (totalMs / 60000) * 0.1
+  return Math.max(FIVE_MIN, Math.ceil(raw / FIVE_MIN) * FIVE_MIN)
+}
+
+function openSegmentDialog(item: MediaItem) {
+  if (item.durationMs === null) {
+    toast.error('视频时长未知，请先「刷新媒体信息」')
+    return
+  }
+  segmentDialog.item = item
+  segmentDialog.minutes = defaultFirstSegmentMinutes(item.durationMs)
+  segmentDialog.open = true
+}
+
+async function submitSegmentDialog() {
+  const item = segmentDialog.item
+  if (!item || item.durationMs === null) return
+  const minutes = Math.floor(segmentDialog.minutes)
+  if (!minutes || minutes < 1) {
+    toast.error('第一段时长至少 1 分钟')
+    return
+  }
+  const firstMs = minutes * 60_000
+  try {
+    // 已存在分段产物时，先询问是否覆盖
+    let overwrite = false
+    if (await transcodeOutputExists(item.id, 'segment')) {
+      overwrite = confirm('已存在分段转码产物，再次分段转码将覆盖同名文件。\n是否继续？')
+      if (!overwrite) return
+    }
+    await segmentTranscode(item.id, firstMs, overwrite)
+    toast.info('已加入转码队列：第一段完成后会自动弹出复制链接窗口')
+    segmentDialog.open = false
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+// 第一段转码完成：弹出「复制链接」窗口（分段播放）
+let unlistenSegmentReady: UnlistenFn | null = null
+onMounted(async () => {
+  try {
+    const fn = await onSegmentReady((seg) => {
+      mediaItemUpdated(seg)
+      const source = seg.sourceMediaId
+        ? mediaStore.items.find((m) => m.id === seg.sourceMediaId) ?? seg
+        : seg
+      toast.success(`「${seg.title}」第一段转码完成，请复制链接`)
+      openUrlDialog(source, 'segment')
+    })
+    unlistenSegmentReady = fn
+  } catch {
+    // 非 Tauri 环境忽略
+  }
+})
+onUnmounted(() => {
+  unlistenSegmentReady?.()
+})
 </script>
 
 <template>
@@ -121,11 +431,17 @@ function onRemoved(id: string) {
         <h1 class="text-xl font-semibold">媒体库</h1>
         <p class="mt-0.5 text-sm text-muted-foreground">共 {{ mediaStore.items.length }} 个视频</p>
       </div>
-      <Button :disabled="importing" @click="importViaDialog">
-        <Loader2 v-if="importing" class="h-4 w-4 animate-spin" />
-        <Plus v-else class="h-4 w-4" />
-        导入视频
-      </Button>
+      <div class="flex gap-2">
+        <Button variant="outline" :disabled="importing" @click="openCreateFolder">
+          <FolderPlus class="h-4 w-4" />
+          新建文件夹
+        </Button>
+        <Button :disabled="importing" @click="importViaDialog">
+          <Loader2 v-if="importing" class="h-4 w-4 animate-spin" />
+          <Plus v-else class="h-4 w-4" />
+          导入视频
+        </Button>
+      </div>
     </div>
 
     <div v-if="!serverStore.running" class="mt-4 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400">
@@ -136,17 +452,59 @@ function onRemoved(id: string) {
       </RouterLink>
     </div>
 
-    <div class="mt-4 flex flex-wrap items-center gap-2">
+    <!-- 面包屑导航 -->
+    <div class="mt-4 flex items-center gap-1 text-sm">
+      <button
+        type="button"
+        class="flex cursor-pointer items-center gap-1 rounded px-2 py-1 font-medium hover:bg-accent"
+        :class="currentFolderId === null ? 'text-foreground' : 'text-muted-foreground'"
+        @click="currentFolderId = null"
+      >
+        <FolderIcon class="h-4 w-4" />
+        根目录
+      </button>
+      <template v-for="crumb in breadcrumbs" :key="crumb.id">
+        <ChevronRight class="h-4 w-4 text-muted-foreground/60" />
+        <button
+          type="button"
+          class="cursor-pointer rounded px-2 py-1 font-medium hover:bg-accent"
+          :class="crumb.id === currentFolderId ? 'text-foreground' : 'text-muted-foreground'"
+          @click="currentFolderId = crumb.id"
+        >
+          {{ crumb.name }}
+        </button>
+      </template>
+      <Button
+        v-if="currentFolderId !== null"
+        size="sm"
+        variant="ghost"
+        class="ml-1 h-7 px-2 text-xs"
+        @click="goUp"
+      >
+        <CornerUpLeft class="h-3.5 w-3.5" />
+        上一级
+      </Button>
+    </div>
+
+    <div class="mt-3 flex flex-wrap items-center gap-2">
       <div class="relative w-64">
         <Search class="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <Input v-model="search" placeholder="搜索标题或文件名" class="pl-8" />
+        <Input v-model="search" placeholder="搜索标题或文件名（全库）" class="pl-8" />
       </div>
       <Select :model-value="sortBy" :options="sortOptions" class="w-32" @update:model-value="setSortBy" />
       <Select :model-value="sortOrder" :options="orderOptions" class="w-24" @update:model-value="setSortOrder" />
       <Select :model-value="statusFilter" :options="statusOptions" class="w-28" @update:model-value="setStatusFilter" />
     </div>
 
-    <div v-if="mediaStore.loaded && filtered.length === 0" class="mt-16 flex flex-col items-center justify-center text-center">
+    <!-- 空状态：搜索无结果，或根目录完全为空 -->
+    <div
+      v-if="
+        mediaStore.loaded &&
+        filtered.length === 0 &&
+        (searching || (childFolders.length === 0 && currentFolderId === null))
+      "
+      class="mt-16 flex flex-col items-center justify-center text-center"
+    >
       <template v-if="mediaStore.items.length === 0">
         <Film class="h-16 w-16 text-muted-foreground/40" />
         <h2 class="mt-4 text-lg font-medium">媒体库为空</h2>
@@ -156,16 +514,147 @@ function onRemoved(id: string) {
           导入视频
         </Button>
       </template>
-      <template v-else>
+      <template v-else-if="searching">
         <Search class="h-12 w-12 text-muted-foreground/40" />
         <p class="mt-4 text-sm text-muted-foreground">没有匹配的视频</p>
       </template>
+      <template v-else>
+        <FolderIcon class="h-12 w-12 text-muted-foreground/40" />
+        <p class="mt-4 text-sm text-muted-foreground">此文件夹为空</p>
+      </template>
     </div>
 
-    <div v-else class="mt-4 grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
-      <MediaCard v-for="item in filtered" :key="item.id" :item="item" @copy-link="openUrlDialog" @removed="onRemoved" />
+    <!-- 内容区：返回上一级 / 文件夹 / 视频 同级网格展示（近似正方形卡片） -->
+    <div
+      v-else
+      class="mt-4 grid grid-cols-[repeat(auto-fill,minmax(170px,1fr))] gap-3"
+    >
+      <!-- 返回上一级（根目录不显示） -->
+      <button
+        v-if="!searching && currentFolderId !== null"
+        type="button"
+        class="flex aspect-square w-full cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border border-dashed bg-card p-4 text-muted-foreground shadow-sm transition-colors hover:border-primary/40 hover:text-foreground"
+        @click="goUp"
+      >
+        <CornerUpLeft class="h-12 w-12" />
+        <div class="text-sm font-medium">返回上一级</div>
+      </button>
+
+      <!-- 文件夹 -->
+      <ContextMenu v-for="f in visibleFolders" :key="f.id" :items="folderMenu(f)">
+        <button
+          type="button"
+          class="flex aspect-square w-full cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border bg-card p-4 shadow-sm transition-colors hover:border-primary/40"
+          @click="enterFolder(f)"
+        >
+          <FolderIcon
+            class="h-12 w-12"
+            :class="f.id === BUILTIN_INCOMPATIBLE_ID ? 'text-destructive/70' : 'text-primary/70'"
+          />
+          <div class="w-full min-w-0 text-center">
+            <div class="truncate text-sm font-medium" :title="f.name">{{ f.name }}</div>
+            <div class="text-xs text-muted-foreground">{{ folderMediaCount(f.id) }} 个视频</div>
+          </div>
+        </button>
+      </ContextMenu>
+
+      <!-- 视频 -->
+      <MediaCard
+        v-for="item in filtered"
+        :key="item.id"
+        :item="item"
+        @copy-link="openUrlDialog"
+        @removed="onRemoved"
+        @rename="openRenameFile"
+        @move="openMoveFile"
+        @goto-source="gotoSource"
+        @segment-transcode="openSegmentDialog"
+      />
     </div>
 
-    <UrlDialog v-model:open="urlDialogOpen" :item="urlDialogItem" />
+    <!-- 空文件夹提示（含返回上一级卡片时的补充说明） -->
+    <div
+      v-if="!searching && currentFolderId !== null && !filtered.length && !childFolders.length"
+      class="mt-4 flex flex-col items-center justify-center rounded-lg border border-dashed border-border py-10 text-center"
+    >
+      <Film class="h-8 w-8 text-muted-foreground/40" />
+      <p class="mt-2 text-sm text-muted-foreground">此文件夹为空</p>
+    </div>
+
+    <UrlDialog v-model:open="urlDialogOpen" :item="urlDialogItem" :initial-format="urlDialogFormat" />
+
+    <!-- 分段转码确认：第一段时长可调整 -->
+    <Dialog
+      :open="segmentDialog.open"
+      title="分段转码"
+      description="先转出第一段供马上观看，第二段（剩余部分）在后台继续转码"
+      @update:open="segmentDialog.open = $event"
+    >
+      <form class="space-y-4" @submit.prevent="submitSegmentDialog">
+        <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <template v-if="segmentDialog.item">
+            视频总时长：{{ segmentDialog.item.durationMs !== null ? formatDuration(segmentDialog.item.durationMs) : '未知' }}
+            · 默认第一段为总时长的 10%（向上取整到 5 分钟）
+          </template>
+        </div>
+        <div class="space-y-1.5">
+          <label class="text-sm font-medium">第一段时长（分钟）</label>
+          <Input v-model.number="segmentDialog.minutes" type="number" min="1" step="1" autofocus />
+          <p class="text-xs text-muted-foreground">第一段转码完成后会自动弹出「复制链接」窗口</p>
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" @click="segmentDialog.open = false">取消</Button>
+          <Button type="submit">开始分段转码</Button>
+        </div>
+      </form>
+    </Dialog>
+
+    <!-- 新建/重命名文件夹 -->
+    <Dialog
+      :open="folderDialog.open"
+      :title="folderDialog.mode === 'create' ? '新建文件夹' : '重命名文件夹'"
+      description="文件夹仅用于媒体库整理，不影响磁盘文件位置"
+      @update:open="folderDialog.open = $event"
+    >
+      <form
+        class="space-y-4"
+        @submit.prevent="submitFolderDialog"
+      >
+        <div class="space-y-1.5">
+          <label class="text-sm font-medium">文件夹名</label>
+          <Input v-model="folderDialog.name" placeholder="例如：电影 / 剧集" autofocus />
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" @click="folderDialog.open = false">取消</Button>
+          <Button type="submit">{{ folderDialog.mode === 'create' ? '创建' : '保存' }}</Button>
+        </div>
+      </form>
+    </Dialog>
+
+    <!-- 重命名/移动视频 -->
+    <Dialog
+      :open="fileDialog.open"
+      :title="fileDialog.mode === 'rename' ? '重命名视频' : '移动视频'"
+      description="仅修改媒体库映射，不会改动磁盘上的文件；播放链接随文件名同步变化"
+      @update:open="fileDialog.open = $event"
+    >
+      <form
+        class="space-y-4"
+        @submit.prevent="submitFileDialog"
+      >
+        <div v-if="fileDialog.mode === 'rename'" class="space-y-1.5">
+          <label class="text-sm font-medium">文件名（含扩展名）</label>
+          <Input v-model="fileDialog.name" placeholder="例如：我的视频.mp4" autofocus />
+        </div>
+        <div v-else class="space-y-1.5">
+          <label class="text-sm font-medium">目标文件夹</label>
+          <Select v-model="fileDialog.target" :options="moveTargetOptions" class="w-full" />
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" @click="fileDialog.open = false">取消</Button>
+          <Button type="submit">{{ fileDialog.mode === 'rename' ? '保存' : '移动' }}</Button>
+        </div>
+      </form>
+    </Dialog>
   </div>
 </template>

@@ -30,7 +30,7 @@ fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, Strin
     let thumb_dir = dir.join("thumbnails");
     std::fs::create_dir_all(&thumb_dir).unwrap();
 
-    let server = HttpServer::new(Arc::new(Mutex::new(db)), &thumb_dir);
+    let server = HttpServer::new(Arc::new(Mutex::new(db)), &thumb_dir, &thumb_dir);
     (server, item, PathBufWrap(dir), id)
 }
 
@@ -280,11 +280,11 @@ async fn test_existing_duplicate_names_are_ambiguous() {
     let db = Db::open(&db_path).unwrap();
     let (item, _) = db.register(&file).unwrap();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute("INSERT INTO media SELECT 'legacy', title, 'SAME.MP4', 'legacy-path', file_size, duration_ms, format, thumbnail, status, added_at, updated_at FROM media WHERE id = ?1", [&item.id]).unwrap();
+    conn.execute("INSERT INTO media (id, title, file_name, file_path, file_size, duration_ms, format, thumbnail, status, added_at, updated_at) SELECT 'legacy', title, 'SAME.MP4', 'legacy-path', file_size, duration_ms, format, thumbnail, status, added_at, updated_at FROM media WHERE id = ?1", [&item.id]).unwrap();
     drop(conn);
     assert!(db.resolve_basename(&item.file_name).unwrap_err().to_string().contains("请先移除冲突条目"));
     assert_eq!(db.register(&file).unwrap().0.id, item.id);
-    let server = HttpServer::new(Arc::new(Mutex::new(db)), &dir.0);
+    let server = HttpServer::new(Arc::new(Mutex::new(db)), &dir.0, &dir.0);
     server.start("127.0.0.1", 0).await.unwrap();
     let base = format!("http://127.0.0.1:{}", server.status().port);
     let client = reqwest::Client::new();

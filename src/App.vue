@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Film, Server, Settings, Info, FilePlus, Minus, Square, Copy, X } from 'lucide-vue-next'
+import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -19,7 +19,9 @@ const maximized = ref(false)
 
 const navItems = [
   { to: '/library', label: '媒体库', icon: Film },
+  { to: '/convert', label: '转码任务', icon: ListVideo },
   { to: '/server', label: 'HTTP 服务', icon: Server },
+  { to: '/easytier', label: 'EasyTier 组网', icon: Network },
   { to: '/settings', label: '设置', icon: Settings },
   { to: '/about', label: '关于', icon: Info },
 ]
@@ -96,13 +98,16 @@ onMounted(async () => {
   try {
     const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
       const payload = event.payload
-      if (payload.type === 'over') {
-        dragActive.value = true
+      if (payload.type === 'enter') {
+        // 仅外部文件拖拽显示导入遮罩；窗口内部拖动（如媒体卡片）paths 为空
+        dragActive.value = payload.paths.length > 0
+      } else if (payload.type === 'over') {
+        // 保持 enter 时的状态（over 事件不携带 paths）
       } else if (payload.type === 'leave') {
         dragActive.value = false
       } else if (payload.type === 'drop') {
         dragActive.value = false
-        handleDrop(payload.paths)
+        if (payload.paths.length) handleDrop(payload.paths)
       }
     })
     if (disposed) unlisten()
@@ -197,7 +202,7 @@ onUnmounted(() => {
     >
       <div class="flex items-center gap-3 rounded-lg border-2 border-dashed border-primary bg-card px-8 py-6 text-lg text-primary">
         <FilePlus class="h-6 w-6" />
-        松开以导入视频文件
+        松开以导入视频 / 视频文件夹
       </div>
     </div>
   </div>
