@@ -92,9 +92,10 @@ const installed = computed(() => easytierComponent.value?.installed ?? false)
 
 const listenHint = computed(() => {
   if (cfg.protocols.length === 0) return '至少启用一种协议，否则无法被其他成员连接。'
-  return cfg.protocols
-    .map((p) => `${p}://0.0.0.0:${cfg.listenPort}${p === 'ws' ? '+1' : p === 'wss' ? '+2' : p === 'quic' ? '+3' : ''}`)
-    .join('，')
+  const offsets: Record<string, number> = { ws: 1, wss: 2, quic: 3 }
+  return `本机监听 ${cfg.protocols
+    .map((p) => `${p}://0.0.0.0:${cfg.listenPort + (offsets[p] ?? 0)}`)
+    .join('、')}`
 })
 
 const installProgressText = computed(() => {
@@ -392,19 +393,10 @@ onUnmounted(() => {
       </div>
 
       <div class="grid grid-cols-2 gap-4">
-        <div class="space-y-1.5">
+        <div class="space-y-1.5 col-span-2">
           <Label>中转服务器地址</Label>
           <Input v-model="cfg.peerUrl" placeholder="例如 tcp://public.easytier.top:11010" />
-        </div>
-        <div class="space-y-1.5">
-          <Label>监听端口</Label>
-          <Input
-            type="number"
-            :min="1"
-            :max="65535"
-            :model-value="String(cfg.listenPort)"
-            @update:model-value="cfg.listenPort = Math.round(Number($event)) || 0"
-          />
+          <p class="text-xs text-muted-foreground">端口包含在地址中（host:port），多个地址可用空格或逗号分隔；本机监听端口默认 11010。</p>
         </div>
         <div class="space-y-1.5">
           <Label>房间名</Label>

@@ -59,8 +59,9 @@ async function load() {
   error.value = null
   try {
     items.value = await fetchPeerMedia(peer.ipv4, props.port)
-  } catch (e) {
-    error.value = errMsg(e)
+  } catch {
+    // 请求失败（超时/对方未运行本软件或 HTTP 服务未启动）：提示媒体库不存在
+    error.value = '对方媒体库不存在（对方可能未运行本软件或未启动 HTTP 服务）'
     items.value = []
   } finally {
     loading.value = false

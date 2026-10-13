@@ -14,8 +14,8 @@ dist-ssr
 dist-portable/
 *.tsbuildinfo
 
-# Third-party runtime components (downloaded at build time)
-components/
+# Third-party runtime components (downloaded at build time, repo root only)
+/components/
 
 # Local media, data and environment settings
 tests/*.mp4
