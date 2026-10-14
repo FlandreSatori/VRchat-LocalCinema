@@ -15,6 +15,9 @@ use crate::settings::EasytierConfig;
 /// easytier-core 的 RPC 门户，easytier-cli 通过它读取运行状态
 pub const RPC_PORTAL: &str = "127.0.0.1:15888";
 
+/// 运行 easytier-core 的计划任务名称（以最高权限运行，注册一次后启停均无需 UAC）
+pub const EASYTIER_TASK_NAME: &str = "LocalCinemaEasyTier";
+
 /// 支持的协议类型
 pub const SUPPORTED_PROTOCOLS: [&str; 5] = ["tcp", "udp", "ws", "wss", "quic"];
 
@@ -120,6 +123,10 @@ pub fn build_args(cfg: &EasytierConfig) -> Vec<String> {
     } else if !cfg.ipv4.trim().is_empty() {
         args.push("--ipv4".into());
         args.push(cfg.ipv4.trim().to_string());
+    } else {
+        // 兜底：关闭 DHCP 且未填写虚拟 IP 时节点会没有虚拟 IP（媒体共享不可用），强制走 DHCP
+        tracing::info!("未开启 DHCP 且未填写虚拟 IPv4，自动回退为 DHCP 分配");
+        args.push("-d".into());
     }
     if !cfg.ipv6.trim().is_empty() {
         args.push("--ipv6".into());
@@ -172,20 +179,23 @@ pub struct EasytierManager {
     status: RwLock<EasytierStatus>,
     /// 本机 EasyTier 虚拟 IPv4（用于组网时的局域网地址）
     virtual_ip: RwLock<Option<String>>,
+    /// 数据目录（启动脚本 run.ps1 的写入位置）
+    data_dir: PathBuf,
 }
 
 impl Default for EasytierManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(PathBuf::from("."))
     }
 }
 
 impl EasytierManager {
-    pub fn new() -> Self {
+    pub fn new(data_dir: PathBuf) -> Self {
         Self {
             child: Mutex::new(None),
             status: RwLock::new(EasytierStatus::default()),
             virtual_ip: RwLock::new(None),
+            data_dir,
         }
     }
 
@@ -207,50 +217,95 @@ impl EasytierManager {
         f(&mut guard);
     }
 
-    /// 启动 easytier-core
+    /// 启动 easytier-core。
+    ///
+    /// 创建虚拟网卡（Wintun）需要管理员权限，因此通过 Windows 计划任务以最高权限
+    /// 运行：任务只注册一次（首次 UAC），之后每次启动/停止均通过 `schtasks /Run`
+    /// 与 `schtasks /End` 完成，无需再次授权。任务动作固定指向 run-hidden.vbs（由其
+    /// 隐藏窗口运行同目录 run.ps1），参数变化只需重写脚本内容，不会触发重新注册。
     pub async fn start(&self, core: &Path, args: Vec<String>) -> AppResult<EasytierStatus> {
-        self.stop();
+        self.stop().await;
 
-        let mut cmd = tokio::process::Command::new(core);
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false);
-        #[cfg(windows)]
-        {
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        // 生成启动脚本（UTF-8 BOM，PowerShell 5.1 可正确解析中文参数）
+        let ps1 = run_ps1_path(&self.data_dir);
+        write_run_ps1(&ps1, core, &args)?;
+
+        // 生成 wscript 隐藏窗口包装脚本：任务动作指向 vbs，运行期完全不显示 PowerShell 窗口
+        let vbs = run_hidden_vbs_path(&self.data_dir);
+        write_run_hidden_vbs(&vbs)?;
+
+        ensure_task_registered(&vbs).await?;
+        task_run().await?;
+
+        // 等待 core 进程拉起
+        let mut pid = None;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if let Some(proc_pid) = core_processes().first().map(|p| p.pid) {
+                pid = Some(proc_pid);
+                break;
+            }
         }
+        let pid = pid.ok_or_else(|| {
+            AppError::Msg("计划任务已触发但未检测到 easytier-core 进程，请查看 easytier-core 日志".to_string())
+        })?;
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AppError::Msg(format!("无法启动 easytier-core: {}", e)))?;
-        let pid = child.id();
-
-        if let Some(stderr) = child.stderr.take() {
-            spawn_log_reader(stderr, "easytier");
-        }
-        if let Some(stdout) = child.stdout.take() {
-            spawn_log_reader(stdout, "easytier");
-        }
-
-        *self.child.lock().unwrap() = Some(child);
+        *self.child.lock().unwrap() = None;
         self.set_status(|s| {
             s.running = true;
-            s.pid = pid;
+            s.pid = Some(pid);
             s.error = None;
-            s.args = args;
+            s.args = args.clone();
         });
+        tracing::info!("easytier-core 已通过计划任务启动，PID={}", pid);
         Ok(self.status())
     }
 
-    /// 停止 easytier-core
-    pub fn stop(&self) {
-        let mut guard = self.child.lock().unwrap();
-        if let Some(mut child) = guard.take() {
-            let _ = child.start_kill();
+    /// 停止 easytier-core（手动停止：计划任务终止 + 提权兜底）。
+    pub async fn stop(&self) {
+        {
+            let mut guard = self.child.lock().unwrap();
+            if let Some(mut child) = guard.take() {
+                let _ = child.start_kill();
+            }
         }
-        drop(guard);
+        self.set_status(|s| {
+            s.running = false;
+            s.pid = None;
+            s.error = None;
+        });
+        self.set_virtual_ip(None);
+
+        // 停止计划任务（无需 UAC；任务不存在时忽略错误）
+        task_end().await;
+        wait_processes_gone(6).await;
+        // 进程残留（任务被手动删除或历史提权直启）时提权兜底终止
+        if !core_processes().is_empty() {
+            tracing::warn!("计划任务未能终止 easytier-core，尝试提权兜底终止");
+            if let Err(e) = kill_process_elevated_by_name(true).await {
+                tracing::warn!("提权终止 easytier-core 失败: {}", e);
+                self.set_status(|s| {
+                    s.error = Some("easytier-core 仍在后台运行，可再次点击停止".to_string());
+                });
+            }
+        }
+    }
+
+    /// 停止 easytier-core（应用退出场景：计划任务终止无需 UAC，同步快速执行）。
+    pub fn stop_detached(&self) {
+        {
+            let mut guard = self.child.lock().unwrap();
+            if let Some(mut child) = guard.take() {
+                let _ = child.start_kill();
+            }
+        }
+        let _ = tauri::async_runtime::block_on(task_end());
+        if !core_processes().is_empty() {
+            // 残留提权进程：异步兜底终止，不阻塞退出
+            tauri::async_runtime::spawn(async {
+                let _ = kill_process_elevated_by_name(false).await;
+            });
+        }
         self.set_status(|s| {
             s.running = false;
             s.pid = None;
@@ -258,42 +313,296 @@ impl EasytierManager {
         self.set_virtual_ip(None);
     }
 
-    /// 进程是否仍然存活（用于刷新状态）
+    /// 刷新运行状态：计划任务模式下按进程存在性判断（同时可检测意外退出）。
     pub fn refresh(&self) {
         let mut guard = self.child.lock().unwrap();
-        let exited = match guard.as_mut() {
-            Some(child) => match child.try_wait() {
+        if guard.is_some() {
+            // 兼容旧本地子进程模式
+            let exited = match guard.as_mut().unwrap().try_wait() {
                 Ok(Some(status)) => Some(format!("easytier-core 已退出（{:?}）", status.code())),
                 Ok(None) => None,
                 Err(e) => Some(format!("检测 easytier-core 状态失败: {}", e)),
-            },
-            None => None,
-        };
-        if let Some(msg) = exited {
-            *guard = None;
-            drop(guard);
-            self.set_status(|s| {
-                s.running = false;
-                s.pid = None;
-                s.error = Some(msg);
-            });
+            };
+            if let Some(msg) = exited {
+                *guard = None;
+                drop(guard);
+                self.set_status(|s| {
+                    s.running = false;
+                    s.pid = None;
+                    s.error = Some(msg);
+                });
+            }
+            return;
+        }
+        drop(guard);
+
+        let was_running = self.status.read().unwrap().running;
+        match core_processes().first() {
+            Some(proc) => {
+                self.set_status(|s| {
+                    s.running = true;
+                    s.pid = Some(proc.pid);
+                });
+            }
+            None => {
+                if was_running {
+                    self.set_status(|s| {
+                        s.running = false;
+                        s.pid = None;
+                        s.error = Some("easytier-core 已退出".to_string());
+                    });
+                }
+            }
         }
     }
 }
 
-fn spawn_log_reader<R>(reader: R, tag: &'static str)
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tauri::async_runtime::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if !line.trim().is_empty() {
-                tracing::info!("[{}] {}", tag, line);
+/// PowerShell 单引号字符串转义（内部单引号翻倍）
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 生成提权执行的 PowerShell 包装脚本。
+/// 外层普通权限 powershell 通过 Start-Process -Verb RunAs 提权执行内层命令；
+/// `wait` 为 true 时外层等待内层退出。
+fn elevated_ps_script(inner: &str, wait: bool) -> String {
+    let wait_flag = if wait { " -Wait" } else { "" };
+    format!(
+        "try {{ Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-NonInteractive','-Command',{}){} -Verb RunAs -WindowStyle Hidden | Out-Null; Write-Output 'OK' }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
+        ps_quote(inner),
+        wait_flag
+    )
+}
+
+/// 运行外层 PowerShell 脚本并解析 OK/ERR 输出
+async fn run_powershell_script(script: &str) -> AppResult<()> {
+    let mut cmd = tokio::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| AppError::Msg(format!("执行 PowerShell 失败: {}", e)))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == "OK" {
+            return Ok(());
+        }
+        if let Some(msg) = line.strip_prefix("ERR|") {
+            let msg = msg.trim();
+            let canceled = msg.contains("取消") || msg.to_ascii_lowercase().contains("cancel");
+            return Err(AppError::Msg(if canceled {
+                "已取消管理员授权，无法继续（创建虚拟网卡需要管理员权限）".to_string()
+            } else {
+                format!("管理员授权执行失败: {}", msg)
+            }));
+        }
+    }
+    Err(AppError::Msg("管理员授权执行无响应，请重试".to_string()))
+}
+
+/// run.ps1 路径（数据目录下 easytier/run.ps1，参数变化仅重写此文件）
+fn run_ps1_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("easytier").join("run.ps1")
+}
+
+/// 写入 UTF-8 BOM 文件（PowerShell 5.1 对无 BOM 的 UTF-8 会按本地代码页解析，中文会乱码）
+fn write_utf8_bom(path: &Path, content: &str) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(content.as_bytes());
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// 生成 easytier-core 启动脚本（参数全部单引号包裹，含空格/中文均安全）
+fn write_run_ps1(path: &Path, core: &Path, args: &[String]) -> AppResult<()> {
+    let mut line = String::from("& ");
+    line.push_str(&ps_quote(&core.to_string_lossy()));
+    for a in args {
+        line.push(' ');
+        line.push_str(&ps_quote(a));
+    }
+    line.push('\n');
+    write_utf8_bom(path, &format!("# 由 VRchat-LocalCinema 自动生成，请勿手动修改\n{}\n", line))
+}
+
+/// run-hidden.vbs 路径（数据目录下 easytier/run-hidden.vbs）
+fn run_hidden_vbs_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("easytier").join("run-hidden.vbs")
+}
+
+/// wscript 隐藏窗口包装脚本内容。
+/// wscript 为 GUI 程序（无控制台），`Run(cmd, 0, True)` 中 0 = SW_HIDE（PowerShell 窗口
+/// 从创建起即隐藏，无闪现），True = 等待 run.ps1 退出（保持任务进程树完整，便于
+/// `schtasks /End` 一并终止）。内容保持纯 ASCII，run.ps1 路径从脚本自身位置推导，
+/// 避免在脚本内嵌入非 ASCII 路径导致 wscript 编码问题。
+const RUN_HIDDEN_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+folder = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\") - 1)
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & folder & "\run.ps1""", 0, True
+"#;
+
+/// 写入 run-hidden.vbs（纯 ASCII，无需 BOM）
+fn write_run_hidden_vbs(path: &Path) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, RUN_HIDDEN_VBS)?;
+    Ok(())
+}
+
+/// 运行 powershell 并捕获输出（普通权限）
+async fn powershell_output(script: &str) -> AppResult<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.output()
+        .await
+        .map_err(|e| AppError::Msg(format!("执行 PowerShell 失败: {}", e)))
+}
+
+/// 检查计划任务是否存在且动作指向当前 run-hidden.vbs
+/// 返回 Some(true)=匹配 / Some(false)=需重新注册 / None=查询失败
+async fn task_action_matches(vbs: &Path) -> Option<bool> {
+    let script = format!(
+        "$t = Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue; if ($t) {{ $a = @($t.Actions)[0]; if ($null -ne $a -and $a.Arguments -and $a.Arguments.Contains({})) {{ Write-Output 'MATCH' }} else {{ Write-Output 'STALE' }} }} else {{ Write-Output 'MISS' }}",
+        EASYTIER_TASK_NAME,
+        ps_quote(&vbs.to_string_lossy())
+    );
+    let output = powershell_output(&script).await.ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        match line.trim() {
+            "MATCH" => return Some(true),
+            "STALE" | "MISS" => return Some(false),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 以管理员权限注册/覆盖计划任务（首次 UAC 一次，之后不再需要）
+async fn register_task_elevated(vbs: &Path) -> AppResult<()> {
+    // 注册逻辑写入独立脚本文件后提权 -File 执行，避免嵌套引号问题
+    let reg = vbs.with_file_name("register-task.ps1");
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\n$v = {}\n$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $v + '\"')\n$u = \"$env:USERDOMAIN\\$env:USERNAME\"\n$principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest\n$set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew\nRegister-ScheduledTask -TaskName '{}' -Action $action -Principal $principal -Settings $set -Force | Out-Null\nWrite-Output 'OK'\n",
+        ps_quote(&vbs.to_string_lossy()),
+        EASYTIER_TASK_NAME
+    );
+    write_utf8_bom(&reg, &script)?;
+
+    let wrapper = format!(
+        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|注册脚本执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
+        ps_quote(&reg.to_string_lossy())
+    );
+    let result = run_powershell_script(&wrapper).await;
+    let _ = std::fs::remove_file(&reg);
+    result
+}
+
+/// 确保计划任务已注册且动作指向当前 run-hidden.vbs
+async fn ensure_task_registered(vbs: &Path) -> AppResult<()> {
+    match task_action_matches(vbs).await {
+        Some(true) => return Ok(()),
+        Some(false) => tracing::info!("计划任务不存在或动作过期，重新注册（可能需要管理员授权）"),
+        None => tracing::info!("无法确认计划任务状态，尝试重新注册"),
+    }
+    register_task_elevated(vbs).await
+}
+
+/// 触发计划任务启动 easytier-core（无需 UAC）
+async fn task_run() -> AppResult<()> {
+    let out = schtasks(&["/Run", "/TN", EASYTIER_TASK_NAME]).await?;
+    if !out.status.success() {
+        return Err(AppError::Msg(
+            "触发计划任务失败，请重新启动组网以重新注册任务".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 终止计划任务（无需 UAC；任务不存在时忽略失败）
+async fn task_end() {
+    let _ = schtasks(&["/End", "/TN", EASYTIER_TASK_NAME]).await;
+}
+
+/// 调用 schtasks（仅以退出码判断结果，规避本地化输出编码问题）
+async fn schtasks(args: &[&str]) -> AppResult<std::process::Output> {
+    let mut cmd = tokio::process::Command::new("schtasks");
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.output()
+        .await
+        .map_err(|e| AppError::Msg(format!("执行 schtasks 失败: {}", e)))
+}
+
+struct CoreProc {
+    pid: u32,
+}
+
+/// 枚举 easytier-core 进程（tasklist 按进程名过滤，CSV 第二列为 PID）
+fn core_processes() -> Vec<CoreProc> {
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", "IMAGENAME eq easytier-core.exe", "/FO", "CSV", "/NH"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let mut result = Vec::new();
+    if let Ok(out) = cmd.output() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() >= 2 {
+                if let Ok(pid) = cols[1].trim_matches('"').trim().parse::<u32>() {
+                    result.push(CoreProc { pid });
+                }
             }
         }
-    });
+    }
+    result
+}
+
+/// 轮询等待 easytier-core 进程全部退出
+async fn wait_processes_gone(rounds: usize) {
+    for _ in 0..rounds {
+        if core_processes().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+}
+
+/// 以管理员权限终止所有 easytier-core 进程（残留兜底）。`wait` 为 true 时等待完成。
+async fn kill_process_elevated_by_name(wait: bool) -> AppResult<()> {
+    let script = elevated_ps_script(
+        "Stop-Process -Name 'easytier-core' -Force -ErrorAction SilentlyContinue",
+        wait,
+    );
+    run_powershell_script(&script).await
 }
 
 /// 按 2 个以上空格切分表格列
@@ -603,6 +912,97 @@ pub fn clear_local_state(data_dir: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// 日志过滤的黑名单片段（基于真实运行日志归纳的刷屏来源）
+const LOG_DENY_PATTERNS: [&str; 11] = [
+    // 连接尝试按所有网卡逐个 bind 刷屏（bind addr / bind addr fail ... AddrNotAvailable）
+    "bind addr",
+    // tracing span 生命周期收尾行（close time.busy=... time.idle=...）
+    "time.busy=",
+    "time.idle=",
+    // STUN/NAT 探测细节
+    "get txt record",
+    "detect_nat_type",
+    // ospf 路由内部事件（关键事件已有 CORE::INSTANCE 行）
+    "global event received",
+    "ospf sync",
+    "new_initiator",
+    // 外网客户端转发刷屏
+    "send msg success",
+    // ring 隧道内部连接
+    "ring://",
+    // Wintun 无害警告
+    "Failed to find matching adapter name",
+];
+
+/// 行首时间戳判断（YYYY-MM-DDTHH...）；无时间戳视为上一行的续行（如启动 TOML 配置块）
+fn log_line_has_timestamp(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 10
+        && b[0].is_ascii_digit()
+        && b[1].is_ascii_digit()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+}
+
+/// 过滤 easytier-core 日志，只保留有价值的内容：
+/// - 保留：CORE::INSTANCE 关键事件（tun device ready / dhcp ip changed / new peer connection
+///   added 等）、WinTun 适配器生命周期、启动配置块（Starting easytier from cli 及其续行）、
+///   其余 WARN/ERROR（黑名单刷屏除外）
+/// - 丢弃：其余 INFO 噪音（连接 bind 尝试、STUN 探测、span 生命周期、ospf 内部事件等）
+pub fn filter_valuable_log(text: &str, max_lines: usize) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        if LOG_DENY_PATTERNS.iter().any(|p| line.contains(p)) {
+            continue;
+        }
+        let valuable = !log_line_has_timestamp(line)
+            || line.contains("CORE::INSTANCE")
+            || line.contains("WinTun:")
+            || line.contains("Starting easytier from cli")
+            || line.contains(" WARN ")
+            || line.contains(" ERROR ");
+        if valuable {
+            kept.push(line);
+        }
+    }
+    if kept.len() > max_lines {
+        let start = kept.len() - max_lines;
+        kept = kept.split_off(start);
+    }
+    kept.join("\n")
+}
+
+/// 读取日志文件末尾（最多 max_bytes 字节，UTF-8 lossy），丢弃可能被截断的首行
+pub fn read_log_tail(path: &Path, max_bytes: u64) -> AppResult<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        if let Some(pos) = text.find('\n') {
+            text.drain(..=pos);
+        }
+    }
+    Ok(text)
+}
+
+/// 查找日志目录下最近修改的日志文件
+pub fn newest_log_file(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
 /// 卸载 EasyTier 虚拟网卡设备（Wintun，FriendlyName 以 et_ 开头）。
 /// 重启 easytier-core 时会自动重新创建，即"重装网卡"。
 /// 返回成功卸载的设备数量。
@@ -756,5 +1156,93 @@ mod tests {
         assert!(parse_peers_json("not json").is_none());
         assert!(parse_peers_json("{}").is_none());
         assert!(parse_peers_json("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_write_run_ps1() {
+        let dir = std::env::temp_dir().join(format!("lc-ps1-test-{}", std::process::id()));
+        let path = run_ps1_path(&dir);
+        let core = Path::new("C:\\Program Files\\EasyTier\\easytier-core.exe");
+        let args = vec![
+            "--network-name".to_string(),
+            "影院房间".to_string(),
+            "--network-secret".to_string(),
+            "p'w\"d".to_string(),
+        ];
+        write_run_ps1(&path, core, &args).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // UTF-8 BOM 前缀
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let text = String::from_utf8_lossy(&bytes[3..]);
+        // 路径与参数单引号包裹，内部单引号翻倍
+        assert!(text.contains("& 'C:\\Program Files\\EasyTier\\easytier-core.exe'"));
+        assert!(text.contains("'影院房间'"));
+        assert!(text.contains("'p''w\"d'"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_register_task_script_shape() {
+        // 注册脚本必须以 UTF-8 BOM 落盘且包含任务名（引号转义由 ps_quote 保证）
+        let ps1 = Path::new("C:\\data\\easytier\\run.ps1");
+        let quoted = ps_quote(&ps1.to_string_lossy());
+        assert_eq!(quoted, "'C:\\data\\easytier\\run.ps1'");
+        assert_eq!(ps_quote("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn test_write_run_hidden_vbs() {
+        let dir = std::env::temp_dir().join(format!("lc-vbs-test-{}", std::process::id()));
+        let path = run_hidden_vbs_path(&dir);
+        write_run_hidden_vbs(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 纯 ASCII（wscript 兼容），且从脚本自身位置推导 run.ps1 路径
+        assert!(text.chars().all(|c| c.is_ascii()));
+        assert!(text.contains("WScript.ScriptFullName"));
+        assert!(text.contains("-WindowStyle Hidden"));
+        assert!(text.contains("\\run.ps1\"\"\""));
+        assert!(text.contains(", 0, True"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_filter_valuable_log() {
+        let raw = "2026-10-14T10:27:54+08:00  INFO CORE: Starting easytier from cli with config:\n\
+                   hostname = \"RAINBOW\"\n\
+                   dhcp = true\n\
+                   2026-10-14T10:27:55.8105+08:00 ERROR easytier::tunnel::tcp: bind addr fail bind_addr=1.2.3.4:0 addr=5.6.7.8:11010 error=IOError\n\
+                   2026-10-14T10:27:55.8107+08:00  INFO easytier::tunnel::tcp: bind addr bind_addr=1.2.3.4:0 addr=5.6.7.8:11010\n\
+                   2026-10-14T10:27:56.0279+08:00  INFO CORE::INSTANCE::CONNECTION: [id] new peer connection added conn_info=PeerConnInfo\n\
+                   2026-10-14T10:27:57.1036+08:00  INFO wintun::log: WinTun: Creating adapter\n\
+                   2026-10-14T10:27:57.6086+08:00 ERROR wintun::log: WinTun: Failed to find matching adapter name: x\n\
+                   2026-10-14T10:27:58.9317+08:00  INFO CORE::INSTANCE: [id] tun device ready dev=\"et_9_elby\"\n\
+                   2026-10-14T10:27:59.0113+08:00  INFO CORE::INSTANCE: [id] dhcp ip changed old=None new=Some(10.126.126.1/24)\n\
+                   2026-10-14T10:27:59.1+08:00  INFO try_connect_to_ip: easytier::connector::direct: close time.busy=3.21s time.idle=16.4s\n\
+                   2026-10-14T10:27:59.2+08:00  INFO easytier::common::dns: get txt record txt_data=x\n";
+        let filtered = filter_valuable_log(raw, 200);
+        assert!(filtered.contains("Starting easytier from cli"));
+        assert!(filtered.contains("hostname = \"RAINBOW\""));
+        assert!(filtered.contains("dhcp = true"));
+        assert!(filtered.contains("new peer connection added"));
+        assert!(filtered.contains("WinTun: Creating adapter"));
+        assert!(filtered.contains("tun device ready"));
+        assert!(filtered.contains("dhcp ip changed"));
+        assert!(!filtered.contains("bind addr fail"));
+        assert!(!filtered.contains("time.busy="));
+        assert!(!filtered.contains("get txt record"));
+        // 黑名单错误（Wintun 无害警告）同样被丢弃
+        assert!(!filtered.contains("Failed to find matching adapter name"));
+    }
+
+    #[test]
+    fn test_filter_valuable_log_max_lines() {
+        let raw: String = (0..300)
+            .map(|i| format!("2026-10-14T10:00:{:02}+08:00  INFO CORE::INSTANCE: [id] dhcp ip changed new=10.0.0.{}\n", i % 60, i))
+            .collect();
+        let filtered = filter_valuable_log(&raw, 100);
+        assert_eq!(filtered.lines().count(), 100);
+        // 保留的是最新的行
+        assert!(filtered.contains("10.0.0.299"));
+        assert!(!filtered.contains("10.0.0.0\n"));
     }
 }

@@ -1,7 +1,7 @@
 # VRchat-LocalCinema portable packaging script
 # Produces two archives in dist-portable:
-#   VRchat-Localcinema-base.zip  app only (components can be auto/manual downloaded in-app)
-#   VRchat-Localcinema-full.zip  app + bundled components (components\ffmpeg, components\easytier)
+#   VRchat-LocalCinema-v<version>-base.zip  app only (components can be auto/manual downloaded in-app)
+#   VRchat-LocalCinema-v<version>-full.zip  app + bundled components (components\ffmpeg, components\easytier)
 # Usage:
 #   powershell -File scripts\package-portable.ps1                      # base only unless components\ is ready
 #   powershell -File scripts\package-portable.ps1 -DownloadComponents  # fetch latest components first, then build full
@@ -130,9 +130,12 @@ try {
         Write-Host "==> Done: $zip"
     }
 
-    New-Package -Name "VRchat-Localcinema-base"
+    # App version drives the package file names (single source: src-tauri\tauri.conf.json)
+    $appVersion = (Get-Content (Join-Path $root "src-tauri\tauri.conf.json") -Raw | ConvertFrom-Json).version
+
+    New-Package -Name "VRchat-LocalCinema-v$appVersion-base"
     if ($fullReady) {
-        New-Package -Name "VRchat-Localcinema-full" -WithComponents
+        New-Package -Name "VRchat-LocalCinema-v$appVersion-full" -WithComponents
     } else {
         Write-Warning "Components incomplete - full package skipped. Run scripts\package-portable.ps1 -DownloadComponents to fetch them."
     }

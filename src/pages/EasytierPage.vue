@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import {
   Play,
   Square,
   RefreshCw,
   Save,
   RotateCcw,
+  ScrollText,
   Users,
   Layers,
   Download,
@@ -16,6 +17,7 @@ import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Input from '../components/ui/Input.vue'
 import Label from '../components/ui/Label.vue'
+import Select from '../components/ui/Select.vue'
 import Switch from '../components/ui/Switch.vue'
 import Badge from '../components/ui/Badge.vue'
 import Separator from '../components/ui/Separator.vue'
@@ -27,6 +29,7 @@ import {
   startEasytier,
   stopEasytier,
   getRoomInfo,
+  readEasytierLog,
   resetNetworkAdapter,
   getComponentsStatus,
   downloadComponent,
@@ -169,6 +172,40 @@ function stopPolling() {
   }
 }
 
+const logText = ref('')
+const logBox = ref<HTMLElement | null>(null)
+let logTimer: number | null = null
+
+// 拉取 easytier-core 运行日志（后端已过滤为有价值内容），变化时滚动到底部
+async function loadLog() {
+  try {
+    const t = await readEasytierLog()
+    const next = t ?? ''
+    if (next !== logText.value) {
+      logText.value = next
+      await nextTick()
+      const el = logBox.value
+      if (el) el.scrollTop = el.scrollHeight
+    }
+  } catch {
+    // 日志读取失败不影响页面
+  }
+}
+
+function startLogPolling() {
+  stopLogPolling()
+  logTimer = window.setInterval(() => {
+    if (status.value.running) loadLog()
+  }, 2000)
+}
+
+function stopLogPolling() {
+  if (logTimer !== null) {
+    window.clearInterval(logTimer)
+    logTimer = null
+  }
+}
+
 async function applyConfig() {
   const base = fullSettings.value
   if (!base) return
@@ -270,6 +307,8 @@ onMounted(async () => {
     await loadComponents()
     if (st.running) await loadRoom()
     startPolling()
+    await loadLog()
+    startLogPolling()
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
@@ -288,6 +327,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopPolling()
+  stopLogPolling()
   unlisteners.forEach((u) => u())
   unlisteners = []
 })
@@ -558,8 +598,8 @@ onUnmounted(() => {
               <td class="py-2 pr-3">{{ formatLatency(peer.latencyMs) }}</td>
               <td class="py-2 pr-3">{{ formatLoss(peer.loss) }}</td>
               <td class="py-2 pr-3">
-                <Button variant="outline" size="sm" :disabled="!peer.ipv4" @click="openPeer(peer)">
-                  查看媒体
+                <Button variant="outline" size="sm" @click="openPeer(peer)">
+                  查看媒体库
                 </Button>
               </td>
             </tr>
@@ -569,6 +609,26 @@ onUnmounted(() => {
       <p class="text-xs text-muted-foreground">
         本地媒体库共 {{ localCount }} 个媒体，已计算哈希的条目可直接与对方比对。
       </p>
+    </Card>
+
+    <Card class="space-y-3 p-5">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <ScrollText class="h-4 w-4 text-muted-foreground" />
+          <h2 class="font-medium">运行日志</h2>
+        </div>
+        <Button variant="ghost" size="sm" @click="loadLog">
+          <RefreshCw class="h-4 w-4" />
+          刷新
+        </Button>
+      </div>
+      <p class="text-xs text-muted-foreground">
+        仅显示关键事件（虚拟网卡、虚拟 IP、成员连接、警告与错误），组网运行中每 2 秒自动更新。
+      </p>
+      <pre
+        ref="logBox"
+        class="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md bg-muted/50 p-3 font-mono text-xs leading-relaxed"
+      >{{ logText || '暂无日志，启动组网后自动生成' }}</pre>
     </Card>
 
     <PeerMediaDialog

@@ -80,7 +80,7 @@ pub fn run() {
                 db,
                 server: server.clone(),
                 recent_logs,
-                easytier: easytier::EasytierManager::new(),
+                easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
             };
@@ -119,9 +119,9 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
-                    // 退出前停止 HTTP 服务与组网进程
+                    // 退出前停止 HTTP 服务与组网进程（组网提权运行，退出时不阻塞等待）
                     state.server.stop();
-                    state.easytier.stop();
+                    state.easytier.stop_detached();
                 }
             }
         })
@@ -160,6 +160,7 @@ pub fn run() {
             commands::start_easytier,
             commands::stop_easytier,
             commands::get_room_info,
+            commands::read_easytier_log,
             commands::reset_network_adapter,
             commands::fetch_peer_media,
             commands::download_peer_media,
@@ -205,7 +206,7 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => {
                 let state = app.state::<AppState>();
                 state.server.stop();
-                state.easytier.stop();
+                state.easytier.stop_detached();
                 app.exit(0);
             }
             _ => {}

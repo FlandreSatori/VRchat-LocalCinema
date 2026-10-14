@@ -9,7 +9,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import brandIcon from '../watching_video.png'
 import Toaster from './components/Toaster.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
-import { APP_BRAND } from './lib/appinfo'
+import { APP_BRAND, APP_VERSION } from './lib/appinfo'
 import { initStore, serverStore, importMediaPaths } from './lib/store'
 import { toast, errMsg } from './lib/toast'
 
@@ -132,7 +132,7 @@ onUnmounted(() => {
     >
       <div class="flex h-full w-[220px] shrink-0 items-center gap-2 border-r border-border bg-card px-4">
         <img :src="brandIcon" alt="" draggable="false" class="pointer-events-none h-6 w-6 object-contain" />
-        <span class="pointer-events-none truncate text-xs font-semibold tracking-tight">{{ APP_BRAND }}</span>
+        <span class="pointer-events-none truncate text-xs font-semibold tracking-tight">{{ APP_BRAND }} <span class="font-normal text-muted-foreground">v{{ APP_VERSION }}</span></span>
       </div>
       <div class="h-full flex-1" />
       <div v-if="appWindow" class="flex h-full shrink-0">

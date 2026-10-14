@@ -16,7 +16,7 @@ use crate::logger::LogEntry;
 use crate::logger::RecentLogs;
 use crate::media_library::{Db, MediaItem, MediaStatus, MediaSummary};
 use crate::network_interfaces::{self, NetInterface};
-use crate::settings::{AppPaths, CloseBehavior, Settings, UrlMode};
+use crate::settings::{AppPaths, CloseBehavior, ListenMode, Settings, UrlMode};
 use crate::thumbnail;
 use crate::url_builder::{self, UrlInput};
 
@@ -842,7 +842,23 @@ pub async fn get_easytier_status(state: State<'_, AppState>) -> AppResult<Easyti
 
 #[tauri::command]
 pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
-    let settings = state.current_settings();
+    let mut settings = state.current_settings();
+    // 组网媒体共享通过虚拟网段访问 HTTP 服务，仅本机（127.0.0.1）监听会导致
+    // 成员之间（包括查看自己的媒体库）无法连接，启动组网时自动切换为局域网监听
+    if settings.listen_mode == ListenMode::Loopback {
+        settings.listen_mode = ListenMode::Lan;
+        {
+            let mut guard = state.settings.write().unwrap();
+            *guard = settings.clone();
+        }
+        settings.save(&state.paths.settings_file)?;
+        let server = state.server.clone();
+        server.stop();
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        server.start(&settings.bind_ip(), settings.port).await?;
+        AppState::emit_status(&app, &server);
+        tracing::info!("监听模式已自动切换为局域网（组网媒体共享需要）");
+    }
     let (core, _) = components::easytier_core_binary(&settings, &state.paths);
     let core = core.ok_or_else(|| {
         AppError::Msg("未检测到 easytier-core，请先在设置中下载或指定 EasyTier 组件".to_string())
@@ -859,6 +875,14 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
         ));
     }
     let args = easytier::build_args(&cfg);
+    // 提权启动后无法捕获 stdout，core 改写文件日志（排查虚拟网卡/组网问题）
+    let core_log_dir = state.paths.log_dir.join("easytier-core");
+    let _ = std::fs::create_dir_all(&core_log_dir);
+    let mut args = args;
+    args.push("--file-log-dir".to_string());
+    args.push(core_log_dir.to_string_lossy().into_owned());
+    args.push("--file-log-level".to_string());
+    args.push("info".to_string());
     let status = state.easytier.start(&core, args).await?;
     // 缓存本机虚拟 IP（配置未指定时由 build URL 时按需查询 route）
     let configured_ip = cfg.ipv4.trim().split('/').next().unwrap_or("").to_string();
@@ -875,7 +899,7 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
 
 #[tauri::command]
 pub async fn stop_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
-    state.easytier.stop();
+    state.easytier.stop().await;
     let status = state.easytier.status();
     let _ = app.emit("easytier-status-changed", &status);
     Ok(status)
@@ -890,6 +914,16 @@ pub async fn get_room_info(state: State<'_, AppState>) -> AppResult<RoomInfo> {
     Ok(easytier::fetch_room_info(&cli).await)
 }
 
+/// 读取 easytier-core 运行日志（最近一块，过滤后有价值的尾部内容），供组网页面展示。
+/// 无日志文件时返回 None。
+#[tauri::command]
+pub fn read_easytier_log(state: State<'_, AppState>) -> Option<String> {
+    let dir = state.paths.log_dir.join("easytier-core");
+    let file = easytier::newest_log_file(&dir)?;
+    let text = easytier::read_log_tail(&file, 512 * 1024).ok()?;
+    Some(easytier::filter_valuable_log(&text, 200))
+}
+
 /// 重置网卡：停止组网并清理本地虚拟网卡缓存后重新启动
 #[tauri::command]
 pub async fn reset_network_adapter(
@@ -897,7 +931,7 @@ pub async fn reset_network_adapter(
     state: State<'_, AppState>,
 ) -> AppResult<EasytierStatus> {
     let was_running = state.easytier.status().running;
-    state.easytier.stop();
+    state.easytier.stop().await;
     match easytier::uninstall_tun_adapter().await {
         Ok(0) => tracing::info!("没有需要卸载的 EasyTier 虚拟网卡"),
         Ok(n) => tracing::info!("已卸载 {} 个 EasyTier 虚拟网卡设备", n),

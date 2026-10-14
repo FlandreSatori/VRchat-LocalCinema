@@ -427,6 +427,9 @@ export function stopEasytier(): Promise<EasytierStatus> {
 export function getRoomInfo(): Promise<RoomInfo> {
   return invoke('get_room_info')
 }
+export function readEasytierLog(): Promise<string | null> {
+  return invoke('read_easytier_log')
+}
 export function resetNetworkAdapter(): Promise<EasytierStatus> {
   return invoke('reset_network_adapter')
 }

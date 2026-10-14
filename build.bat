@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================
 REM  VRchat-LocalCinema - build from source and package portable
-REM  Produces dist-portable\VRchat-Localcinema-base.zip
-REM          dist-portable\VRchat-Localcinema-full.zip (needs components\)
+REM  Produces dist-portable\VRchat-LocalCinema-v<version>-base.zip
+REM          dist-portable\VRchat-LocalCinema-v<version>-full.zip (needs components\)
 REM
 REM  Usage:
 REM    build.bat                      build base (and full if components ready)
@@ -32,13 +32,13 @@ if not "%EC%"=="0" (
 
 echo.
 echo ==^> Step 2/2: verifying output ...
-if exist "dist-portable\VRchat-Localcinema-base.zip" (
-    echo [OK] dist-portable\VRchat-Localcinema-base.zip
+if exist "dist-portable\VRchat-LocalCinema-v*-base.zip" (
+    echo [OK] dist-portable\VRchat-LocalCinema-v*-base.zip
 ) else (
     echo [WARN] base zip not found
 )
-if exist "dist-portable\VRchat-Localcinema-full.zip" (
-    echo [OK] dist-portable\VRchat-Localcinema-full.zip
+if exist "dist-portable\VRchat-LocalCinema-v*-full.zip" (
+    echo [OK] dist-portable\VRchat-LocalCinema-v*-full.zip
 ) else (
     echo [WARN] full zip not found - run: build.bat -DownloadComponents
 )

@@ -15,9 +15,9 @@ const emit = defineEmits<{
 
 <template>
   <SwitchRoot
-    :checked="checked"
+    :model-value="checked"
     :disabled="disabled"
-    @update:checked="emit('update:checked', $event)"
+    @update:model-value="emit('update:checked', $event)"
     :class="
       cn(
         'inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors data-[state=checked]:bg-primary data-[state=unchecked]:bg-input disabled:cursor-not-allowed disabled:opacity-50',
