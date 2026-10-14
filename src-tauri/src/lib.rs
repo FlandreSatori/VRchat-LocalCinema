@@ -39,6 +39,19 @@ pub fn run() {
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let paths = settings::resolve_paths(&exe);
             let _ = std::fs::create_dir_all(&paths.thumb_dir);
+            // 清理上次转码中断遗留的临时产物（*.part.mp4），避免残留半成品
+            {
+                let converted = paths.data_dir.join("converted");
+                if converted.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&converted) {
+                        for e in entries.flatten() {
+                            if e.file_name().to_string_lossy().ends_with(".part.mp4") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            }
             let recent_logs = logger::init(&paths.log_dir);
             tracing::info!(
                 "应用启动，数据目录: {} (便携模式: {})",
@@ -177,6 +190,8 @@ pub fn run() {
             commands::download_task_resume,
             commands::transcode_media,
             commands::transcode_output_exists,
+            commands::generate_sample,
+            commands::reveal_path,
             commands::segment_transcode,
             commands::list_segments,
             commands::list_convert_tasks,

@@ -41,6 +41,7 @@ import {
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import { settingsCache, mediaStore } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
+import { confirmDialog } from '../lib/confirm'
 import { formatSize } from '../lib/format'
 
 const form = reactive<Settings>({
@@ -291,7 +292,13 @@ async function save() {
 }
 
 async function reset() {
-  if (!confirm('确定恢复默认设置吗？所有自定义配置将被重置。')) return
+  const ok = await confirmDialog({
+    title: '恢复默认设置？',
+    description: '确定恢复默认设置吗？所有自定义配置将被重置。',
+    confirmText: '恢复默认',
+    danger: true,
+  })
+  if (!ok) return
   try {
     const s = await resetSettings()
     Object.assign(form, s)
@@ -343,14 +350,15 @@ async function openTranscodeDir() {
 async function doClearConvertCache() {
   const info = convertCache.value
   if (!info || clearingConvertCache.value) return
-  if (
-    !confirm(
-      `确定清除全部转码缓存吗？\n` +
-        `将删除转码目录下的 ${info.fileCount} 个文件（约 ${formatSize(info.totalBytes)}），` +
-        `并从媒体库移除对应的转码产物记录。\n源视频与磁盘上的其他文件不受影响。`
-    )
-  )
-    return
+  const ok = await confirmDialog({
+    title: '清除转码缓存？',
+    description:
+      `将删除转码目录下的 ${info.fileCount} 个文件（约 ${formatSize(info.totalBytes)}），` +
+      '并从媒体库移除对应的转码产物记录。源视频与磁盘上的其他文件不受影响。',
+    confirmText: '清除',
+    danger: true,
+  })
+  if (!ok) return
   clearingConvertCache.value = true
   try {
     const r = await clearConvertCache()

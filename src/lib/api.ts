@@ -261,6 +261,27 @@ export function transcodeMedia(id: string, overwrite?: boolean): Promise<Convert
 export function transcodeOutputExists(id: string, kind?: 'transcode' | 'segment'): Promise<boolean> {
   return invoke('transcode_output_exists', { id, kind })
 }
+/** 样本生成完成事件：ok 为 true 时 path 为样本文件路径 */
+export interface SampleDoneEvent {
+  mediaId: string
+  ok: boolean
+  path: string | null
+  error: string | null
+}
+/** 生成视频样本（截取前 10 秒，保存到源视频所在目录），完成后触发 sample-done 事件 */
+export function generateSample(id: string): Promise<void> {
+  return invoke('generate_sample', { id })
+}
+/** 监听样本生成完成事件 */
+export function onSampleDone(
+  callback: (e: SampleDoneEvent) => void
+): Promise<UnlistenFn> {
+  return listen<SampleDoneEvent>('sample-done', (ev) => callback(ev.payload))
+}
+/** 在资源管理器中定位文件（选中） */
+export function revealPath(path: string): Promise<void> {
+  return invoke('reveal_path', { path })
+}
 export function segmentTranscode(id: string, firstMs: number, overwrite?: boolean): Promise<ConvertTask> {
   return invoke('segment_transcode', { id, firstMs, overwrite })
 }

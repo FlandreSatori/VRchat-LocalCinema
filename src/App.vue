@@ -8,6 +8,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import type { UnlistenFn } from '@tauri-apps/api/event'
 import brandIcon from '../watching_video.png'
 import Toaster from './components/Toaster.vue'
+import ConfirmHost from './components/ConfirmHost.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
 import { initStore, serverStore, importMediaPaths } from './lib/store'
@@ -195,6 +196,7 @@ onUnmounted(() => {
     </div>
 
     <Toaster />
+    <ConfirmHost />
 
     <div
       v-if="dragActive"

@@ -1676,6 +1676,25 @@ fn transcode_args(
     args
 }
 
+/// 转码临时产物路径（`<原名>.part.mp4`）：ffmpeg 先写临时文件，成功后改名为正式产物，
+/// 中途退出/崩溃不会在产物目录留下被误认为已完成转码的半成品。
+/// 注意：下载任务使用 part_path（`.part` 后缀，支持断点续传）；此处必须保留 .mp4 扩展名供 ffmpeg 识别格式
+fn transcode_part_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output.mp4".into());
+    dest.with_file_name(format!("{}.part.mp4", name))
+}
+
+/// 转码成功后把临时产物改名到最终路径（Windows 上 rename 不能覆盖已存在文件，先删再改）
+fn promote_part(part: &std::path::Path, dest: &std::path::Path) -> AppResult<()> {
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(part, dest)
+        .map_err(|e| AppError::Msg(format!("保存转码产物失败: {}", e)))?;
+    Ok(())
+}
+
 /// 加入转码队列（按任务序列执行），可在「转码任务」页查看进度、开始或取消；
 /// overwrite 为 true 时直接覆盖已存在的转码产物（前端已弹出覆盖确认）
 #[tauri::command]
@@ -1719,6 +1738,108 @@ pub async fn transcode_output_exists(
         vec![format!("{} (转码).mp4", stem)]
     };
     Ok(names.iter().any(|n| dir.join(n).exists()))
+}
+
+/// 样本生成完成事件（前端据此提示并打开所在目录）
+#[derive(Clone, serde::Serialize)]
+struct SampleDoneEvent {
+    media_id: String,
+    ok: bool,
+    path: Option<String>,
+    error: Option<String>,
+}
+
+/// 生成视频样本：调用 ffmpeg 截取前 10 秒转码保存到源视频所在目录，
+/// 完成后发送 sample-done 事件，由前端打开资源管理器定位文件
+#[tauri::command]
+pub async fn generate_sample(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<()> {
+    let item = get_item_checked(&state, &id)?;
+    if !std::path::Path::new(&item.file_path).is_file() {
+        return Err(AppError::Msg("文件已丢失或无法访问".into()));
+    }
+    let settings = state.current_settings();
+    let (ffmpeg, _) = components::ffmpeg_binary(&settings, &state.paths);
+    let ffmpeg = ffmpeg
+        .ok_or_else(|| AppError::Msg("未检测到 ffmpeg，请先在设置中下载或指定 FFmpeg 组件".into()))?;
+
+    let media_id = id;
+    let file_path = item.file_path.clone();
+    tokio::spawn(async move {
+        let event = match run_sample_ffmpeg(&ffmpeg, &file_path).await {
+            Ok(dest) => SampleDoneEvent {
+                media_id,
+                ok: true,
+                path: Some(dest.to_string_lossy().to_string()),
+                error: None,
+            },
+            Err(e) => SampleDoneEvent {
+                media_id,
+                ok: false,
+                path: None,
+                error: Some(e.to_string()),
+            },
+        };
+        let _ = app.emit("sample-done", &event);
+    });
+    Ok(())
+}
+
+/// 构建样本截取参数：流复制（-c copy）保持原编码与原封装格式，仅重封装前 10 秒，不重新转码
+fn sample_args(input: &str, dest: &std::path::Path) -> Vec<String> {
+    vec![
+        "-y".into(),
+        "-i".into(),
+        input.to_string(),
+        "-map".into(),
+        "0:v?".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-map".into(),
+        "0:s?".into(),
+        "-c".into(),
+        "copy".into(),
+        "-t".into(),
+        "10".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
+        dest.to_string_lossy().to_string(),
+    ]
+}
+
+/// 截取视频前 10 秒生成样本文件：-c copy 流复制（保持原格式和原封装，速度极快），
+/// 命名为 `<原名> (样本).<原扩展名>`，保存到源视频所在目录
+async fn run_sample_ffmpeg(ffmpeg: &PathBuf, file_path: &str) -> AppResult<PathBuf> {
+    let src = std::path::Path::new(file_path);
+    let dir = src.parent().unwrap_or(std::path::Path::new("."));
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "video".into());
+    let ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mp4".into());
+    let dest = unique_dest(dir, &format!("{} (样本).{}", stem, ext));
+    let part = transcode_part_path(&dest);
+    let args = sample_args(file_path, &part);
+    let result = run_ffmpeg_with_progress(ffmpeg, &args, Some(10_000), None, |_| {}).await;
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    promote_part(&part, &dest)?;
+    Ok(dest)
+}
+
+/// 在资源管理器中定位文件（选中该文件）
+#[tauri::command]
+pub async fn reveal_path(path: String) -> AppResult<()> {
+    external_player::reveal_in_folder(&PathBuf::from(path))
 }
 
 /// 加入分段转码队列：第一段默认总时长 10%（向上取整到 5 分钟），可由前端调整 firstMs；
@@ -1871,7 +1992,8 @@ async fn run_queued_transcode(
         unique_dest(&dir, &out_name)
     };
 
-    let args = transcode_args(&item.file_path, &dest, None, None);
+    let part = transcode_part_path(&dest);
+    let args = transcode_args(&item.file_path, &part, None, None);
 
     let progress_app = app.clone();
     let progress_media_id = task.media_id.clone();
@@ -1900,9 +2022,10 @@ async fn run_queued_transcode(
     .await;
 
     if let Err(e) = result {
-        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&part);
         return Err(e);
     }
+    promote_part(&part, &dest)?;
 
     // 源条目视为已处理；保留在「不兼容」文件夹原位置，由转码产物的快捷方式卡片承接跳转
     let updated = {
@@ -1961,7 +2084,8 @@ async fn transcode_segment(
     cancel: Arc<std::sync::atomic::AtomicBool>,
     segment_index: i64,
 ) -> AppResult<MediaItem> {
-    let args = transcode_args(&source.file_path, dest, start_sec, dur_sec);
+    let part = transcode_part_path(dest);
+    let args = transcode_args(&source.file_path, &part, start_sec, dur_sec);
     let progress_app = app.clone();
     let progress_media_id = task.media_id.clone();
     let progress_task_id = task.id.clone();
@@ -1989,9 +2113,10 @@ async fn transcode_segment(
     )
     .await;
     if let Err(e) = result {
-        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(&part);
         return Err(e);
     }
+    promote_part(&part, dest)?;
 
     // 分段产物入库：登记源关联与段序号
     let registered = {

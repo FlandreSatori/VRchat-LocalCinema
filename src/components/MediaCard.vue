@@ -16,6 +16,8 @@ import {
   FileVideo,
   ListVideo,
   CornerUpLeft,
+  Scissors,
+  Check,
 } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -35,16 +37,24 @@ import {
   removeMedia,
   transcodeMedia,
   transcodeOutputExists,
+  generateSample,
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
+import { confirmDialog } from '../lib/confirm'
 import { formatSize, formatDuration } from '../lib/format'
 import { serverStore, convertStore, convertTaskStore } from '../lib/store'
 
-const props = defineProps<{
-  item: MediaItem
-}>()
+const props = withDefaults(
+  defineProps<{
+    item: MediaItem
+    /** 批量管理模式：显示勾选框，点击卡片切换选中 */
+    selectable?: boolean
+    selected?: boolean
+  }>(),
+  { selectable: false, selected: false }
+)
 
 const emit = defineEmits<{
   'copy-link': [item: MediaItem]
@@ -53,6 +63,7 @@ const emit = defineEmits<{
   move: [item: MediaItem]
   'goto-source': [sourceId: string]
   'segment-transcode': [item: MediaItem]
+  'toggle-select': [id: string]
 }>()
 
 const router = useRouter()
@@ -102,16 +113,29 @@ async function copyUrl(mode: UrlMode, label: string) {
 
 async function doTranscode() {
   try {
-    // 已存在转码产物时，先询问是否覆盖
+    // 已存在转码产物时，先询问是否覆盖（应用内确认框，替代原生 confirm）
     let overwrite = false
     if (await transcodeOutputExists(props.item.id)) {
-      overwrite = confirm(
-        `「${props.item.title}」已存在转码产物，再次转码将覆盖该文件。\n是否继续？`
-      )
+      overwrite = await confirmDialog({
+        title: '覆盖转码产物？',
+        description: `「${props.item.title}」已存在转码产物，再次转码将覆盖该文件。`,
+        confirmText: '覆盖',
+        danger: true,
+      })
       if (!overwrite) return
     }
     await transcodeMedia(props.item.id, overwrite)
     toast.info('已加入转码队列，可在「任务」页查看进度或调整顺序')
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+/// 生成样本：截取视频前 10 秒保存到源视频所在目录，完成后自动打开资源管理器定位
+async function doSample() {
+  try {
+    await generateSample(props.item.id)
+    toast.info('正在生成样本（前 10 秒），完成后将打开所在目录')
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -166,7 +190,13 @@ async function changeThumbnail() {
 }
 
 async function doRemove() {
-  if (!confirm(`确定从媒体库移除「${props.item.title}」吗？\n仅移除记录，不会删除磁盘文件。`)) return
+  const ok = await confirmDialog({
+    title: '从媒体库移除？',
+    description: `确定移除「${props.item.title}」吗？仅移除记录，不会删除磁盘文件。`,
+    confirmText: '移除',
+    danger: true,
+  })
+  if (!ok) return
   try {
     await removeMedia(props.item.id)
     emit('removed', props.item.id)
@@ -224,6 +254,7 @@ const menuItems = computed<MenuEntry[]>(() => {
       disabled: props.item.durationMs === null,
       onSelect: () => emit('segment-transcode', props.item),
     },
+    { type: 'item', label: '生成样本（前 10 秒）', icon: Scissors, onSelect: doSample },
     { type: 'item', label: '刷新媒体信息', icon: RefreshCw, onSelect: doRefresh },
     { type: 'item', label: '更换封面', icon: ImageIcon, onSelect: changeThumbnail },
     { type: 'item', label: '重命名', icon: Pencil, onSelect: () => emit('rename', props.item) },
@@ -243,9 +274,22 @@ function navigateToConvert() {
   <ContextMenu :items="menuItems">
     <div
       class="group overflow-hidden rounded-lg border bg-card shadow-sm transition-colors hover:border-primary/40"
-      :class="unsupported ? 'border-destructive/40' : 'border-border'"
+      :class="[unsupported ? 'border-destructive/40' : 'border-border', selectable ? 'cursor-pointer' : '']"
+      :style="selected ? 'border-color: hsl(var(--primary))' : ''"
+      @click="selectable && emit('toggle-select', item.id)"
     >
       <div class="relative aspect-square w-full overflow-hidden bg-zinc-900">
+        <!-- 批量管理勾选框 -->
+        <button
+          v-if="selectable"
+          type="button"
+          class="absolute left-2 top-2 z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 backdrop-blur-sm transition-colors"
+          :class="selected ? 'border-primary bg-primary text-primary-foreground' : 'border-white/70 bg-black/40 text-transparent'"
+          :title="selected ? '取消选择' : '选择'"
+          @click.stop="emit('toggle-select', item.id)"
+        >
+          <Check class="h-4 w-4" />
+        </button>
         <img
           v-if="showImage"
           :src="thumbUrl!"
@@ -271,7 +315,8 @@ function navigateToConvert() {
         <Badge
           v-if="isShortcut"
           variant="secondary"
-          class="absolute left-2 top-2 cursor-help"
+          class="absolute top-2 cursor-help"
+          :class="selectable ? 'left-10' : 'left-2'"
           title="这是源视频的转码产物（快捷方式）；源视频仍在原位置，可通过右键菜单跳转"
         >
           转码产物

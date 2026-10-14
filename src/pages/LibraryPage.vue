@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import {
   Film,
   Plus,
@@ -13,6 +13,10 @@ import {
   FolderPlus,
   CornerUpLeft,
   Users,
+  ListChecks,
+  FolderInput,
+  FileVideo,
+  Check,
 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Button from '../components/ui/Button.vue'
@@ -32,6 +36,7 @@ import {
   folderStore,
   serverStore,
   settingsCache,
+  convertTaskStore,
   importMediaPaths,
   removeMediaItem,
   loadFolders,
@@ -42,13 +47,18 @@ import {
   deleteFolder,
   renameMedia,
   moveMedia,
+  removeMedia,
+  transcodeMedia,
   segmentTranscode,
   transcodeOutputExists,
   onSegmentReady,
+  onSampleDone,
+  revealPath,
   getEasytierStatus,
   getRoomInfo,
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
+import { confirmDialog } from '../lib/confirm'
 import { formatDuration } from '../lib/format'
 
 const search = ref('')
@@ -258,7 +268,13 @@ function folderMenu(f: Folder): MenuEntry[] {
 }
 
 async function doDeleteFolder(f: Folder) {
-  if (!confirm(`确定删除文件夹「${f.name}」吗？\n其中的视频将移回上一级（不会删除磁盘文件）。`)) return
+  const ok = await confirmDialog({
+    title: '删除文件夹？',
+    description: `确定删除文件夹「${f.name}」吗？其中的视频将移回上一级（不会删除磁盘文件）。`,
+    confirmText: '删除',
+    danger: true,
+  })
+  if (!ok) return
   try {
     await deleteFolder(f.id)
     await loadFolders(true)
@@ -357,6 +373,120 @@ function gotoSource(sourceId: string) {
   }
   currentFolderId.value = src.folderId
   toast.info(`已跳转到源视频「${src.title}」所在位置`)
+}
+
+// ---------- 批量管理（多选：移动 / 删除 / 转码） ----------
+
+const selectMode = ref(false)
+const selectedIds = ref<Set<string>>(new Set())
+
+function toggleSelectMode() {
+  selectMode.value = !selectMode.value
+  if (!selectMode.value) selectedIds.value = new Set()
+}
+
+function toggleSelect(id: string) {
+  const next = new Set(selectedIds.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  selectedIds.value = next
+}
+
+const selectedCount = computed(() => selectedIds.value.size)
+const allFilteredSelected = computed(
+  () => filtered.value.length > 0 && filtered.value.every((m) => selectedIds.value.has(m.id))
+)
+
+function selectAllFiltered() {
+  const next = new Set(selectedIds.value)
+  if (allFilteredSelected.value) {
+    filtered.value.forEach((m) => next.delete(m.id))
+  } else {
+    filtered.value.forEach((m) => next.add(m.id))
+  }
+  selectedIds.value = next
+}
+
+// 切换文件夹或修改搜索时清空选择，避免误操作不可见条目
+watch([currentFolderId, search], () => {
+  selectedIds.value = new Set()
+})
+
+/// 批量移动对话框
+const batchMoveOpen = ref(false)
+const batchMoveTarget = ref('__root__')
+
+function openBatchMove() {
+  batchMoveTarget.value = currentFolderId.value ?? '__root__'
+  batchMoveOpen.value = true
+}
+
+async function submitBatchMove() {
+  const target = batchMoveTarget.value === '__root__' ? null : batchMoveTarget.value
+  const ids = [...selectedIds.value]
+  let ok = 0
+  for (const id of ids) {
+    try {
+      const updated = await moveMedia(id, target)
+      mediaItemUpdated(updated)
+      ok++
+    } catch {
+      // 单个失败不中断，最后统一汇报
+    }
+  }
+  batchMoveOpen.value = false
+  toast.success(`已移动 ${ok}/${ids.length} 个视频`)
+}
+
+/// 批量转码：跳过转码产物卡片与已在队列中的条目；已存在产物时使用新文件名（不覆盖）
+async function batchTranscode() {
+  const ids = [...selectedIds.value]
+  let queued = 0
+  let skipped = 0
+  for (const id of ids) {
+    const item = mediaStore.items.find((m) => m.id === id)
+    const busy = convertTaskStore.tasks.some(
+      (t) => t.mediaId === id && (t.state === 'queued' || t.state === 'running')
+    )
+    if (!item || item.sourceMediaId !== null || busy) {
+      skipped++
+      continue
+    }
+    try {
+      await transcodeMedia(id, false)
+      queued++
+    } catch {
+      skipped++
+    }
+  }
+  if (queued > 0) {
+    toast.info(`已加入转码队列 ${queued} 个${skipped ? `，跳过 ${skipped} 个` : ''}`)
+  } else {
+    toast.error('没有可转码的条目（转码产物与已在队列中的会被跳过）')
+  }
+}
+
+async function batchRemove() {
+  const n = selectedIds.value.size
+  const ok = await confirmDialog({
+    title: '从媒体库移除？',
+    description: `确定移除选中的 ${n} 个视频吗？仅移除记录，不会删除磁盘文件。`,
+    confirmText: '移除',
+    danger: true,
+  })
+  if (!ok) return
+  let done = 0
+  for (const id of [...selectedIds.value]) {
+    try {
+      await removeMedia(id)
+      removeMediaItem(id)
+      done++
+    } catch {
+      // 单个失败不中断
+    }
+  }
+  selectedIds.value = new Set()
+  toast.success(`已移除 ${done}/${n} 个`)
 }
 
 // ---------- 查看他人媒体库 ----------
@@ -463,10 +593,15 @@ async function submitSegmentDialog() {
   }
   const firstMs = minutes * 60_000
   try {
-    // 已存在分段产物时，先询问是否覆盖
+    // 已存在分段产物时，先询问是否覆盖（应用内确认框）
     let overwrite = false
     if (await transcodeOutputExists(item.id, 'segment')) {
-      overwrite = confirm('已存在分段转码产物，再次分段转码将覆盖同名文件。\n是否继续？')
+      overwrite = await confirmDialog({
+        title: '覆盖分段产物？',
+        description: '已存在分段转码产物，再次分段转码将覆盖同名文件。',
+        confirmText: '覆盖',
+        danger: true,
+      })
       if (!overwrite) return
     }
     await segmentTranscode(item.id, firstMs, overwrite)
@@ -477,8 +612,9 @@ async function submitSegmentDialog() {
   }
 }
 
-// 第一段转码完成：弹出「复制链接」窗口（分段播放）
+// 第一段转码完成：弹出「复制链接」窗口（分段播放）；样本生成完成：提示并打开所在目录
 let unlistenSegmentReady: UnlistenFn | null = null
+let unlistenSampleDone: UnlistenFn | null = null
 onMounted(async () => {
   try {
     const fn = await onSegmentReady((seg) => {
@@ -493,9 +629,23 @@ onMounted(async () => {
   } catch {
     // 非 Tauri 环境忽略
   }
+  try {
+    const fn = await onSampleDone((e) => {
+      if (e.ok && e.path) {
+        toast.success('样本已生成，正在打开所在目录')
+        revealPath(e.path).catch(() => {})
+      } else {
+        toast.error(`样本生成失败：${e.error ?? '未知错误'}`)
+      }
+    })
+    unlistenSampleDone = fn
+  } catch {
+    // 非 Tauri 环境忽略
+  }
 })
 onUnmounted(() => {
   unlistenSegmentReady?.()
+  unlistenSampleDone?.()
 })
 </script>
 
@@ -510,6 +660,10 @@ onUnmounted(() => {
         <Button variant="outline" @click="openPeerMedia">
           <Users class="h-4 w-4" />
           查看他人媒体库
+        </Button>
+        <Button variant="outline" :class="selectMode ? 'border-primary text-primary' : ''" @click="toggleSelectMode">
+          <ListChecks class="h-4 w-4" />
+          {{ selectMode ? '退出多选' : '批量管理' }}
         </Button>
         <Button variant="outline" :disabled="importing" @click="openCreateFolder">
           <FolderPlus class="h-4 w-4" />
@@ -642,13 +796,42 @@ onUnmounted(() => {
         v-for="item in filtered"
         :key="item.id"
         :item="item"
+        :selectable="selectMode"
+        :selected="selectedIds.has(item.id)"
         @copy-link="openUrlDialog"
         @removed="onRemoved"
         @rename="openRenameFile"
         @move="openMoveFile"
         @goto-source="gotoSource"
         @segment-transcode="openSegmentDialog"
+        @toggle-select="toggleSelect"
       />
+    </div>
+
+    <!-- 批量管理操作栏 -->
+    <div
+      v-if="selectMode"
+      class="fixed bottom-6 left-1/2 z-40 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-border bg-card px-4 py-2 shadow-lg"
+    >
+      <span class="whitespace-nowrap text-sm font-medium">
+        <Check class="mr-1 inline h-4 w-4 text-primary" />已选 {{ selectedCount }} 个
+      </span>
+      <Button size="sm" variant="ghost" :disabled="!filtered.length" @click="selectAllFiltered">
+        {{ allFilteredSelected ? '取消全选' : '全选' }}
+      </Button>
+      <Button size="sm" variant="outline" :disabled="!selectedCount" @click="openBatchMove">
+        <FolderInput class="h-3.5 w-3.5" />
+        移动到…
+      </Button>
+      <Button size="sm" variant="outline" :disabled="!selectedCount" @click="batchTranscode">
+        <FileVideo class="h-3.5 w-3.5" />
+        转码 MP4
+      </Button>
+      <Button size="sm" variant="destructive" :disabled="!selectedCount" @click="batchRemove">
+        <Trash2 class="h-3.5 w-3.5" />
+        移除
+      </Button>
+      <Button size="sm" variant="ghost" @click="toggleSelectMode">完成</Button>
     </div>
 
     <!-- 空文件夹提示（含返回上一级卡片时的补充说明） -->
@@ -804,6 +987,25 @@ onUnmounted(() => {
         <div class="flex justify-end gap-2">
           <Button type="button" variant="outline" @click="fileDialog.open = false">取消</Button>
           <Button type="submit">{{ fileDialog.mode === 'rename' ? '保存' : '移动' }}</Button>
+        </div>
+      </form>
+    </Dialog>
+
+    <!-- 批量移动视频 -->
+    <Dialog
+      :open="batchMoveOpen"
+      title="批量移动视频"
+      :description="`将选中的 ${selectedCount} 个视频移动到目标文件夹（不会改动磁盘文件）`"
+      @update:open="batchMoveOpen = $event"
+    >
+      <form class="space-y-4" @submit.prevent="submitBatchMove">
+        <div class="space-y-1.5">
+          <label class="text-sm font-medium">目标文件夹</label>
+          <Select v-model="batchMoveTarget" :options="moveTargetOptions" class="w-full" autofocus />
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" @click="batchMoveOpen = false">取消</Button>
+          <Button type="submit">移动</Button>
         </div>
       </form>
     </Dialog>
