@@ -51,9 +51,9 @@ export const convertTaskStore = reactive<{ tasks: ConvertTask[]; loaded: boolean
 export function applyConvertTasks(tasks: ConvertTask[]) {
   convertTaskStore.tasks = tasks
   convertTaskStore.loaded = true
-  // 同步媒体卡片上的转码进度浮层（转码 MP4 与分段转码；HLS 浮层由 convert-progress 事件单独维护）
+  // 同步媒体卡片上的转码进度浮层（转码 MP4 与分段转码；HLS/下载任务由任务页单独展示）
   for (const t of tasks) {
-    if (t.kind === 'hls') continue
+    if (t.kind === 'hls' || t.kind === 'download') continue
     if (t.state === 'queued') {
       convertStore.jobs[t.mediaId] = { kind: t.kind, percent: null, status: 'queued' }
     } else if (t.state === 'running') {

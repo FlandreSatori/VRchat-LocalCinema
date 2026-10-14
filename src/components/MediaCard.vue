@@ -111,7 +111,7 @@ async function doTranscode() {
       if (!overwrite) return
     }
     await transcodeMedia(props.item.id, overwrite)
-    toast.info('已加入转码队列，可在「转码任务」页查看进度或调整顺序')
+    toast.info('已加入转码队列，可在「任务」页查看进度或调整顺序')
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -201,7 +201,7 @@ const menuItems = computed<MenuEntry[]>(() => {
       { type: 'item', label: '查看视频信息', icon: Info, onSelect: () => (infoOpen.value = true) },
       {
         type: 'item',
-        label: '打开转码任务页',
+        label: '打开任务页',
         icon: ListVideo,
         onSelect: () => navigateToConvert(),
       },

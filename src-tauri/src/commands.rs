@@ -982,24 +982,47 @@ pub async fn fetch_peer_media(ip: String, port: u16) -> AppResult<Vec<MediaSumma
     Ok(parsed.items)
 }
 
-/// 从对等节点下载媒体到本地并登记入库
+/// 下载专用 HTTP 客户端：大文件下载耗时不确定，不能设置总超时
+/// （旧实现 peer_client 的 timeout 会中断超过 15 秒的下载，
+/// 导致文件只写了一半、入库逻辑从未执行）
+fn peer_download_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("VRchat-LocalCinema")
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Msg(format!("创建网络客户端失败: {}", e)))
+}
+
+/// 解析下载目录（设置优先，否则用默认数据目录）
+fn download_dir_of(state: &AppState) -> PathBuf {
+    let settings = state.current_settings();
+    if settings.download_dir.trim().is_empty() {
+        state.paths.download_dir.clone()
+    } else {
+        PathBuf::from(settings.download_dir.trim())
+    }
+}
+
+/// 下载临时文件路径：与最终文件同目录、后缀 .part，完成后改名为最终文件
+fn part_path(dest: &std::path::Path) -> PathBuf {
+    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".part");
+    dest.with_file_name(name)
+}
+
+/// 加入对端媒体下载任务（后台执行，可在「任务」页查看进度、暂停/继续/取消，
+/// 完成后自动登记入库）
 #[tauri::command]
-pub async fn download_peer_media(
+pub async fn download_peer_media_task(
     app: AppHandle,
     state: State<'_, AppState>,
     ip: String,
     port: u16,
     id: String,
     file_name: String,
-) -> AppResult<MediaItem> {
-    let settings = state.current_settings();
-    let dir = if settings.download_dir.trim().is_empty() {
-        state.paths.download_dir.clone()
-    } else {
-        PathBuf::from(settings.download_dir.trim())
-    };
-    std::fs::create_dir_all(&dir)?;
-
+    file_size: u64,
+    title: String,
+) -> AppResult<crate::convert_queue::ConvertTask> {
     let safe_name = std::path::Path::new(&file_name)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1012,40 +1035,322 @@ pub async fn download_peer_media(
         return Err(AppError::Msg("不支持的格式".to_string()));
     }
 
-    let dest = unique_dest(&dir, &safe_name);
-    let url = format!("http://{}:{}/download/{}", ip, port, id);
-    tracing::info!("开始从 {} 下载 {}", ip, url);
-
+    // 本地已有预检：同名同大小的条目视为已拥有，避免重复下载后入库冲突
     {
-        use futures_util::StreamExt;
-        use tokio::io::AsyncWriteExt;
-
-        let resp = peer_client()?
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::Msg(format!("下载失败: {}", e)))?;
-        if !resp.status().is_success() {
-            return Err(AppError::Msg(format!(
-                "下载失败（HTTP {}）",
-                resp.status().as_u16()
-            )));
+        let db = state.db.lock().unwrap();
+        let dup = db.list()?.into_iter().find(|m| {
+            m.status != MediaStatus::Missing
+                && m.file_name.to_lowercase() == safe_name.to_lowercase()
+        });
+        if let Some(existing) = dup {
+            if existing.file_size == file_size {
+                return Err(AppError::Msg(
+                    "本地已有该文件（同名同大小），无需重复下载".into(),
+                ));
+            }
         }
-        let mut file = tokio::fs::File::create(&dest).await?;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| AppError::Msg(format!("下载中断: {}", e)))?;
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
     }
 
-    let item = {
-        let db = state.db.lock().unwrap();
-        db.register(&dest)?.0
+    let dir = download_dir_of(&state);
+    std::fs::create_dir_all(&dir)?;
+    let dest = unique_dest(&dir, &safe_name);
+
+    let (task, cancel_flag, pause_flag) = state
+        .convert_queue
+        .register_download_task(
+            id.clone(),
+            title,
+            safe_name.clone(),
+            ip.clone(),
+            port,
+            dest.to_string_lossy().to_string(),
+        )
+        .map_err(AppError::Msg)?;
+    tracing::info!("加入下载任务: {} <- {}:{}{}", safe_name, ip, port, id);
+    emit_convert_tasks(&app);
+    spawn_download_worker(app, task.id.clone(), cancel_flag, pause_flag);
+    Ok(task)
+}
+
+/// 暂停下载任务（保留 .part 进度，可继续）
+#[tauri::command]
+pub async fn download_task_pause(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> AppResult<()> {
+    state
+        .convert_queue
+        .pause_download(&task_id)
+        .map_err(AppError::Msg)?;
+    emit_convert_tasks(&app);
+    Ok(())
+}
+
+/// 继续已暂停/失败的下载任务（从 .part 断点续传）
+#[tauri::command]
+pub async fn download_task_resume(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> AppResult<()> {
+    let (_task, cancel_flag, pause_flag) = state
+        .convert_queue
+        .resume_download(&task_id)
+        .map_err(AppError::Msg)?;
+    emit_convert_tasks(&app);
+    spawn_download_worker(app, task_id, cancel_flag, pause_flag);
+    Ok(())
+}
+
+/// 下载会话结束原因
+enum DownloadEnd {
+    /// 下载完成，.part 已改名为最终文件
+    Done,
+    Cancelled,
+    /// 已暂停（携带已接收字节）
+    Paused(u64),
+    Failed(String),
+}
+
+/// 后台下载执行器：从 .part 已有偏移断点续传，结束后保存进度/入库并刷新任务列表
+fn spawn_download_worker(
+    app: AppHandle,
+    task_id: String,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    pause_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tauri::async_runtime::spawn(async move {
+        run_download_task(app, task_id, cancel_flag, pause_flag).await;
+    });
+}
+
+/// 执行一次下载会话（从 .part 已有偏移续传），通过 on_progress 上报进度
+async fn run_download_session(
+    ip: &str,
+    port: u16,
+    peer_media_id: &str,
+    dest: &std::path::Path,
+    part: &std::path::Path,
+    cancel_flag: &std::sync::atomic::AtomicBool,
+    pause_flag: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(u64, Option<u64>, Option<f64>),
+) -> DownloadEnd {
+    use std::sync::atomic::Ordering;
+
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut offset = tokio::fs::metadata(part)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let url = format!("http://{}:{}/download/{}", ip, port, peer_media_id);
+    let client = match peer_download_client() {
+        Ok(c) => c,
+        Err(e) => return DownloadEnd::Failed(e.to_string()),
     };
-    spawn_probe_task(app, item.id.clone());
-    Ok(item)
+
+    // 带 Range 头续传；对方返回 416（远端文件已变化）时放弃续传从头下载
+    let resp = loop {
+        let mut req = client.get(&url);
+        if offset > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={}-", offset));
+        }
+        match req.send().await {
+            Ok(r) => {
+                let status = r.status();
+                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
+                    offset = 0;
+                    continue;
+                }
+                if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                    return DownloadEnd::Failed(format!("下载失败（HTTP {}）", status.as_u16()));
+                }
+                break r;
+            }
+            Err(e) => return DownloadEnd::Failed(format!("连接失败: {}", e)),
+        }
+    };
+
+    let resumed = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT && offset > 0;
+    if !resumed {
+        offset = 0;
+    }
+    let total = resp.content_length().map(|len| offset + len);
+
+    let mut file = if resumed {
+        match tokio::fs::OpenOptions::new().append(true).open(part).await {
+            Ok(f) => f,
+            Err(e) => return DownloadEnd::Failed(format!("无法写入临时文件: {}", e)),
+        }
+    } else {
+        match tokio::fs::File::create(part).await {
+            Ok(f) => f,
+            Err(e) => return DownloadEnd::Failed(format!("无法创建临时文件: {}", e)),
+        }
+    };
+
+    let mut stream = resp.bytes_stream();
+    let mut received = offset;
+    // 每 300ms 轮询一次取消/暂停标志，避免对端停发数据时操作无响应
+    let mut flag_tick = tokio::time::interval(std::time::Duration::from_millis(300));
+    loop {
+        tokio::select! {
+            _ = flag_tick.tick() => {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return DownloadEnd::Cancelled;
+                }
+                if pause_flag.load(Ordering::Relaxed) {
+                    let _ = file.flush().await;
+                    return DownloadEnd::Paused(received);
+                }
+            }
+            chunk = stream.next() => {
+                match chunk {
+                    None => break,
+                    Some(Err(e)) => return DownloadEnd::Failed(format!("下载中断: {}", e)),
+                    Some(Ok(bytes)) => {
+                        if let Err(e) = file.write_all(&bytes).await {
+                            return DownloadEnd::Failed(format!("写入文件失败: {}", e));
+                        }
+                        received += bytes.len() as u64;
+                        let percent = total
+                            .filter(|t| *t > 0)
+                            .map(|t| (received as f64 / t as f64 * 100.0).min(100.0));
+                        on_progress(received, total, percent);
+                    }
+                }
+            }
+        }
+    }
+    if let Err(e) = file.flush().await {
+        return DownloadEnd::Failed(format!("写入文件失败: {}", e));
+    }
+    drop(file);
+
+    // 改名为最终文件（若最终名期间被占用则顺延序号）
+    let final_dest = if dest.exists() {
+        let dir = dest.parent().unwrap_or(std::path::Path::new("."));
+        let name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "video".into());
+        unique_dest(dir, &name)
+    } else {
+        dest.to_path_buf()
+    };
+    if let Err(e) = tokio::fs::rename(part, &final_dest).await {
+        return DownloadEnd::Failed(format!("保存文件失败: {}", e));
+    }
+    DownloadEnd::Done
+}
+
+/// 下载任务执行器：运行一次下载会话并按结果收尾（完成时登记入库并启动探针）
+async fn run_download_task(
+    app: AppHandle,
+    task_id: String,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    pause_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let Some(st) = app.try_state::<AppState>() else {
+        return;
+    };
+    let queue = st.convert_queue.clone();
+    let Some(task) = queue.list().into_iter().find(|t| t.id == task_id) else {
+        return;
+    };
+    let (Some(ip), Some(port), Some(peer_media_id), Some(dest_str)) = (
+        task.peer_ip.clone(),
+        task.peer_port,
+        task.peer_media_id.clone(),
+        task.dest_path.clone(),
+    ) else {
+        queue.finish(
+            &task_id,
+            crate::convert_queue::TaskState::Error,
+            Some("下载任务信息不完整".into()),
+        );
+        emit_convert_tasks(&app);
+        return;
+    };
+    let dest = PathBuf::from(&dest_str);
+    let part = part_path(&dest);
+
+    // 进度上报：更新队列并按 1% 或 300ms 节流广播，避免事件风暴
+    let progress_queue = queue.clone();
+    let progress_app = app.clone();
+    let progress_task_id = task_id.clone();
+    let mut last_emit = std::time::Instant::now();
+    let mut last_pct = -1i64;
+    let end = run_download_session(
+        &ip,
+        port,
+        &peer_media_id,
+        &dest,
+        &part,
+        &cancel_flag,
+        &pause_flag,
+        move |received, total, percent| {
+            let pct = percent.map(|p| p as i64).unwrap_or(-1);
+            if last_emit.elapsed() >= std::time::Duration::from_millis(300) || pct != last_pct {
+                last_emit = std::time::Instant::now();
+                last_pct = pct;
+                progress_queue.set_download_progress(&progress_task_id, received, total, percent);
+                emit_convert_tasks(&progress_app);
+            }
+        },
+    )
+    .await;
+
+    // 会话已返回（文件句柄已释放），此处可安全收尾
+    let was_cancel_requested =
+        cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
+    match end {
+        DownloadEnd::Done => {
+            let reg = {
+                let db = st.db.lock().unwrap();
+                db.register(&dest)
+            };
+            match reg {
+                Ok((item, _)) => {
+                    queue.finish(&task_id, crate::convert_queue::TaskState::Done, None);
+                    tracing::info!("下载完成并入库: {}", item.file_path);
+                    spawn_probe_task(app.clone(), item.id.clone());
+                    let _ = app.emit("media-updated", &item);
+                }
+                Err(e) => {
+                    queue.finish(
+                        &task_id,
+                        crate::convert_queue::TaskState::Error,
+                        Some(format!("下载完成但入库失败：{}（文件保留在下载目录）", e)),
+                    );
+                }
+            }
+        }
+        DownloadEnd::Cancelled => {
+            let _ = tokio::fs::remove_file(&part).await;
+            queue.finish(&task_id, crate::convert_queue::TaskState::Cancelled, None);
+        }
+        DownloadEnd::Paused(received) => {
+            // 暂停与取消请求同时到达时以取消为准
+            if was_cancel_requested {
+                let _ = tokio::fs::remove_file(&part).await;
+                queue.finish(&task_id, crate::convert_queue::TaskState::Cancelled, None);
+            } else {
+                let total = queue
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == task_id)
+                    .and_then(|t| t.total);
+                queue.mark_download_paused(&task_id, received, total);
+            }
+        }
+        DownloadEnd::Failed(msg) => {
+            queue.finish(&task_id, crate::convert_queue::TaskState::Error, Some(msg));
+        }
+    }
+    emit_convert_tasks(&app);
 }
 
 /// 目标文件重名时追加序号，避免覆盖
@@ -1377,17 +1682,33 @@ pub async fn convert_task_start(
     Ok(())
 }
 
-/// 取消任务：排队中直接标记取消；进行中的终止 ffmpeg
+/// 取消任务：排队中直接标记取消；进行中的终止 ffmpeg / 下载；已暂停的下载取消时清理临时文件
 #[tauri::command]
 pub async fn convert_task_cancel(
     app: AppHandle,
     state: State<'_, AppState>,
     task_id: String,
 ) -> AppResult<()> {
+    let before = state
+        .convert_queue
+        .list()
+        .into_iter()
+        .find(|t| t.id == task_id);
     state
         .convert_queue
         .cancel(&task_id)
         .map_err(AppError::Msg)?;
+    // 已暂停的下载没有执行器在跑，取消时由命令清理 .part 临时文件；
+    // 运行中的下载由执行器在感知取消后自行清理
+    if let Some(t) = before {
+        if t.kind == crate::convert_queue::TaskKind::Download
+            && t.state == crate::convert_queue::TaskState::Paused
+        {
+            if let Some(dest) = t.dest_path.as_deref() {
+                let _ = tokio::fs::remove_file(part_path(std::path::Path::new(dest))).await;
+            }
+        }
+    }
     emit_convert_tasks(&app);
     Ok(())
 }
@@ -1723,6 +2044,8 @@ pub fn spawn_convert_worker(app: AppHandle) {
                 }
                 // HLS 已停用，不会再有排队任务
                 crate::convert_queue::TaskKind::Hls => Ok(None),
+                // 下载任务不占用转码 worker（直接以 Running 注册，由独立执行器处理）
+                crate::convert_queue::TaskKind::Download => Ok(None),
             };
             let cancelled = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
             match result {

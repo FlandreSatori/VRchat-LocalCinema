@@ -224,9 +224,9 @@ export function setCustomThumbnail(id: string, imagePath: string): Promise<Media
   return invoke('set_custom_thumbnail', { id, imagePath })
 }
 
-// 转码 / 分段转码
-export type ConvertTaskState = 'queued' | 'running' | 'done' | 'error' | 'cancelled'
-export type ConvertTaskKind = 'transcode' | 'segment' | 'hls'
+// 转码 / 分段转码 / 下载任务
+export type ConvertTaskState = 'queued' | 'running' | 'paused' | 'done' | 'error' | 'cancelled'
+export type ConvertTaskKind = 'transcode' | 'segment' | 'hls' | 'download'
 export interface ConvertTask {
   id: string
   mediaId: string
@@ -240,6 +240,18 @@ export interface ConvertTask {
   percent: number | null
   error: string | null
   createdAt: number
+  /** 下载任务：对端文件名（下载落盘名）；其余任务为 null */
+  fileName?: string | null
+  /** 下载任务：对端地址与端口；其余任务为 null */
+  peerIp?: string | null
+  peerPort?: number | null
+  /** 下载任务：对端媒体 id；其余任务为 null */
+  peerMediaId?: string | null
+  /** 下载任务：最终落盘路径；其余任务为 null */
+  destPath?: string | null
+  /** 下载任务：已接收字节 / 总字节 */
+  received?: number | null
+  total?: number | null
 }
 export function transcodeMedia(id: string, overwrite?: boolean): Promise<ConvertTask> {
   return invoke('transcode_media', { id, overwrite })
@@ -441,11 +453,20 @@ export function onEasytierStatusChanged(callback: (status: EasytierStatus) => vo
 export function fetchPeerMedia(ip: string, port: number): Promise<MediaSummary[]> {
   return invoke('fetch_peer_media', { ip, port })
 }
-export function downloadPeerMedia(
-  ip: string,
-  port: number,
-  id: string,
+/** 加入对端媒体下载任务（后台执行，可在「任务」页暂停/继续/取消，完成后自动入库） */
+export function downloadPeerMediaTask(params: {
+  ip: string
+  port: number
+  id: string
   fileName: string
-): Promise<MediaItem> {
-  return invoke('download_peer_media', { ip, port, id, fileName })
+  fileSize: number
+  title: string
+}): Promise<ConvertTask> {
+  return invoke('download_peer_media_task', params)
+}
+export function downloadTaskPause(taskId: string): Promise<void> {
+  return invoke('download_task_pause', { taskId })
+}
+export function downloadTaskResume(taskId: string): Promise<void> {
+  return invoke('download_task_resume', { taskId })
 }

@@ -27,6 +27,8 @@ pub enum TaskState {
     Error,
     /// 已取消
     Cancelled,
+    /// 已暂停（仅下载任务，可继续）
+    Paused,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -38,6 +40,8 @@ pub enum TaskKind {
     Segment,
     /// 边转边播（HLS，后台独立执行）——已停用，保留类型以兼容旧记录
     Hls,
+    /// 下载对端媒体文件（后台独立执行，不占用转码 worker，可暂停/继续/取消）
+    Download,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,13 +59,28 @@ pub struct ConvertTask {
     pub percent: Option<f64>,
     pub error: Option<String>,
     pub created_at: i64,
+    // ===== 下载任务专用字段（其余任务为 None）=====
+    /// 对端文件名（下载落盘名）
+    pub file_name: Option<String>,
+    /// 对端地址与端口
+    pub peer_ip: Option<String>,
+    pub peer_port: Option<u16>,
+    /// 对端媒体 id（media_id 在登记本地条目前暂存它）
+    pub peer_media_id: Option<String>,
+    /// 最终落盘路径（用于断点续传与取消时清理临时文件）
+    pub dest_path: Option<String>,
+    /// 已接收字节 / 总字节
+    pub received: Option<u64>,
+    pub total: Option<u64>,
 }
 
 #[derive(Default)]
 struct Inner {
     tasks: Vec<ConvertTask>,
-    /// 运行中任务的取消标志（转码 worker 与 HLS 后台任务可并行，故为列表）
+    /// 运行中任务的取消标志（转码 worker 与 HLS/下载后台任务可并行，故为列表）
     running_cancel: Vec<(String, Arc<AtomicBool>)>,
+    /// 运行中下载任务的暂停标志
+    running_pause: Vec<(String, Arc<AtomicBool>)>,
 }
 
 /// 线程安全的转码任务队列
@@ -96,6 +115,13 @@ impl ConvertQueue {
             percent: None,
             error: None,
             created_at: now_ms(),
+            file_name: None,
+            peer_ip: None,
+            peer_port: None,
+            peer_media_id: None,
+            dest_path: None,
+            received: None,
+            total: None,
         };
         inner.tasks.push(task.clone());
         Ok(task)
@@ -126,6 +152,13 @@ impl ConvertQueue {
             percent: None,
             error: None,
             created_at: now_ms(),
+            file_name: None,
+            peer_ip: None,
+            peer_port: None,
+            peer_media_id: None,
+            dest_path: None,
+            received: None,
+            total: None,
         };
         inner.tasks.push(task.clone());
         Ok(task)
@@ -155,11 +188,158 @@ impl ConvertQueue {
             percent: None,
             error: None,
             created_at: now_ms(),
+            file_name: None,
+            peer_ip: None,
+            peer_port: None,
+            peer_media_id: None,
+            dest_path: None,
+            received: None,
+            total: None,
         };
         let flag = Arc::new(AtomicBool::new(false));
         inner.running_cancel.push((task.id.clone(), flag.clone()));
         inner.tasks.push(task.clone());
         Ok((task, flag))
+    }
+
+    /// 注册一个下载任务：直接以 Running 状态进入队列，返回 (任务, 取消标志, 暂停标志)。
+    /// 下载不占用转码 worker，由后台独立执行，仅借用队列展示进度。
+    pub fn register_download_task(
+        &self,
+        peer_media_id: String,
+        title: String,
+        file_name: String,
+        peer_ip: String,
+        peer_port: u16,
+        dest_path: String,
+    ) -> Result<(ConvertTask, Arc<AtomicBool>, Arc<AtomicBool>), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let active = |t: &ConvertTask| {
+            t.kind == TaskKind::Download
+                && matches!(
+                    t.state,
+                    TaskState::Queued | TaskState::Running | TaskState::Paused
+                )
+        };
+        if inner.tasks.iter().any(|t| {
+            active(t)
+                && t.peer_media_id.as_deref() == Some(peer_media_id.as_str())
+                && t.peer_ip.as_deref() == Some(peer_ip.as_str())
+        }) {
+            return Err("该文件已在下载队列中".into());
+        }
+        if inner
+            .tasks
+            .iter()
+            .any(|t| active(t) && t.file_name.as_deref() == Some(file_name.as_str()))
+        {
+            return Err("已有同名文件正在下载".into());
+        }
+        let task = ConvertTask {
+            id: format!("task-{}-{}", now_ms(), self.seq.fetch_add(1, Ordering::Relaxed)),
+            media_id: peer_media_id.clone(),
+            title,
+            kind: TaskKind::Download,
+            overwrite: false,
+            first_ms: None,
+            state: TaskState::Running,
+            percent: Some(0.0),
+            error: None,
+            created_at: now_ms(),
+            file_name: Some(file_name),
+            peer_ip: Some(peer_ip),
+            peer_port: Some(peer_port),
+            peer_media_id: Some(peer_media_id),
+            dest_path: Some(dest_path),
+            received: Some(0),
+            total: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        inner.running_cancel.push((task.id.clone(), cancel.clone()));
+        inner.running_pause.push((task.id.clone(), pause.clone()));
+        inner.tasks.push(task.clone());
+        Ok((task, cancel, pause))
+    }
+
+    /// 暂停下载任务（仅运行中）：置位暂停标志，由下载执行器保存进度并转入 Paused
+    pub fn pause_download(&self, task_id: &str) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(task) = inner.tasks.iter_mut().find(|t| t.id == task_id) else {
+            return Err("任务不存在".into());
+        };
+        if task.kind != TaskKind::Download || task.state != TaskState::Running {
+            return Err("仅进行中的下载任务可以暂停".into());
+        }
+        if let Some((_, flag)) = inner.running_pause.iter().find(|(id, _)| id == task_id) {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err("任务不在运行中".into())
+        }
+    }
+
+    /// 继续下载任务（已暂停或失败）：重新标记为运行中并返回新的取消/暂停标志
+    pub fn resume_download(
+        &self,
+        task_id: &str,
+    ) -> Result<(ConvertTask, Arc<AtomicBool>, Arc<AtomicBool>), String> {
+        let mut inner = self.inner.lock().unwrap();
+        let task = {
+            let Some(task) = inner.tasks.iter_mut().find(|t| t.id == task_id) else {
+                return Err("任务不存在".into());
+            };
+            if task.kind != TaskKind::Download {
+                return Err("仅下载任务支持继续".into());
+            }
+            if !matches!(task.state, TaskState::Paused | TaskState::Error) {
+                return Err("仅已暂停或失败的任务可以继续".into());
+            }
+            task.state = TaskState::Running;
+            task.error = None;
+            task.clone()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        inner.running_cancel.retain(|(id, _)| id != task_id);
+        inner.running_pause.retain(|(id, _)| id != task_id);
+        inner.running_cancel.push((task_id.to_string(), cancel.clone()));
+        inner.running_pause.push((task_id.to_string(), pause.clone()));
+        Ok((task, cancel, pause))
+    }
+
+    /// 下载执行器：更新进度
+    pub fn set_download_progress(
+        &self,
+        task_id: &str,
+        received: u64,
+        total: Option<u64>,
+        percent: Option<f64>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
+            t.received = Some(received);
+            if total.is_some() {
+                t.total = total;
+            }
+            t.percent = percent;
+        }
+    }
+
+    /// 下载执行器：转入已暂停（保存已接收进度并清理运行标志）
+    pub fn mark_download_paused(&self, task_id: &str, received: u64, total: Option<u64>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
+            if t.state == TaskState::Running {
+                t.state = TaskState::Paused;
+                t.received = Some(received);
+                if total.is_some() {
+                    t.total = total;
+                }
+            }
+        }
+        inner.running_pause.retain(|(id, _)| id != task_id);
+        inner.running_cancel.retain(|(id, _)| id != task_id);
     }
 
     /// 开始任务：将排队中的任务移到队列最前（当前任务完成后立即执行）
@@ -188,7 +368,8 @@ impl ConvertQueue {
             return Err("任务不存在".into());
         };
         match task.state {
-            TaskState::Queued => {
+            TaskState::Queued | TaskState::Paused => {
+                // 排队中直接标记取消；已暂停的下载任务由调用方清理临时文件
                 task.state = TaskState::Cancelled;
                 Ok(())
             }
@@ -277,6 +458,7 @@ impl ConvertQueue {
             t.error = error;
         }
         inner.running_cancel.retain(|(id, _)| id != task_id);
+        inner.running_pause.retain(|(id, _)| id != task_id);
     }
 
     /// 仅当任务仍处于 Running 时标记结束（供 HLS 后台任务使用，
@@ -294,6 +476,7 @@ impl ConvertQueue {
             t.error = error;
         }
         inner.running_cancel.retain(|(id, _)| id != task_id);
+        inner.running_pause.retain(|(id, _)| id != task_id);
     }
 }
 
@@ -382,5 +565,88 @@ mod tests {
         q.finish_if_running(&hls.id, TaskState::Done, None);
         let done = q.list().into_iter().find(|t| t.id == hls.id).unwrap();
         assert_eq!(done.state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn test_download_task_lifecycle() {
+        let q = ConvertQueue::default();
+        let (task, cancel, pause) = q
+            .register_download_task(
+                "pm1".into(),
+                "视频 A".into(),
+                "video.mp4".into(),
+                "10.0.0.2".into(),
+                17001,
+                "C:\\dl\\video.mp4".into(),
+            )
+            .unwrap();
+        assert_eq!(task.kind, TaskKind::Download);
+        assert_eq!(task.state, TaskState::Running);
+        assert_eq!(task.received, Some(0));
+
+        // 同一对端同一文件重复下载被拒绝；不同对端同名文件也被拒绝
+        assert!(q
+            .register_download_task(
+                "pm1".into(),
+                "视频 A".into(),
+                "video.mp4".into(),
+                "10.0.0.2".into(),
+                17001,
+                "x".into()
+            )
+            .is_err());
+        assert!(q
+            .register_download_task(
+                "pm2".into(),
+                "视频 B".into(),
+                "video.mp4".into(),
+                "10.0.0.3".into(),
+                17001,
+                "x".into()
+            )
+            .is_err());
+
+        // 下载任务不占用转码 worker
+        let _t = q.enqueue("m1".into(), "A".into(), false).unwrap();
+        let (next, _) = q.take_next().unwrap();
+        assert_eq!(next.kind, TaskKind::Transcode);
+
+        // 进度更新 → 暂停保存进度 → 继续恢复
+        q.set_download_progress(&task.id, 40, Some(100), Some(40.0));
+        assert!(q.pause_download(&task.id).is_ok());
+        q.mark_download_paused(&task.id, 40, Some(100));
+        let t = q.list().into_iter().find(|t| t.id == task.id).unwrap();
+        assert_eq!(t.state, TaskState::Paused);
+        assert_eq!(t.received, Some(40));
+        assert_eq!(t.total, Some(100));
+        // 已暂停后不可再次暂停
+        assert!(q.pause_download(&task.id).is_err());
+
+        let (t2, cancel2, _pause2) = q.resume_download(&task.id).unwrap();
+        assert_eq!(t2.state, TaskState::Running);
+        assert!(t2.error.is_none());
+
+        // 运行中取消 → 置位取消标志（由执行器清理临时文件并收尾）；
+        // 继续后旧标志作废，只有新标志生效
+        assert!(q.cancel(&task.id).is_ok());
+        assert!(cancel2.load(Ordering::Relaxed));
+        assert!(!cancel.load(Ordering::Relaxed));
+        q.finish(&task.id, TaskState::Cancelled, None);
+        let t = q.list().into_iter().find(|t| t.id == task.id).unwrap();
+        assert_eq!(t.state, TaskState::Cancelled);
+        // 已取消不可继续
+        assert!(q.resume_download(&task.id).is_err());
+
+        // 非下载任务不支持暂停/继续
+        let (tr, _) = {
+            let _ = cancel;
+            let _ = pause;
+            q.enqueue("m2".into(), "B".into(), false).unwrap();
+            let (tr, flag) = q.take_next().unwrap();
+            (tr, flag)
+        };
+        assert!(q.pause_download(&tr.id).is_err());
+        assert!(q.resume_download(&tr.id).is_err());
+        assert!(q.cancel(&tr.id).is_ok());
     }
 }

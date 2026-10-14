@@ -18,6 +18,10 @@ pub const RPC_PORTAL: &str = "127.0.0.1:15888";
 /// 运行 easytier-core 的计划任务名称（以最高权限运行，注册一次后启停均无需 UAC）
 pub const EASYTIER_TASK_NAME: &str = "LocalCinemaEasyTier";
 
+/// 清理残留 easytier-core 的计划任务名称（`schtasks /End` 只终止任务动作进程本身、
+/// 不递归终止子进程，残留的提权 core 需通过本任务以最高权限强杀，避免弹 UAC）
+pub const EASYTIER_TASK_NAME_STOP: &str = "LocalCinemaEasyTierStop";
+
 /// 支持的协议类型
 pub const SUPPORTED_PROTOCOLS: [&str; 5] = ["tcp", "udp", "ws", "wss", "quic"];
 
@@ -233,8 +237,16 @@ impl EasytierManager {
         // 生成 wscript 隐藏窗口包装脚本：任务动作指向 vbs，运行期完全不显示 PowerShell 窗口
         let vbs = run_hidden_vbs_path(&self.data_dir);
         write_run_hidden_vbs(&vbs)?;
+        write_stop_hidden_vbs(&stop_hidden_vbs_path(&self.data_dir))?;
 
-        ensure_task_registered(&vbs).await?;
+        ensure_task_registered(&self.data_dir).await?;
+        // 注册完成后若仍有旧 core 残留（如升级前残留、停止任务未注册时的遗留），
+        // 此时停止任务已可用，先清理再启动，避免新旧实例并存
+        if !core_processes().is_empty() {
+            tracing::warn!("启动前检测到 easytier-core 残留，通过停止任务清理");
+            let _ = task_stop().await;
+            wait_processes_gone(10).await;
+        }
         task_run().await?;
 
         // 等待 core 进程拉起
@@ -261,7 +273,7 @@ impl EasytierManager {
         Ok(self.status())
     }
 
-    /// 停止 easytier-core（手动停止：计划任务终止 + 提权兜底）。
+    /// 停止 easytier-core（手动停止：计划任务终止 + 停止任务免 UAC 清理残留）。
     pub async fn stop(&self) {
         {
             let mut guard = self.child.lock().unwrap();
@@ -279,15 +291,22 @@ impl EasytierManager {
         // 停止计划任务（无需 UAC；任务不存在时忽略错误）
         task_end().await;
         wait_processes_gone(6).await;
-        // 进程残留（任务被手动删除或历史提权直启）时提权兜底终止
+        // /End 只终止任务动作进程（wscript/powershell），不递归终止子进程；
+        // 残留的提权 core 通过停止任务强杀（免 UAC、无窗口）
         if !core_processes().is_empty() {
-            tracing::warn!("计划任务未能终止 easytier-core，尝试提权兜底终止");
-            if let Err(e) = kill_process_elevated_by_name(true).await {
-                tracing::warn!("提权终止 easytier-core 失败: {}", e);
-                self.set_status(|s| {
-                    s.error = Some("easytier-core 仍在后台运行，可再次点击停止".to_string());
-                });
+            tracing::warn!("计划任务 /End 后 easytier-core 残留，触发停止任务清理");
+            if let Err(e) = task_stop().await {
+                tracing::warn!("触发停止任务失败: {}", e);
             }
+            wait_processes_gone(10).await;
+        }
+        if !core_processes().is_empty() {
+            self.set_status(|s| {
+                s.error = Some(
+                    "easytier-core 仍在后台运行；若停止任务未注册，请先启动一次组网以完成升级注册"
+                        .to_string(),
+                )
+            });
         }
     }
 
@@ -301,9 +320,9 @@ impl EasytierManager {
         }
         let _ = tauri::async_runtime::block_on(task_end());
         if !core_processes().is_empty() {
-            // 残留提权进程：异步兜底终止，不阻塞退出
+            // 残留提权进程：通过停止任务免 UAC 清理，异步执行不阻塞退出
             tauri::async_runtime::spawn(async {
-                let _ = kill_process_elevated_by_name(false).await;
+                let _ = task_stop().await;
             });
         }
         self.set_status(|s| {
@@ -360,18 +379,6 @@ impl EasytierManager {
 /// PowerShell 单引号字符串转义（内部单引号翻倍）
 fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
-}
-
-/// 生成提权执行的 PowerShell 包装脚本。
-/// 外层普通权限 powershell 通过 Start-Process -Verb RunAs 提权执行内层命令；
-/// `wait` 为 true 时外层等待内层退出。
-fn elevated_ps_script(inner: &str, wait: bool) -> String {
-    let wait_flag = if wait { " -Wait" } else { "" };
-    format!(
-        "try {{ Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-NonInteractive','-Command',{}){} -Verb RunAs -WindowStyle Hidden | Out-Null; Write-Output 'OK' }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
-        ps_quote(inner),
-        wait_flag
-    )
 }
 
 /// 运行外层 PowerShell 脚本并解析 OK/ERR 输出
@@ -441,6 +448,11 @@ fn run_hidden_vbs_path(data_dir: &Path) -> PathBuf {
     data_dir.join("easytier").join("run-hidden.vbs")
 }
 
+/// stop-hidden.vbs 路径（数据目录下 easytier/stop-hidden.vbs）
+fn stop_hidden_vbs_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("easytier").join("stop-hidden.vbs")
+}
+
 /// wscript 隐藏窗口包装脚本内容。
 /// wscript 为 GUI 程序（无控制台），`Run(cmd, 0, True)` 中 0 = SW_HIDE（PowerShell 窗口
 /// 从创建起即隐藏，无闪现），True = 等待 run.ps1 退出（保持任务进程树完整，便于
@@ -460,6 +472,22 @@ fn write_run_hidden_vbs(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+/// wscript 隐藏窗口包装的停止脚本：以最高权限强杀 easytier-core。
+/// 由 LocalCinemaEasyTierStop 计划任务触发（`schtasks /Run` 无需 UAC），
+/// 用于清理 `/End` 无法递归终止的残留 core 进程，全程无窗口。
+const STOP_HIDDEN_VBS: &str = r#"Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell.exe -NoProfile -NonInteractive -Command ""Stop-Process -Name 'easytier-core' -Force -ErrorAction SilentlyContinue""", 0, True
+"#;
+
+/// 写入 stop-hidden.vbs（纯 ASCII，无需 BOM）
+fn write_stop_hidden_vbs(path: &Path) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, STOP_HIDDEN_VBS)?;
+    Ok(())
+}
+
 /// 运行 powershell 并捕获输出（普通权限）
 async fn powershell_output(script: &str) -> AppResult<std::process::Output> {
     let mut cmd = tokio::process::Command::new("powershell");
@@ -476,13 +504,17 @@ async fn powershell_output(script: &str) -> AppResult<std::process::Output> {
         .map_err(|e| AppError::Msg(format!("执行 PowerShell 失败: {}", e)))
 }
 
-/// 检查计划任务是否存在且动作指向当前 run-hidden.vbs
+/// 检查运行/停止两个计划任务是否存在且动作指向当前 vbs
 /// 返回 Some(true)=匹配 / Some(false)=需重新注册 / None=查询失败
-async fn task_action_matches(vbs: &Path) -> Option<bool> {
+async fn task_action_matches(data_dir: &Path) -> Option<bool> {
+    let run_vbs = run_hidden_vbs_path(data_dir);
+    let stop_vbs = stop_hidden_vbs_path(data_dir);
     let script = format!(
-        "$t = Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue; if ($t) {{ $a = @($t.Actions)[0]; if ($null -ne $a -and $a.Arguments -and $a.Arguments.Contains({})) {{ Write-Output 'MATCH' }} else {{ Write-Output 'STALE' }} }} else {{ Write-Output 'MISS' }}",
+        "$r = Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue; $s = Get-ScheduledTask -TaskName '{}' -ErrorAction SilentlyContinue; if ($r -and $s) {{ $ra = @($r.Actions)[0]; $sa = @($s.Actions)[0]; if ($null -ne $ra -and $null -ne $sa -and $ra.Arguments -and $sa.Arguments -and $ra.Arguments.Contains({}) -and $sa.Arguments.Contains({})) {{ Write-Output 'MATCH' }} else {{ Write-Output 'STALE' }} }} else {{ Write-Output 'MISS' }}",
         EASYTIER_TASK_NAME,
-        ps_quote(&vbs.to_string_lossy())
+        EASYTIER_TASK_NAME_STOP,
+        ps_quote(&run_vbs.to_string_lossy()),
+        ps_quote(&stop_vbs.to_string_lossy())
     );
     let output = powershell_output(&script).await.ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -496,14 +528,16 @@ async fn task_action_matches(vbs: &Path) -> Option<bool> {
     None
 }
 
-/// 以管理员权限注册/覆盖计划任务（首次 UAC 一次，之后不再需要）
-async fn register_task_elevated(vbs: &Path) -> AppResult<()> {
+/// 以管理员权限注册/覆盖运行与停止两个计划任务（首次 UAC 一次，之后不再需要）
+async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
     // 注册逻辑写入独立脚本文件后提权 -File 执行，避免嵌套引号问题
-    let reg = vbs.with_file_name("register-task.ps1");
+    let reg = run_ps1_path(data_dir).with_file_name("register-task.ps1");
     let script = format!(
-        "$ErrorActionPreference = 'Stop'\n$v = {}\n$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $v + '\"')\n$u = \"$env:USERDOMAIN\\$env:USERNAME\"\n$principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest\n$set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew\nRegister-ScheduledTask -TaskName '{}' -Action $action -Principal $principal -Settings $set -Force | Out-Null\nWrite-Output 'OK'\n",
-        ps_quote(&vbs.to_string_lossy()),
-        EASYTIER_TASK_NAME
+        "$ErrorActionPreference = 'Stop'\n$rv = {}\n$sv = {}\n$u = \"$env:USERDOMAIN\\$env:USERNAME\"\n$principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest\n$set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew\n$a1 = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $rv + '\"')\nRegister-ScheduledTask -TaskName '{}' -Action $a1 -Principal $principal -Settings $set -Force | Out-Null\n$a2 = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $sv + '\"')\nRegister-ScheduledTask -TaskName '{}' -Action $a2 -Principal $principal -Settings $set -Force | Out-Null\nWrite-Output 'OK'\n",
+        ps_quote(&run_hidden_vbs_path(data_dir).to_string_lossy()),
+        ps_quote(&stop_hidden_vbs_path(data_dir).to_string_lossy()),
+        EASYTIER_TASK_NAME,
+        EASYTIER_TASK_NAME_STOP
     );
     write_utf8_bom(&reg, &script)?;
 
@@ -516,14 +550,14 @@ async fn register_task_elevated(vbs: &Path) -> AppResult<()> {
     result
 }
 
-/// 确保计划任务已注册且动作指向当前 run-hidden.vbs
-async fn ensure_task_registered(vbs: &Path) -> AppResult<()> {
-    match task_action_matches(vbs).await {
+/// 确保运行/停止两个计划任务已注册且动作指向当前 vbs
+async fn ensure_task_registered(data_dir: &Path) -> AppResult<()> {
+    match task_action_matches(data_dir).await {
         Some(true) => return Ok(()),
         Some(false) => tracing::info!("计划任务不存在或动作过期，重新注册（可能需要管理员授权）"),
         None => tracing::info!("无法确认计划任务状态，尝试重新注册"),
     }
-    register_task_elevated(vbs).await
+    register_task_elevated(data_dir).await
 }
 
 /// 触发计划任务启动 easytier-core（无需 UAC）
@@ -540,6 +574,15 @@ async fn task_run() -> AppResult<()> {
 /// 终止计划任务（无需 UAC；任务不存在时忽略失败）
 async fn task_end() {
     let _ = schtasks(&["/End", "/TN", EASYTIER_TASK_NAME]).await;
+}
+
+/// 触发停止任务强杀残留 easytier-core（免 UAC、无窗口；任务未注册时报错）
+async fn task_stop() -> AppResult<()> {
+    let out = schtasks(&["/Run", "/TN", EASYTIER_TASK_NAME_STOP]).await?;
+    if !out.status.success() {
+        return Err(AppError::Msg("停止任务未注册或触发失败".to_string()));
+    }
+    Ok(())
 }
 
 /// 调用 schtasks（仅以退出码判断结果，规避本地化输出编码问题）
@@ -594,15 +637,6 @@ async fn wait_processes_gone(rounds: usize) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
-}
-
-/// 以管理员权限终止所有 easytier-core 进程（残留兜底）。`wait` 为 true 时等待完成。
-async fn kill_process_elevated_by_name(wait: bool) -> AppResult<()> {
-    let script = elevated_ps_script(
-        "Stop-Process -Name 'easytier-core' -Force -ErrorAction SilentlyContinue",
-        wait,
-    );
-    run_powershell_script(&script).await
 }
 
 /// 按 2 个以上空格切分表格列
@@ -1202,6 +1236,19 @@ mod tests {
         assert!(text.contains("-WindowStyle Hidden"));
         assert!(text.contains("\\run.ps1\"\"\""));
         assert!(text.contains(", 0, True"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_write_stop_hidden_vbs() {
+        let dir = std::env::temp_dir().join(format!("lc-stopvbs-test-{}", std::process::id()));
+        let path = stop_hidden_vbs_path(&dir);
+        write_stop_hidden_vbs(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 纯 ASCII（wscript 兼容），隐藏窗口运行并强杀 easytier-core
+        assert!(text.chars().all(|c| c.is_ascii()));
+        assert!(text.contains("Stop-Process -Name 'easytier-core' -Force"));
+        assert!(text.contains("-WindowStyle") || text.contains(", 0, True"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

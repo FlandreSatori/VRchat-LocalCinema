@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Download, RefreshCw, CheckCircle2, HardDriveDownload, XCircle } from 'lucide-vue-next'
+import { Download, RefreshCw, CheckCircle2, HardDriveDownload, Loader2, XCircle } from 'lucide-vue-next'
 import Dialog from '../components/ui/Dialog.vue'
 import Badge from '../components/ui/Badge.vue'
 import Button from '../components/ui/Button.vue'
-import { fetchPeerMedia, downloadPeerMedia, type MediaSummary, type PeerInfo } from '../lib/api'
-import { mediaStore, upsertMedia } from '../lib/store'
+import { fetchPeerMedia, downloadPeerMediaTask, type MediaSummary, type PeerInfo } from '../lib/api'
+import { mediaStore, convertTaskStore } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 
 const props = defineProps<{
@@ -21,15 +21,23 @@ const emit = defineEmits<{
 const items = ref<MediaSummary[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
-const downloadingId = ref<string | null>(null)
 
-/** 本地已有的哈希集合，用于判断对方媒体是否已在本地 */
-const localHashes = computed(() => {
-  const map = new Map<string, string>()
+/** 本地已有的内容哈希集合：优先按内容比对 */
+const localByHash = computed(() => {
+  const set = new Set<string>()
   for (const item of mediaStore.items) {
-    if (item.hash) map.set(item.hash, item.title)
+    if (item.hash) set.add(item.hash)
   }
-  return map
+  return set
+})
+
+/** 本地已有的「文件名|大小」集合：哈希尚未算出（探测未完成）时的兜底比对 */
+const localByNameSize = computed(() => {
+  const set = new Set<string>()
+  for (const item of mediaStore.items) {
+    set.add(`${item.fileName.toLowerCase()}|${item.fileSize}`)
+  }
+  return set
 })
 
 function formatSize(bytes: number): string {
@@ -45,7 +53,20 @@ function formatSize(bytes: number): string {
 }
 
 function isLocal(item: MediaSummary): boolean {
-  return !!item.hash && localHashes.value.has(item.hash)
+  // 按内容哈希比对；哈希缺失时按 文件名 + 文件大小 兜底
+  if (item.hash && localByHash.value.has(item.hash)) return true
+  return localByNameSize.value.has(`${item.fileName.toLowerCase()}|${item.fileSize}`)
+}
+
+/** 该条目是否有进行中/已暂停的下载任务（任务页可见） */
+function activeDownloadState(item: MediaSummary): string | null {
+  const t = convertTaskStore.tasks.find(
+    (t) =>
+      t.kind === 'download' &&
+      t.peerMediaId === item.id &&
+      (t.state === 'queued' || t.state === 'running' || t.state === 'paused')
+  )
+  return t?.state ?? null
 }
 
 async function load() {
@@ -70,16 +91,19 @@ async function load() {
 
 async function download(item: MediaSummary) {
   const peer = props.peer
-  if (!peer || downloadingId.value) return
-  downloadingId.value = item.id
+  if (!peer || !peer.ipv4) return
   try {
-    const media = await downloadPeerMedia(peer.ipv4, props.port, item.id, item.fileName)
-    upsertMedia(media)
-    toast.success(`已下载并导入：${media.title}`)
+    await downloadPeerMediaTask({
+      ip: peer.ipv4,
+      port: props.port,
+      id: item.id,
+      fileName: item.fileName,
+      fileSize: item.fileSize,
+      title: item.title,
+    })
+    toast.success('已加入下载任务，可在「任务」页查看进度')
   } catch (e) {
     toast.error(errMsg(e))
-  } finally {
-    downloadingId.value = null
   }
 }
 
@@ -128,22 +152,19 @@ watch(
           <CheckCircle2 class="mr-1 h-3 w-3" />
           本地已有
         </Badge>
-        <Button
-          v-else
-          variant="outline"
-          size="sm"
-          class="shrink-0"
-          :disabled="downloadingId !== null"
-          @click="download(item)"
-        >
+        <Badge v-else-if="activeDownloadState(item)" variant="secondary" class="shrink-0">
+          <Loader2 v-if="activeDownloadState(item) === 'running'" class="mr-1 h-3 w-3 animate-spin" />
+          {{ activeDownloadState(item) === 'paused' ? '已暂停' : '下载中' }}
+        </Badge>
+        <Button v-else variant="outline" size="sm" class="shrink-0" @click="download(item)">
           <HardDriveDownload class="h-4 w-4" />
-          {{ downloadingId === item.id ? '下载中…' : '下载' }}
+          下载
         </Button>
       </div>
     </div>
     <p class="mt-4 flex items-center gap-1.5 text-xs text-muted-foreground">
       <Download class="h-3.5 w-3.5" />
-      下载后会保存到本地下载目录并自动导入媒体库
+      下载在后台进行，可在「任务」页查看进度、暂停或取消；完成后自动导入媒体库
     </p>
   </Dialog>
 </template>

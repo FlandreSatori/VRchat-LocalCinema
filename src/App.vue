@@ -19,7 +19,7 @@ const maximized = ref(false)
 
 const navItems = [
   { to: '/library', label: '媒体库', icon: Film },
-  { to: '/convert', label: '转码任务', icon: ListVideo },
+  { to: '/convert', label: '任务', icon: ListVideo },
   { to: '/server', label: 'HTTP 服务', icon: Server },
   { to: '/easytier', label: 'EasyTier 组网', icon: Network },
   { to: '/settings', label: '设置', icon: Settings },
