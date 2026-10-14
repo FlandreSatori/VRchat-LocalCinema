@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -26,6 +27,8 @@ pub struct AppState {
     pub db: Arc<Mutex<Db>>,
     pub server: HttpServer,
     pub recent_logs: RecentLogs,
+    /// 是否允许对等节点查看本机媒体库（与设置同步，供 HTTP 服务读取）
+    pub allow_peer_view: Arc<AtomicBool>,
     pub easytier: easytier::EasytierManager,
     /// 转码任务队列（按任务序列执行）
     pub convert_queue: crate::convert_queue::ConvertQueue,
@@ -72,10 +75,25 @@ pub async fn save_settings(
         old.bind_ip() != settings.bind_ip() || old.port != settings.port;
     let autostart_changed = old.autostart != settings.autostart;
 
+    // 同步「允许他人查看媒体库」的入站防火墙规则：开启（或端口变化）需要提权放行；
+    // 关闭时尽力移除（应用层已不再对外返回清单，移除失败不影响功能）。
+    let need_allow =
+        settings.allow_peer_view && (!old.allow_peer_view || old.port != settings.port);
+    if need_allow {
+        apply_firewall_rule(&state.paths.data_dir, settings.port, true).await?;
+    } else if old.allow_peer_view && !settings.allow_peer_view {
+        if let Err(e) = apply_firewall_rule(&state.paths.data_dir, old.port, false).await {
+            tracing::warn!("移除媒体库入站防火墙规则失败: {}", e);
+        }
+    }
+
     {
         let mut guard = state.settings.write().unwrap();
         *guard = settings.clone();
     }
+    state
+        .allow_peer_view
+        .store(settings.allow_peer_view, Ordering::Relaxed);
     settings.save(&state.paths.settings_file)?;
 
     if autostart_changed {
@@ -964,22 +982,104 @@ pub async fn fetch_peer_media(ip: String, port: u16) -> AppResult<Vec<MediaSumma
         items: Vec<MediaSummary>,
     }
     let url = format!("http://{}:{}/api/media", ip, port);
-    let resp = peer_client()?
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("无法连接 {}：{}", ip, e)))?;
+    let resp = match peer_client()?.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("读取对端媒体库失败 {}: {}", url, e);
+            return Err(AppError::Msg(format!("无法连接 {}：{}", ip, e)));
+        }
+    };
     if !resp.status().is_success() {
-        return Err(AppError::Msg(format!(
-            "对方媒体库不可用（HTTP {}）",
-            resp.status().as_u16()
-        )));
+        let code = resp.status().as_u16();
+        tracing::warn!("读取对端媒体库失败 {}: HTTP {}", url, code);
+        return Err(AppError::Msg(format!("对方媒体库不可用（HTTP {}）", code)));
     }
     let parsed: ApiMediaResponse = resp
         .json()
         .await
         .map_err(|e| AppError::Msg(format!("解析对方媒体库失败: {}", e)))?;
+    tracing::info!("成功读取对端媒体库 {}，共 {} 条", url, parsed.items.len());
     Ok(parsed.items)
+}
+
+// ---------- 网络连通性 & 防火墙 ----------
+
+/// 入站防火墙规则显示名（纯 ASCII，便于复用与移除）
+const FIREWALL_RULE_NAME: &str = "VRchat-LocalCinema Media Library";
+
+/// 增删媒体库入站防火墙规则。需要管理员权限，通过 Start-Process -Verb RunAs 提权执行
+/// （首次会弹出一次 UAC 授权）。allow=true 时放行该端口的入站 TCP；allow=false 时移除规则。
+async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResult<()> {
+    let name = crate::easytier::ps_quote(FIREWALL_RULE_NAME);
+    let script = if allow {
+        format!(
+            "$ErrorActionPreference = 'Stop'\nGet-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\nNew-NetFirewallRule -DisplayName {} -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -Profile Any | Out-Null\nWrite-Output 'OK'\n",
+            name, name, port
+        )
+    } else {
+        format!(
+            "$ErrorActionPreference = 'Stop'\nGet-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\nWrite-Output 'OK'\n",
+            name
+        )
+    };
+    let path = data_dir.join("firewall-rule.ps1");
+    crate::easytier::write_utf8_bom(&path, &script)?;
+    let wrapper = format!(
+        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|防火墙规则执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
+        crate::easytier::ps_quote(&path.to_string_lossy())
+    );
+    let result = crate::easytier::run_powershell_script(&wrapper).await;
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// 对端连通性检测结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerConnCheck {
+    /// ICMP 是否可达
+    pub ping: bool,
+    /// 目标端口 TCP 是否可连接
+    pub tcp: bool,
+}
+
+/// 检测对端 IP 的 ICMP 与目标端口 TCP 连通性（用于给出精确的失败提示）
+#[tauri::command]
+pub async fn test_peer_connection(ip: String, port: u16) -> AppResult<PeerConnCheck> {
+    let ip = ip.trim().to_string();
+    if ip.is_empty() {
+        return Err(AppError::Msg("请输入对方的虚拟 IP".to_string()));
+    }
+    let tcp = {
+        let ip = ip.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::net::{TcpStream, ToSocketAddrs};
+            match (ip.as_str(), port).to_socket_addrs() {
+                Ok(addrs) => addrs.into_iter().any(|a| {
+                    TcpStream::connect_timeout(&a, std::time::Duration::from_secs(2)).is_ok()
+                }),
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
+    };
+    let ping = ping_host(&ip).await;
+    Ok(PeerConnCheck { ping, tcp })
+}
+
+/// 单次 ICMP ping（ping.exe 退出码为 0 视为可达），无窗口执行
+async fn ping_host(ip: &str) -> bool {
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.args(["-n", "1", "-w", "1500", ip])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    matches!(cmd.status().await, Ok(s) if s.success())
 }
 
 /// 下载专用 HTTP 客户端：大文件下载耗时不确定，不能设置总超时

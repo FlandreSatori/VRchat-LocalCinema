@@ -377,12 +377,12 @@ impl EasytierManager {
 }
 
 /// PowerShell 单引号字符串转义（内部单引号翻倍）
-fn ps_quote(s: &str) -> String {
+pub(crate) fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
 /// 运行外层 PowerShell 脚本并解析 OK/ERR 输出
-async fn run_powershell_script(script: &str) -> AppResult<()> {
+pub(crate) async fn run_powershell_script(script: &str) -> AppResult<()> {
     let mut cmd = tokio::process::Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
         .stdin(Stdio::null())
@@ -406,7 +406,7 @@ async fn run_powershell_script(script: &str) -> AppResult<()> {
             let msg = msg.trim();
             let canceled = msg.contains("取消") || msg.to_ascii_lowercase().contains("cancel");
             return Err(AppError::Msg(if canceled {
-                "已取消管理员授权，无法继续（创建虚拟网卡需要管理员权限）".to_string()
+                "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string()
             } else {
                 format!("管理员授权执行失败: {}", msg)
             }));
@@ -421,7 +421,7 @@ fn run_ps1_path(data_dir: &Path) -> PathBuf {
 }
 
 /// 写入 UTF-8 BOM 文件（PowerShell 5.1 对无 BOM 的 UTF-8 会按本地代码页解析，中文会乱码）
-fn write_utf8_bom(path: &Path, content: &str) -> AppResult<()> {
+pub(crate) fn write_utf8_bom(path: &Path, content: &str) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

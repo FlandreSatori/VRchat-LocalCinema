@@ -13,6 +13,7 @@ pub mod settings;
 pub mod thumbnail;
 pub mod url_builder;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -72,7 +73,13 @@ pub fn run() {
                 std::path::PathBuf::from(settings_fixed.thumb_dir.trim())
             };
             let hls_dir = paths.data_dir.join("hls");
-            let server = HttpServer::new(db.clone(), &thumb_dir, &hls_dir);
+            let allow_peer_view = Arc::new(AtomicBool::new(settings_fixed.allow_peer_view));
+            let server = HttpServer::new(
+                db.clone(),
+                &thumb_dir,
+                &hls_dir,
+                allow_peer_view.clone(),
+            );
 
             let state = AppState {
                 paths: paths.clone(),
@@ -80,6 +87,7 @@ pub fn run() {
                 db,
                 server: server.clone(),
                 recent_logs,
+                allow_peer_view,
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
@@ -160,6 +168,7 @@ pub fn run() {
             commands::start_easytier,
             commands::stop_easytier,
             commands::get_room_info,
+            commands::test_peer_connection,
             commands::read_easytier_log,
             commands::reset_network_adapter,
             commands::fetch_peer_media,

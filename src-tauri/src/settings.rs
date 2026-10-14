@@ -152,6 +152,9 @@ pub struct Settings {
     /// 手动指定的局域网网卡 IP；空表示自动（EasyTier 运行时优先虚拟 IP，其次物理网卡）
     #[serde(default)]
     pub lan_adapter_ip: String,
+    /// 是否允许其他人（对等节点）查看本机媒体库；开启时会自动放行入站防火墙
+    #[serde(default)]
+    pub allow_peer_view: bool,
     /// 默认外部播放器路径，空表示未设置
     pub default_player_path: String,
     /// 播放器附加参数模板，{path} 会被替换为文件路径；为空则仅传文件路径
@@ -182,6 +185,7 @@ impl Default for Settings {
             default_url_mode: UrlMode::Localhost,
             easytier_ip: String::new(),
             lan_adapter_ip: String::new(),
+            allow_peer_view: false,
             default_player_path: String::new(),
             default_player_args: String::new(),
             thumb_dir: String::new(),

@@ -35,6 +35,8 @@ export interface Settings {
   port: number
   defaultUrlMode: UrlMode
   lanAdapterIp: string
+  /** 是否允许其他人（对等节点）查看本机媒体库 */
+  allowPeerView: boolean
   defaultPlayerPath: string
   defaultPlayerArgs: string
   thumbDir: string
@@ -452,6 +454,15 @@ export function onEasytierStatusChanged(callback: (status: EasytierStatus) => vo
 // 房间内媒体共享
 export function fetchPeerMedia(ip: string, port: number): Promise<MediaSummary[]> {
   return invoke('fetch_peer_media', { ip, port })
+}
+/** 对端连通性检测结果：ICMP 可达 / 目标端口 TCP 可连接 */
+export interface PeerConnCheck {
+  ping: boolean
+  tcp: boolean
+}
+/** 检测对端 IP 的 ping 与目标端口 TCP 连通性 */
+export function testPeerConnection(ip: string, port: number): Promise<PeerConnCheck> {
+  return invoke('test_peer_connection', { ip, port })
 }
 /** 加入对端媒体下载任务（后台执行，可在「任务」页暂停/继续/取消，完成后自动入库） */
 export function downloadPeerMediaTask(params: {

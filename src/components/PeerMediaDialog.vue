@@ -4,7 +4,7 @@ import { Download, RefreshCw, CheckCircle2, HardDriveDownload, Loader2, XCircle 
 import Dialog from '../components/ui/Dialog.vue'
 import Badge from '../components/ui/Badge.vue'
 import Button from '../components/ui/Button.vue'
-import { fetchPeerMedia, downloadPeerMediaTask, type MediaSummary, type PeerInfo } from '../lib/api'
+import { fetchPeerMedia, downloadPeerMediaTask, testPeerConnection, type MediaSummary, type PeerInfo } from '../lib/api'
 import { mediaStore, convertTaskStore } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 
@@ -69,6 +69,21 @@ function activeDownloadState(item: MediaSummary): string | null {
   return t?.state ?? null
 }
 
+/** 请求失败时做 ping/TCP 连通性检测，区分「网络不可达」与「对方未开放查看」 */
+async function describeConnectError(ip: string, port: number): Promise<string> {
+  try {
+    const r = await testPeerConnection(ip, port)
+    if (!r.tcp) {
+      return r.ping
+        ? '对方不允许你查看媒体库（对方未开启「允许其他人查看我的媒体库」，或双方端口不一致）'
+        : '无法连接（对方不在线或网络不可达）'
+    }
+  } catch {
+    // 非 Tauri 环境或检测失败，回退到通用提示
+  }
+  return '对方媒体库不存在（对方可能未运行本软件或未启动 HTTP 服务）'
+}
+
 async function load() {
   const peer = props.peer
   if (!peer || !peer.ipv4) {
@@ -81,9 +96,9 @@ async function load() {
   try {
     items.value = await fetchPeerMedia(peer.ipv4, props.port)
   } catch {
-    // 请求失败（超时/对方未运行本软件或 HTTP 服务未启动）：提示媒体库不存在
-    error.value = '对方媒体库不存在（对方可能未运行本软件或未启动 HTTP 服务）'
+    // 请求失败：进一步做 ping/TCP 检测，给出精确原因
     items.value = []
+    error.value = await describeConnectError(peer.ipv4, props.port)
   } finally {
     loading.value = false
   }

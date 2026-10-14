@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::header::{self, HeaderValue};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 use axum::response::IntoResponse;
@@ -33,6 +33,8 @@ struct MediaState {
     db: Arc<Mutex<Db>>,
     thumb_dir: PathBuf,
     hls_dir: PathBuf,
+    /// 是否允许对等节点查看本机媒体库（关闭时 /api/media 返回空清单）
+    allow_peer_view: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -43,7 +45,12 @@ pub struct HttpServer {
 }
 
 impl HttpServer {
-    pub fn new(db: Arc<Mutex<Db>>, thumb_dir: &Path, hls_dir: &Path) -> Self {
+    pub fn new(
+        db: Arc<Mutex<Db>>,
+        thumb_dir: &Path,
+        hls_dir: &Path,
+        allow_peer_view: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             status: Arc::new(RwLock::new(ServerStatus {
                 running: false,
@@ -55,6 +62,7 @@ impl HttpServer {
                 db,
                 thumb_dir: thumb_dir.to_path_buf(),
                 hls_dir: hls_dir.to_path_buf(),
+                allow_peer_view,
             },
             tx: Arc::new(RwLock::new(None)),
         }
@@ -99,6 +107,7 @@ impl HttpServer {
             .route("/", get(|| async { "VRchat-LocalCinema" }))
             .route("/{file_name}", get(serve_media_basename))
             .layer(ConcurrencyLimitLayer::new(64))
+            .layer(axum::middleware::from_fn(log_peer_request))
             .with_state(self.state.clone());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -115,8 +124,31 @@ impl HttpServer {
                 error: None,
             };
         }
-        tracing::info!("HTTP 服务启动: {}", actual_addr);
-        let srv = axum::serve(listener, app);
+        let scope = if bind_ip == "0.0.0.0" {
+            "局域网(0.0.0.0)"
+        } else {
+            "仅本机(127.0.0.1)"
+        };
+        tracing::info!("HTTP 服务启动: {} 监听范围={}", actual_addr, scope);
+        // 记录本机可用 IPv4 网卡，便于排查「对方无法访问本机媒体库」时确认监听地址与虚拟 IP
+        let mut lan_addrs: Vec<String> = Vec::new();
+        for iface in crate::network_interfaces::list_ipv4_interfaces() {
+            for ip in &iface.ips {
+                lan_addrs.push(format!("{}={}", iface.name, ip));
+            }
+        }
+        tracing::info!(
+            "本机可用 IPv4 网卡: {}",
+            if lan_addrs.is_empty() {
+                "无".to_string()
+            } else {
+                lan_addrs.join(", ")
+            }
+        );
+        let srv = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        );
 
         let status = self.status.clone();
         tokio::spawn(async move {
@@ -160,8 +192,40 @@ impl HttpServer {
     }
 }
 
+/// 诊断用中间件：记录对端发现的媒体库接口（/api/*）请求及其来源地址。
+/// 若对端打开「查看他人媒体库」时此处没有对应记录，说明请求根本没到达本机
+/// （多为监听地址为 127.0.0.1 或防火墙拦截）；若有记录，则问题在应用层。
+/// 只记录 /api/*，避免播放期间的 Range 请求刷屏。
+async fn log_peer_request(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    if path.starts_with("/api/") {
+        tracing::info!("收到对端媒体库请求: {} {} 来自 {}", method, path, addr);
+    }
+    next.run(req).await
+}
+
 /// 返回对等节点的媒体清单（用于房间内互相浏览媒体库）
 async fn api_media(State(state): State<MediaState>) -> Response<Body> {
+    // 未开启「允许其他人查看我的媒体库」时返回空清单（对方看不到任何视频）
+    if !state
+        .allow_peer_view
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let body = serde_json::json!({ "items": [] });
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            )
+            .body(Body::from(body.to_string()))
+            .unwrap();
+    }
     let summaries = {
         let db = state.db.lock().unwrap();
         db.list_summaries()

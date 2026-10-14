@@ -1,6 +1,6 @@
 [package]
 name = "vrchat-localcinema"
-version = "1.2.0"
+version = "1.2.1"
 description = "VRchat-LocalCinema - local media library with HTTP sharing"
 authors = ["you"]
 license = "MIT"

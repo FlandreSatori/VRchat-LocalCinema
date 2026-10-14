@@ -2,7 +2,7 @@
 
 > 面向 VRChat 观影场景的 Windows 本地视频媒体库与 HTTP 分享工具：导入视频、检测格式兼容性、必要时一键转码，再把链接交给支持 HTTP 视频播放的播放器；也可通过内置 EasyTier 与朋友组建虚拟局域网，互相共享媒体库。
 
-![Version](https://img.shields.io/badge/version-1.2.0-orange.svg)
+![Version](https://img.shields.io/badge/version-1.2.1-orange.svg)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-blue.svg)](https://tauri.app/)
 [![License declaration](https://img.shields.io/badge/license%20declaration-MIT-blue.svg)](#许可证)
 

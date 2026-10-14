@@ -30,7 +30,12 @@ fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, Strin
     let thumb_dir = dir.join("thumbnails");
     std::fs::create_dir_all(&thumb_dir).unwrap();
 
-    let server = HttpServer::new(Arc::new(Mutex::new(db)), &thumb_dir, &thumb_dir);
+    let server = HttpServer::new(
+        Arc::new(Mutex::new(db)),
+        &thumb_dir,
+        &thumb_dir,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
     (server, item, PathBufWrap(dir), id)
 }
 
@@ -284,7 +289,12 @@ async fn test_existing_duplicate_names_are_ambiguous() {
     drop(conn);
     assert!(db.resolve_basename(&item.file_name).unwrap_err().to_string().contains("请先移除冲突条目"));
     assert_eq!(db.register(&file).unwrap().0.id, item.id);
-    let server = HttpServer::new(Arc::new(Mutex::new(db)), &dir.0, &dir.0);
+    let server = HttpServer::new(
+        Arc::new(Mutex::new(db)),
+        &dir.0,
+        &dir.0,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
     server.start("127.0.0.1", 0).await.unwrap();
     let base = format!("http://127.0.0.1:{}", server.status().port);
     let client = reqwest::Client::new();

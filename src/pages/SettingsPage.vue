@@ -10,6 +10,7 @@ import Badge from '../components/ui/Badge.vue'
 import Select from '../components/ui/Select.vue'
 import Switch from '../components/ui/Switch.vue'
 import Separator from '../components/ui/Separator.vue'
+import Dialog from '../components/ui/Dialog.vue'
 import {
   getSettings,
   saveSettings,
@@ -47,6 +48,7 @@ const form = reactive<Settings>({
   port: 17001,
   defaultUrlMode: 'localhost',
   lanAdapterIp: '',
+  allowPeerView: false,
   defaultPlayerPath: '',
   defaultPlayerArgs: '',
   thumbDir: '',
@@ -145,6 +147,7 @@ async function openManual(kind: 'ffmpeg' | 'easytier') {
 
 const loading = ref(true)
 const saving = ref(false)
+const savedOpen = ref(false)
 const appPaths = ref<AppPaths | null>(null)
 const players = ref<PlayerInfo[]>([])
 
@@ -172,8 +175,11 @@ const playerOptions = computed(() => {
   return opts
 })
 
-watch(() => form.listenMode, (mode) => {
+watch(() => form.listenMode, (mode, prev) => {
   form.defaultUrlMode = mode === 'lan' ? 'lan' : 'localhost'
+  if (mode === 'lan' && prev !== 'lan') {
+    toast.info('已切换到局域网模式')
+  }
 })
 
 /// 局域网模式使用的网卡（IP）选择
@@ -276,7 +282,7 @@ async function save() {
   try {
     await saveSettings({ ...form })
     settingsCache.value = { ...form }
-    toast.success('设置已保存')
+    savedOpen.value = true
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
@@ -394,6 +400,28 @@ onUnmounted(() => {
 
 <template>
   <div class="mx-auto max-w-3xl space-y-4 p-6 pb-12">
+    <!-- 设置生效前阻止用户操作 -->
+    <div
+      v-if="saving"
+      class="fixed inset-0 z-[60] flex items-center justify-center bg-background/70 backdrop-blur-sm"
+    >
+      <div class="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 shadow-lg">
+        <RefreshCw class="h-4 w-4 animate-spin" />
+        <span class="text-sm">正在应用设置，请稍候…</span>
+      </div>
+    </div>
+
+    <Dialog
+      :open="savedOpen"
+      title="设置已保存"
+      description="设置已生效"
+      @update:open="savedOpen = $event"
+    >
+      <div class="flex justify-end">
+        <Button type="button" @click="savedOpen = false">确定</Button>
+      </div>
+    </Dialog>
+
     <div class="flex items-center justify-between">
       <h1 class="text-xl font-semibold">设置</h1>
       <Button :disabled="loading || saving" @click="save">
@@ -425,6 +453,19 @@ onUnmounted(() => {
       </div>
       <p class="text-xs text-muted-foreground">
         本地模式仅允许本机访问；局域网模式会自动选择本机可用的物理网卡地址，其他同网络设备可访问。
+      </p>
+      <Separator />
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <Label>允许其他人查看我的媒体库</Label>
+          <p class="mt-0.5 text-xs text-muted-foreground">
+            开启后自动添加入站防火墙放行规则（首次需管理员授权）；请将监听模式设为局域网，并确保所有成员的监听端口一致
+          </p>
+        </div>
+        <Switch v-model:checked="form.allowPeerView" />
+      </div>
+      <p v-if="form.allowPeerView" class="text-xs text-amber-600 dark:text-amber-500">
+        已开启：他人可通过 {{ form.port }} 端口查看你的媒体库。请保持所有人的监听端口一致；关闭后对方将看不到任何视频。
       </p>
     </Card>
 

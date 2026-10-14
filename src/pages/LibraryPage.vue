@@ -363,38 +363,39 @@ function gotoSource(sourceId: string) {
 
 const peerMediaOpen = ref(false)
 const selectedPeer = ref<PeerInfo | null>(null)
-const peerPort = computed(() => settingsCache.value?.port ?? 17001)
+/// 对方端口输入：留空时回退到本机监听端口
+const peerPortInput = ref('')
+const defaultPeerPort = computed(() => settingsCache.value?.port ?? 17001)
+const peerPort = computed(() => {
+  const n = Math.round(Number(peerPortInput.value.trim()))
+  return Number.isFinite(n) && n >= 1 && n <= 65535 ? n : defaultPeerPort.value
+})
 
-/// 成员选择 / 手动输入对话框
+/// 查看他人媒体库对话框：手动输入虚拟 IP/端口始终可用，EasyTier 运行时额外提供成员一键选择
 const peerPickerOpen = ref(false)
 const pickerLoading = ref(false)
 const pickerPeers = ref<PeerInfo[]>([])
-const manualMode = ref(false)
 const manualIp = ref('')
 
 async function openPeerMedia() {
   peerPickerOpen.value = true
   pickerLoading.value = true
-  manualMode.value = false
   pickerPeers.value = []
   manualIp.value = ''
+  peerPortInput.value = ''
   try {
     const st = await getEasytierStatus()
-    if (!st.running) {
-      // 未组网：提示手动输入对方虚拟 IP 或启用 EasyTier
-      manualMode.value = true
-      return
+    if (st.running) {
+      const info = await getRoomInfo()
+      if (info.error) {
+        toast.error(info.error)
+      } else {
+        pickerPeers.value = info.peers
+      }
     }
-    const info = await getRoomInfo()
-    if (info.error) {
-      toast.error(info.error)
-      manualMode.value = true
-      return
-    }
-    pickerPeers.value = info.peers
+    // 未启用 EasyTier 时不报错：仅提供手动输入（成员列表为空）
   } catch {
-    // 非 Tauri 环境或获取失败：退回手动输入虚拟 IP
-    manualMode.value = true
+    // 非 Tauri 环境或获取失败：仅提供手动输入
   } finally {
     pickerLoading.value = false
   }
@@ -661,54 +662,73 @@ onUnmounted(() => {
 
     <UrlDialog v-model:open="urlDialogOpen" :item="urlDialogItem" :initial-format="urlDialogFormat" />
 
-    <!-- 查看他人媒体库：选择房间成员或手动输入虚拟 IP -->
+    <!-- 查看他人媒体库：手动输入虚拟 IP/端口，EasyTier 运行时额外提供成员一键选择 -->
     <Dialog
       :open="peerPickerOpen"
       title="查看他人媒体库"
       :description="
-        manualMode
-          ? '请输入对方的虚拟IP或启用Easytier'
-          : pickerLoading
-            ? '正在读取房间成员…'
-            : '选择同一房间内要查看的成员'
+        pickerLoading
+          ? '正在读取房间成员…'
+          : pickerPeers.length
+            ? '选择同一房间内的成员，或手动输入对方的虚拟 IP 与端口'
+            : '请输入对方的虚拟IP或启用Easytier'
       "
       @update:open="peerPickerOpen = $event"
     >
-      <div v-if="pickerLoading" class="py-6 text-center text-sm text-muted-foreground">
-        正在读取房间成员…
-      </div>
-      <div v-else-if="manualMode" class="space-y-4">
-        <div class="space-y-1.5">
-          <label class="text-sm font-medium">对方的虚拟 IP</label>
-          <Input
-            v-model="manualIp"
-            placeholder="例如 10.126.126.2"
-            autofocus
-            @keydown.enter="submitManualIp"
-          />
+      <div class="space-y-4">
+        <div class="grid grid-cols-[1fr_auto] gap-3">
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium">对方的虚拟 IP</label>
+            <Input
+              v-model="manualIp"
+              placeholder="例如 10.126.126.2"
+              autofocus
+              @keydown.enter="submitManualIp"
+            />
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium">端口</label>
+            <Input
+              v-model="peerPortInput"
+              type="number"
+              :min="1"
+              :max="65535"
+              class="w-28"
+              :placeholder="`留空 ${defaultPeerPort}`"
+            />
+          </div>
         </div>
         <div class="flex justify-end gap-2">
           <Button type="button" variant="outline" @click="peerPickerOpen = false">取消</Button>
           <Button type="button" @click="submitManualIp">查看</Button>
         </div>
-      </div>
-      <div v-else-if="pickerPeers.length === 0" class="py-6 text-center text-sm text-muted-foreground">
-        房间内暂无其他成员
-      </div>
-      <div v-else class="max-h-[52vh] space-y-2 overflow-y-auto pr-1">
-        <button
-          v-for="peer in pickerPeers"
-          :key="peer.ipv4 + peer.hostname"
-          type="button"
-          class="flex w-full items-center justify-between gap-3 rounded-md border border-border p-3 text-left transition-colors hover:bg-accent"
-          @click="choosePeer(peer)"
-        >
-          <div class="min-w-0 flex-1">
-            <p class="truncate text-sm font-medium">{{ peer.hostname || '未命名成员' }}</p>
-            <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{{ peer.ipv4 || '无虚拟 IP' }}</p>
+
+        <!-- 一键选择：仅在 EasyTier 运行且读取到房间成员时显示 -->
+        <template v-if="pickerLoading">
+          <div class="border-t border-border" />
+          <div class="py-2 text-center text-sm text-muted-foreground">正在读取房间成员…</div>
+        </template>
+        <template v-else-if="pickerPeers.length">
+          <div class="border-t border-border" />
+          <div class="space-y-2">
+            <p class="text-xs font-medium text-muted-foreground">房间成员（一键查看）</p>
+            <div class="max-h-[42vh] space-y-2 overflow-y-auto pr-1">
+              <button
+                v-for="peer in pickerPeers"
+                :key="peer.ipv4 + peer.hostname"
+                type="button"
+                class="flex w-full items-center justify-between gap-3 rounded-md border border-border p-3 text-left transition-colors hover:bg-accent"
+                @click="choosePeer(peer)"
+              >
+                <div class="min-w-0 flex-1">
+                  <p class="truncate text-sm font-medium">{{ peer.hostname || '未命名成员' }}</p>
+                  <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{{ peer.ipv4 || '无虚拟 IP' }}</p>
+                </div>
+                <Badge variant="outline" class="shrink-0">{{ costText(peer.cost) }}</Badge>
+              </button>
+            </div>
           </div>
-          <Badge variant="outline" class="shrink-0">{{ costText(peer.cost) }}</Badge>
-        </button>
+        </template>
       </div>
     </Dialog>
 
