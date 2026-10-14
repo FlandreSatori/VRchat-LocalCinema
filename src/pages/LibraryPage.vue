@@ -12,6 +12,7 @@ import {
   ChevronRight,
   FolderPlus,
   CornerUpLeft,
+  Users,
 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Button from '../components/ui/Button.vue'
@@ -19,15 +20,18 @@ import Input from '../components/ui/Input.vue'
 import Select from '../components/ui/Select.vue'
 import Dialog from '../components/ui/Dialog.vue'
 import ContextMenu from '../components/ui/ContextMenu.vue'
+import Badge from '../components/ui/Badge.vue'
 import MediaCard from '../components/MediaCard.vue'
 import UrlDialog from '../components/UrlDialog.vue'
+import PeerMediaDialog from '../components/PeerMediaDialog.vue'
 import type { MenuEntry } from '../lib/menu'
-import type { MediaItem, Folder, UnlistenFn } from '../lib/api'
+import type { MediaItem, Folder, PeerInfo, UnlistenFn } from '../lib/api'
 import { BUILTIN_INCOMPATIBLE_ID } from '../lib/api'
 import {
   mediaStore,
   folderStore,
   serverStore,
+  settingsCache,
   importMediaPaths,
   removeMediaItem,
   loadFolders,
@@ -41,6 +45,8 @@ import {
   segmentTranscode,
   transcodeOutputExists,
   onSegmentReady,
+  getEasytierStatus,
+  getRoomInfo,
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
 import { formatDuration } from '../lib/format'
@@ -353,6 +359,74 @@ function gotoSource(sourceId: string) {
   toast.info(`已跳转到源视频「${src.title}」所在位置`)
 }
 
+// ---------- 查看他人媒体库 ----------
+
+const peerMediaOpen = ref(false)
+const selectedPeer = ref<PeerInfo | null>(null)
+const peerPort = computed(() => settingsCache.value?.port ?? 17001)
+
+/// 成员选择 / 手动输入对话框
+const peerPickerOpen = ref(false)
+const pickerLoading = ref(false)
+const pickerPeers = ref<PeerInfo[]>([])
+const manualMode = ref(false)
+const manualIp = ref('')
+
+async function openPeerMedia() {
+  peerPickerOpen.value = true
+  pickerLoading.value = true
+  manualMode.value = false
+  pickerPeers.value = []
+  manualIp.value = ''
+  try {
+    const st = await getEasytierStatus()
+    if (!st.running) {
+      // 未组网：提示手动输入对方虚拟 IP 或启用 EasyTier
+      manualMode.value = true
+      return
+    }
+    const info = await getRoomInfo()
+    if (info.error) {
+      toast.error(info.error)
+      manualMode.value = true
+      return
+    }
+    pickerPeers.value = info.peers
+  } catch {
+    // 非 Tauri 环境或获取失败：退回手动输入虚拟 IP
+    manualMode.value = true
+  } finally {
+    pickerLoading.value = false
+  }
+}
+
+function choosePeer(peer: PeerInfo) {
+  if (!peer.ipv4) {
+    toast.error('该成员暂无可用的虚拟 IP')
+    return
+  }
+  peerPickerOpen.value = false
+  selectedPeer.value = peer
+  peerMediaOpen.value = true
+}
+
+function submitManualIp() {
+  const ip = manualIp.value.trim()
+  if (!ip) {
+    toast.error('请输入对方的虚拟 IP')
+    return
+  }
+  peerPickerOpen.value = false
+  selectedPeer.value = { hostname: '', ipv4: ip, latencyMs: null, loss: null, cost: '', nat: '', version: '' }
+  peerMediaOpen.value = true
+}
+
+function costText(cost: string): string {
+  if (cost.startsWith('p2p')) return '直连'
+  if (cost.startsWith('relay')) return '中转'
+  return cost || '-'
+}
+
 // ---------- 分段转码 ----------
 
 /// 分段转码确认对话框（第一段时长可调整，默认总时长 10% 向上取整到 5 分钟）
@@ -432,6 +506,10 @@ onUnmounted(() => {
         <p class="mt-0.5 text-sm text-muted-foreground">共 {{ mediaStore.items.length }} 个视频</p>
       </div>
       <div class="flex gap-2">
+        <Button variant="outline" @click="openPeerMedia">
+          <Users class="h-4 w-4" />
+          查看他人媒体库
+        </Button>
         <Button variant="outline" :disabled="importing" @click="openCreateFolder">
           <FolderPlus class="h-4 w-4" />
           新建文件夹
@@ -582,6 +660,59 @@ onUnmounted(() => {
     </div>
 
     <UrlDialog v-model:open="urlDialogOpen" :item="urlDialogItem" :initial-format="urlDialogFormat" />
+
+    <!-- 查看他人媒体库：选择房间成员或手动输入虚拟 IP -->
+    <Dialog
+      :open="peerPickerOpen"
+      title="查看他人媒体库"
+      :description="
+        manualMode
+          ? '请输入对方的虚拟IP或启用Easytier'
+          : pickerLoading
+            ? '正在读取房间成员…'
+            : '选择同一房间内要查看的成员'
+      "
+      @update:open="peerPickerOpen = $event"
+    >
+      <div v-if="pickerLoading" class="py-6 text-center text-sm text-muted-foreground">
+        正在读取房间成员…
+      </div>
+      <div v-else-if="manualMode" class="space-y-4">
+        <div class="space-y-1.5">
+          <label class="text-sm font-medium">对方的虚拟 IP</label>
+          <Input
+            v-model="manualIp"
+            placeholder="例如 10.126.126.2"
+            autofocus
+            @keydown.enter="submitManualIp"
+          />
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" @click="peerPickerOpen = false">取消</Button>
+          <Button type="button" @click="submitManualIp">查看</Button>
+        </div>
+      </div>
+      <div v-else-if="pickerPeers.length === 0" class="py-6 text-center text-sm text-muted-foreground">
+        房间内暂无其他成员
+      </div>
+      <div v-else class="max-h-[52vh] space-y-2 overflow-y-auto pr-1">
+        <button
+          v-for="peer in pickerPeers"
+          :key="peer.ipv4 + peer.hostname"
+          type="button"
+          class="flex w-full items-center justify-between gap-3 rounded-md border border-border p-3 text-left transition-colors hover:bg-accent"
+          @click="choosePeer(peer)"
+        >
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-sm font-medium">{{ peer.hostname || '未命名成员' }}</p>
+            <p class="mt-0.5 truncate font-mono text-xs text-muted-foreground">{{ peer.ipv4 || '无虚拟 IP' }}</p>
+          </div>
+          <Badge variant="outline" class="shrink-0">{{ costText(peer.cost) }}</Badge>
+        </button>
+      </div>
+    </Dialog>
+
+    <PeerMediaDialog v-model:open="peerMediaOpen" :peer="selectedPeer" :port="peerPort" />
 
     <!-- 分段转码确认：第一段时长可调整 -->
     <Dialog

@@ -2,7 +2,7 @@
 
 > 面向 VRChat 观影场景的 Windows 本地视频媒体库与 HTTP 分享工具：导入视频、检测格式兼容性、必要时一键转码，再把链接交给支持 HTTP 视频播放的播放器；也可通过内置 EasyTier 与朋友组建虚拟局域网，互相共享媒体库。
 
-![Version](https://img.shields.io/badge/version-1.1.3-orange.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-orange.svg)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-blue.svg)](https://tauri.app/)
 [![License declaration](https://img.shields.io/badge/license%20declaration-MIT-blue.svg)](#许可证)
 
@@ -182,10 +182,8 @@ Set-Location ..
 powershell -File scripts\package-portable.ps1
 ```
 
-脚本会生成 `dist-portable\VRchat-Localcinema-base.zip`（不含 ffmpeg 与 easytier-cli）和 `VRchat-Localcinema-full.zip`（内置两组件）；追加 `-DownloadComponents` 参数可自动下载最新组件。也可以直接运行仓库根目录的 `build.bat` 一键完成前端构建、Rust 编译与打包（同样支持透传 `-DownloadComponents`）。构建产物和运行数据不属于源码提交内容，请按自己的发布流程管理。
-
 ---
 
 ## 许可证
 
-本项目源码元数据声明使用 MIT License。仓库当前未附带 `LICENSE` 正文；在补充正式许可证文件前，请以仓库实际文件和发布说明为准。
+本项目使用 MIT License。
