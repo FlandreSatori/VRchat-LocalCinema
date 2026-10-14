@@ -78,7 +78,16 @@ let unlistenDrag: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
 let disposed = false
 
+// 禁用 WebView 原生右键菜单（返回/前进等），右键菜单位置由应用自定义菜单接管；
+// 文本输入框内保留原生菜单，方便粘贴
+function onContextMenu(e: MouseEvent) {
+  const el = e.target as HTMLElement | null
+  if (el?.closest('input, textarea, [contenteditable="true"]')) return
+  e.preventDefault()
+}
+
 onMounted(async () => {
+  document.addEventListener('contextmenu', onContextMenu)
   if (appWindow) {
     try {
       await syncMaximized()
@@ -120,6 +129,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true
+  document.removeEventListener('contextmenu', onContextMenu)
   unlistenDrag?.()
   unlistenResize?.()
 })
