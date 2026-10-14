@@ -2,7 +2,7 @@
 
 > 面向 VRChat 观影场景的 Windows 本地视频媒体库与 HTTP 分享工具：导入视频、检测格式兼容性、必要时一键转码，再把链接交给支持 HTTP 视频播放的播放器；也可通过内置 EasyTier 与朋友组建虚拟局域网，互相共享媒体库。
 
-![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+![Version](https://img.shields.io/badge/version-1.1.3-orange.svg)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-blue.svg)](https://tauri.app/)
 [![License declaration](https://img.shields.io/badge/license%20declaration-MIT-blue.svg)](#许可证)
 
@@ -43,6 +43,8 @@
 ---
 
 ## 快速开始
+
+我是小白，完全不懂github，看这里→[小白请读我](https://github.com/FlandreSatori/VRchat-LocalCinema/blob/main/%E5%B0%8F%E7%99%BD%E8%AF%B7%E8%AF%BB%E6%88%91.md)
 
 ### 使用发布版
 
@@ -114,7 +116,7 @@ data/
 
 当玩家的电脑加载VRchat房间时，其内包含的播放器是运行在玩家自己的电脑上的。
 
-因此当房主设置了播放连接为本地链接（比如http://127.0.0.1:17001/test.mp4）时，播放器会在自己电脑上寻找对应的视频并播放。
+因此当房主设置了播放连接为本地链接（比如`http://127.0.0.1:17001/test.mp4`）时，播放器会在自己电脑上寻找对应的视频并播放。
 
 未安装本程序或未下载并拖入视频的玩家无法播放。
 
