@@ -79,6 +79,30 @@ function formatSize(bytes: number): string {
   return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`
 }
 
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return '计算中'
+  const total = Math.ceil(seconds)
+  if (total < 60) return `${total} 秒`
+  const minutes = Math.floor(total / 60)
+  const rest = total % 60
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
+}
+
+function formatTaskTelemetry(t: ConvertTask): string | null {
+  if (t.state !== 'running') return null
+  if (t.kind === 'download' && t.speed && t.speed > 0) {
+    return `${formatSize(t.speed)}/s · 剩余 ${formatDuration(t.remainingSeconds)}`
+  }
+  if (t.kind === 'transcode' || t.kind === 'segment') {
+    const rates = [
+      t.speed && t.speed > 0 ? `${t.speed.toFixed(1)}x` : null,
+      t.fps && t.fps > 0 ? `${Math.round(t.fps)} fps` : null,
+    ].filter(Boolean).join(' · ')
+    return `${rates || '速度计算中'} · 剩余 ${formatDuration(t.remainingSeconds)}`
+  }
+  return null
+}
+
 async function refresh() {
   try {
     applyConvertTasks(await listConvertTasks())
@@ -149,7 +173,7 @@ onMounted(refresh)
       <div>
         <h1 class="text-xl font-semibold">任务</h1>
         <p class="mt-0.5 text-sm text-muted-foreground">
-          转码为 MP4（H.264 + AAC）与分段转码按队列顺序执行；下载任务后台执行，完成后自动加入媒体库
+          转码与分段转码按队列顺序执行；下载任务后台执行，完成后自动加入媒体库
         </p>
       </div>
       <Button v-if="finishedCount > 0" variant="outline" @click="clearFinished">
@@ -192,6 +216,9 @@ onMounted(refresh)
               </template>
               <template v-if="t.kind === 'download' && (t.state === 'running' || t.state === 'paused') && t.received !== null && t.received !== undefined">
                 · {{ formatSize(t.received) }}<template v-if="t.total"> / {{ formatSize(t.total) }}</template>
+              </template>
+              <template v-if="formatTaskTelemetry(t)">
+                · {{ formatTaskTelemetry(t) }}
               </template>
             </div>
           </div>

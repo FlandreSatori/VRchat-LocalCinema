@@ -259,7 +259,7 @@ fn test_batch_import_conflicts() {
     std::fs::create_dir_all(dir.0.join("a")).unwrap();
     std::fs::create_dir_all(dir.0.join("b")).unwrap();
     let first = dir.0.join("a/测试 Video.mp4");
-    let conflict = dir.0.join("b/测试 video.MP4");
+    let conflict = dir.0.join("b/测试 Video.mp4");
     let other = dir.0.join("b/other%.mp4");
     for path in [&first, &conflict, &other] { std::fs::write(path, b"video").unwrap(); }
     let db = Db::open(&dir.0.join("library.db")).unwrap();
@@ -276,7 +276,7 @@ fn test_batch_import_conflicts() {
 }
 
 #[tokio::test]
-async fn test_existing_duplicate_names_are_ambiguous() {
+async fn test_duplicate_names_resolve_case_sensitively() {
     let dir = PathBufWrap(std::env::temp_dir().join(format!("vlc-legacy-{}", uuid::Uuid::new_v4())));
     std::fs::create_dir_all(&dir.0).unwrap();
     let file = dir.0.join("same.mp4");
@@ -287,7 +287,9 @@ async fn test_existing_duplicate_names_are_ambiguous() {
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute("INSERT INTO media (id, title, file_name, file_path, file_size, duration_ms, format, thumbnail, status, added_at, updated_at) SELECT 'legacy', title, 'SAME.MP4', 'legacy-path', file_size, duration_ms, format, thumbnail, status, added_at, updated_at FROM media WHERE id = ?1", [&item.id]).unwrap();
     drop(conn);
-    assert!(db.resolve_basename(&item.file_name).unwrap_err().to_string().contains("请先移除冲突条目"));
+    // 大小写敏感：精确名各自解析到对应条目，不再视为歧义
+    assert_eq!(db.resolve_basename("same.mp4").unwrap().unwrap().id, item.id);
+    assert_eq!(db.resolve_basename("SAME.MP4").unwrap().unwrap().id, "legacy");
     assert_eq!(db.register(&file).unwrap().0.id, item.id);
     let server = HttpServer::new(
         Arc::new(Mutex::new(db)),
@@ -298,9 +300,10 @@ async fn test_existing_duplicate_names_are_ambiguous() {
     server.start("127.0.0.1", 0).await.unwrap();
     let base = format!("http://127.0.0.1:{}", server.status().port);
     let client = reqwest::Client::new();
-    let response = client.get(format!("{}/same.mp4", base)).send().await.unwrap();
-    assert_eq!(response.status(), 409);
-    assert!(response.text().await.unwrap().contains("移除冲突"));
+    // 精确大小写命中真实文件
+    assert_eq!(client.get(format!("{}/same.mp4", base)).send().await.unwrap().status(), 200);
+    // 大小写不同的名字落到另一条（其磁盘文件不存在）→ 404
+    assert_eq!(client.get(format!("{}/SAME.MP4", base)).send().await.unwrap().status(), 404);
     assert_eq!(client.get(format!("{}/media/{}", base, item.id)).send().await.unwrap().status(), 200);
     server.stop();
 }

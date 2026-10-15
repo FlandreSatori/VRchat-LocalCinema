@@ -100,7 +100,7 @@ onMounted(async () => {
             <Badge :variant="statusBadge.variant" class="px-3 py-1 text-sm">{{ statusBadge.text }}</Badge>
           </div>
           <p v-if="serverStore.running" class="text-sm text-muted-foreground">
-            监听地址 <span class="font-mono text-foreground">{{ serverStore.bindAddr }}:{{ serverStore.port }}</span>
+            监听地址 <span class="font-mono text-foreground">{{ serverStore.bindAddr }}</span>
           </p>
           <p v-else class="text-sm text-muted-foreground">端口 {{ serverStore.port }}</p>
           <p v-if="serverStore.error" class="text-sm text-destructive">{{ serverStore.error }}</p>
@@ -151,7 +151,11 @@ onMounted(async () => {
       </div>
       <div v-if="logs.length === 0" class="mt-4 text-center text-sm text-muted-foreground">暂无日志</div>
       <div v-else class="mt-3 max-h-96 space-y-1 overflow-y-auto font-mono text-xs">
-        <div v-for="(log, i) in logs" :key="i" class="flex items-start gap-2 rounded px-1.5 py-1 hover:bg-accent/50">
+        <div
+          v-for="log in logs"
+          :key="`${log.ts}·${log.level}·${log.target}·${log.message}`"
+          class="flex items-start gap-2 rounded px-1.5 py-1 hover:bg-accent/50"
+        >
           <span class="shrink-0 text-muted-foreground">{{ formatTime(log.ts) }}</span>
           <Badge :variant="levelVariant(log.level)" class="shrink-0 px-1.5 py-0 text-[10px]">{{ log.level }}</Badge>
           <span class="break-all leading-snug">{{ log.message }}</span>

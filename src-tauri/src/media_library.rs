@@ -94,7 +94,7 @@ pub struct MediaItem {
     pub format: String,
     /// 封面文件名（相对封面缓存目录），None 表示无封面
     pub thumbnail: Option<String>,
-    /// 文件内容 SHA-256（小写十六进制），None 表示尚未计算
+    /// 文件内容 BLAKE3（小写十六进制），None 表示尚未计算
     pub hash: Option<String>,
     // ===== ffprobe 深度探测结果 =====
     pub container: Option<String>,
@@ -214,6 +214,14 @@ impl Db {
                 created_at INTEGER NOT NULL
             );",
         )?;
+        // 索引：避免按文件名/文件夹/HLS 播放列表/源视频查询时全表扫描
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_media_file_name ON media(file_name);
+             CREATE INDEX IF NOT EXISTS idx_media_folder_id ON media(folder_id);
+             CREATE INDEX IF NOT EXISTS idx_media_hls_playlist ON media(hls_playlist);
+             CREATE INDEX IF NOT EXISTS idx_media_source_media_id ON media(source_media_id);
+             CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);",
+        )?;
         let _ = conn.execute(
             "INSERT OR IGNORE INTO folders (id, name, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
             params![BUILTIN_INCOMPATIBLE_ID, "不兼容", now_ms()],
@@ -237,10 +245,12 @@ impl Db {
         }
         let canonical = std::fs::canonicalize(path)?;
         let path_str = canonical.to_string_lossy().to_string();
+        // 路径去重：file_path 有 UNIQUE 索引，先精确查；旧数据（未规范化）再兜底比较
+        if let Some(existing) = self.get_by_path(&path_str)? {
+            return Ok((existing, false));
+        }
         for item in self.list()? {
-            if item.file_path.eq_ignore_ascii_case(&path_str)
-                || std::fs::canonicalize(&item.file_path).ok().as_ref() == Some(&canonical)
-            {
+            if std::fs::canonicalize(&item.file_path).ok().as_ref() == Some(&canonical) {
                 return Ok((item, false));
             }
         }
@@ -252,13 +262,9 @@ impl Db {
         if !crate::url_builder::valid_basename(&file_name) {
             return Err(AppError::Msg("文件名不能映射为播放 URL".into()));
         }
-        if let Some(existing) = self
-            .list()?
-            .into_iter()
-            .find(|m| m.file_name.to_lowercase() == file_name.to_lowercase())
-        {
+        if let Some(existing) = self.find_by_name(&file_name)?.into_iter().next() {
             return Err(AppError::Msg(format!(
-                "同名文件冲突（不区分大小写）：{} 已登记为 {}；请移除冲突条目或自行重命名后再导入",
+                "同名文件冲突：{} 已登记为 {}；请移除冲突条目或自行重命名后再导入",
                 file_name, existing.file_path
             )));
         }
@@ -278,7 +284,9 @@ impl Db {
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, 'processing', ?7, ?7)",
             params![id, title, file_name, path_str, meta.len() as i64, ext, now],
         )?;
-        let item = self.get(&id)?.expect("just inserted");
+        let item = self
+            .get(&id)?
+            .ok_or_else(|| AppError::Msg("写入媒体条目后读取失败".into()))?;
         Ok((item, true))
     }
 
@@ -350,19 +358,29 @@ impl Db {
         Ok(out)
     }
 
+    /// 按文件名精确查找（大小写敏感，走 file_name 索引）
+    pub fn find_by_name(&self, name: &str) -> AppResult<Vec<MediaItem>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{} WHERE file_name = ?1", Self::SELECT))?;
+        let rows = stmt.query_map(params![name], Self::row_to_item)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 按播放 URL 中的文件名解析媒体条目（大小写敏感）
     pub fn resolve_basename(&self, name: &str) -> AppResult<Option<MediaItem>> {
-        let matches: Vec<_> = self
-            .list()?
-            .into_iter()
-            .filter(|m| m.file_name.to_lowercase() == name.to_lowercase())
-            .collect();
+        let matches = self.find_by_name(name)?;
         if matches.len() > 1 {
             return Err(AppError::Msg(format!(
                 "同名文件冲突：{} 对应多个已登记文件，请先移除冲突条目",
                 name
             )));
         }
-        Ok(matches.into_iter().find(|m| m.file_name == name))
+        Ok(matches.into_iter().next())
     }
 
     pub fn import_paths(&self, paths: &[String]) -> ImportResult {
@@ -516,12 +534,15 @@ impl Db {
 
     /// 列出某源视频的全部分段产物（按段序号排序）
     pub fn list_segments_of(&self, source_id: &str) -> AppResult<Vec<MediaItem>> {
-        let mut items: Vec<MediaItem> = self
-            .list()?
-            .into_iter()
-            .filter(|m| m.source_media_id.as_deref() == Some(source_id) && m.segment_index.is_some())
-            .collect();
-        items.sort_by_key(|m| m.segment_index.unwrap_or(0));
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE source_media_id = ?1 AND segment_index IS NOT NULL ORDER BY segment_index ASC",
+            Self::SELECT
+        ))?;
+        let rows = stmt.query_map(params![source_id], Self::row_to_item)?;
+        let mut items = Vec::new();
+        for r in rows {
+            items.push(r?);
+        }
         Ok(items)
     }
 
@@ -588,12 +609,26 @@ impl Db {
         Ok(out)
     }
 
+    /// 按名称+父级精确查找文件夹（走索引，避免全表扫描）
+    fn find_folder_by_name(&self, name: &str, parent_id: Option<&str>) -> AppResult<Option<Folder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, parent_id, created_at FROM folders WHERE name = ?1 AND parent_id IS ?2",
+        )?;
+        let mut rows = stmt.query_map(params![name, parent_id], |row| {
+            Ok(Folder {
+                id: row.get("id")?,
+                name: row.get("name")?,
+                parent_id: row.get("parent_id")?,
+                created_at: row.get("created_at")?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
     /// 按名称+父级查找文件夹，不存在则创建（导入目录结构时使用）
     pub fn get_or_create_folder(&self, name: &str, parent_id: Option<&str>) -> AppResult<Folder> {
-        for f in self.list_folders()? {
-            if f.parent_id.as_deref() == parent_id && f.name == name {
-                return Ok(f);
-            }
+        if let Some(f) = self.find_folder_by_name(name, parent_id)? {
+            return Ok(f);
         }
         self.create_folder(name, parent_id)
     }
@@ -611,10 +646,8 @@ impl Db {
                 return Err(AppError::Msg("目标文件夹不存在".into()));
             }
         }
-        for f in self.list_folders()? {
-            if f.parent_id.as_deref() == parent_id && f.name == name {
-                return Err(AppError::Msg(format!("同级已存在同名文件夹「{}」", name)));
-            }
+        if self.find_folder_by_name(name, parent_id)?.is_some() {
+            return Err(AppError::Msg(format!("同级已存在同名文件夹「{}」", name)));
         }
         let id = uuid::Uuid::new_v4().to_string();
         let now = now_ms();
@@ -660,22 +693,27 @@ impl Db {
         }
         self.get_folder(id)?
             .ok_or_else(|| AppError::Msg("文件夹不存在".into()))?;
+        // 邻接表 + 迭代求子树，避免 O(N²) 的 contains 扫描
         let all = self.list_folders()?;
-        let mut to_delete = vec![id.to_string()];
-        loop {
-            let mut grew = false;
-            for f in &all {
-                if let Some(p) = &f.parent_id {
-                    if to_delete.contains(p) && !to_delete.contains(&f.id) {
-                        to_delete.push(f.id.clone());
-                        grew = true;
-                    }
-                }
-            }
-            if !grew {
-                break;
+        let mut children: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        for f in &all {
+            if let Some(p) = f.parent_id.as_deref() {
+                children.entry(p).or_default().push(f.id.as_str());
             }
         }
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stack: Vec<&str> = vec![id];
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            to_delete.push(cur.to_string());
+            if let Some(cs) = children.get(cur) {
+                stack.extend(cs.iter().copied());
+            }
+        }
+        let tx = self.conn.unchecked_transaction()?;
         for fid in &to_delete {
             self.conn.execute(
                 "UPDATE media SET folder_id = NULL, updated_at = ?2 WHERE folder_id = ?1",
@@ -683,6 +721,7 @@ impl Db {
             )?;
             self.conn.execute("DELETE FROM folders WHERE id = ?1", params![fid])?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -720,13 +759,8 @@ impl Db {
         let item = self
             .get(id)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".into()))?;
-        for m in self.list()? {
-            if m.id != id && m.file_name.to_lowercase() == name.to_lowercase() {
-                return Err(AppError::Msg(format!(
-                    "同名文件已存在：{}（不区分大小写）",
-                    m.file_name
-                )));
-            }
+        if let Some(m) = self.find_by_name(name)?.into_iter().find(|m| m.id != id) {
+            return Err(AppError::Msg(format!("同名文件已存在：{}", m.file_name)));
         }
         let title = std::path::Path::new(name)
             .file_stem()
@@ -737,23 +771,30 @@ impl Db {
             params![id, name, title, now_ms()],
         )?;
         let _ = item;
-        Ok(self.get(id)?.expect("just updated"))
+        Ok(self
+            .get(id)?
+            .ok_or_else(|| AppError::Msg("更新媒体条目后读取失败".into()))?)
     }
 
     /// 返回可供对等节点比对的媒体摘要（文件仍存在的条目）
     pub fn list_summaries(&self) -> AppResult<Vec<MediaSummary>> {
-        Ok(self
-            .list()?
-            .into_iter()
-            .filter(|m| m.status != MediaStatus::Missing)
-            .map(|m| MediaSummary {
+        let mut stmt = self.conn.prepare(&format!(
+            "{} WHERE status != 'missing' ORDER BY added_at DESC",
+            Self::SELECT
+        ))?;
+        let rows = stmt.query_map([], Self::row_to_item)?;
+        let mut out = Vec::new();
+        for r in rows {
+            let m = r?;
+            out.push(MediaSummary {
                 id: m.id,
                 title: m.title,
                 file_name: m.file_name,
                 file_size: m.file_size,
                 duration_ms: m.duration_ms,
                 hash: m.hash,
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 }

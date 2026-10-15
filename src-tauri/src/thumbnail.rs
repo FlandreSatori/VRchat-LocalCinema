@@ -33,10 +33,10 @@ pub fn resolve_tool(configured: &str, default_name: &str) -> Option<PathBuf> {
     which(default_name)
 }
 
-pub(crate) fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+/// 隐藏控制台窗口（tokio 版）
+fn hide_console_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     cmd
@@ -94,22 +94,22 @@ async fn run_with_timeout(
     file: &Path,
     timeout: Duration,
 ) -> AppResult<Vec<u8>> {
-    let mut cmd = std::process::Command::new(tool);
+    let mut cmd = tokio::process::Command::new(tool);
     cmd.args(args)
         .arg(file)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    hide_console(&mut cmd);
+        .stderr(Stdio::piped())
+        // 超时后 future 被丢弃时自动结束子进程，避免遗留僵尸进程
+        .kill_on_drop(true);
+    hide_console_tokio(&mut cmd);
     let child = cmd
         .spawn()
         .map_err(|e| AppError::Msg(format!("无法启动 {}: {}", tool.display(), e)))?;
 
-    let wait = tokio::task::spawn_blocking(move || child.wait_with_output());
-    let output = match tokio::time::timeout(timeout, wait).await {
-        Ok(Ok(Ok(o))) => o,
-        Ok(Ok(Err(e))) => return Err(AppError::Io(e)),
-        Ok(Err(e)) => return Err(AppError::Msg(format!("进程任务失败: {}", e))),
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(AppError::Io(e)),
         Err(_) => return Err(AppError::Msg(format!("{} 执行超时", tool.display()))),
     };
     if !output.status.success() {
@@ -154,21 +154,20 @@ pub async fn extract_thumbnail(
             "4".into(),
             out_str,
         ];
-        let mut cmd = std::process::Command::new(ffmpeg);
+        let mut cmd = tokio::process::Command::new(ffmpeg);
         cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        hide_console(&mut cmd);
+            .stderr(Stdio::piped())
+            // 超时后自动结束子进程
+            .kill_on_drop(true);
+        hide_console_tokio(&mut cmd);
         let child = cmd.spawn();
         let ok = match child {
-            Ok(c) => {
-                let wait = tokio::task::spawn_blocking(move || c.wait_with_output());
-                match tokio::time::timeout(Duration::from_secs(30), wait).await {
-                    Ok(Ok(Ok(o))) => o.status.success() && out_path.exists(),
-                    _ => false,
-                }
-            }
+            Ok(c) => match tokio::time::timeout(Duration::from_secs(30), c.wait_with_output()).await {
+                Ok(Ok(o)) => o.status.success() && out_path.exists(),
+                _ => false,
+            },
             Err(e) => {
                 return Err(AppError::Msg(format!("无法启动 ffmpeg: {}", e)));
             }

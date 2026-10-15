@@ -3,6 +3,7 @@ pub mod compat;
 pub mod components;
 pub mod convert_queue;
 pub mod easytier;
+pub mod estimate;
 pub mod error;
 pub mod external_player;
 pub mod http_server;
@@ -10,7 +11,9 @@ pub mod logger;
 pub mod media_library;
 pub mod network_interfaces;
 pub mod settings;
+pub mod system_codecs;
 pub mod thumbnail;
+pub mod transcode;
 pub mod url_builder;
 
 use std::sync::atomic::AtomicBool;
@@ -101,11 +104,13 @@ pub fn run() {
                 server: server.clone(),
                 recent_logs,
                 allow_peer_view,
+                easytier_forced_lan: AtomicBool::new(false),
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
             };
             app.manage(state);
+            app.manage(estimate::EstimateState::default());
 
             // 转码队列执行器
             commands::spawn_convert_worker(app.handle().clone());
@@ -166,6 +171,7 @@ pub fn run() {
             commands::open_with_system_default,
             commands::open_in_folder,
             commands::open_url,
+            commands::system_audio_decoder_missing,
             commands::get_recent_logs,
             commands::get_app_paths,
             commands::open_data_dir,
@@ -188,6 +194,10 @@ pub fn run() {
             commands::download_peer_media_task,
             commands::download_task_pause,
             commands::download_task_resume,
+            commands::get_media_streams,
+            estimate::load_estimate_source,
+            estimate::probe_transcode_estimate,
+            estimate::cancel_transcode_estimate,
             commands::transcode_media,
             commands::transcode_output_exists,
             commands::generate_sample,

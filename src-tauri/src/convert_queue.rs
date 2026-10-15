@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
+use crate::transcode::TranscodeOptions;
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,6 +55,8 @@ pub struct ConvertTask {
     pub kind: TaskKind,
     /// 转码 MP4 时：是否覆盖已存在的产物
     pub overwrite: bool,
+    /// 转码设置（流选择 / 编码方式 / 字幕处理等）；下载任务为空配置
+    pub options: TranscodeOptions,
     /// 分段转码：第一段时长（毫秒）；其余任务为 None
     pub first_ms: Option<u64>,
     pub state: TaskState,
@@ -67,11 +71,17 @@ pub struct ConvertTask {
     pub peer_port: Option<u16>,
     /// 对端媒体 id（media_id 在登记本地条目前暂存它）
     pub peer_media_id: Option<String>,
+    /// 下载任务：对端提供的文件哈希（下载完成后校验），其余任务为 None
+    pub expected_hash: Option<String>,
     /// 最终落盘路径（用于断点续传与取消时清理临时文件）
     pub dest_path: Option<String>,
     /// 已接收字节 / 总字节
     pub received: Option<u64>,
     pub total: Option<u64>,
+    /// 转码为倍速、下载为 bytes/s
+    pub speed: Option<f64>,
+    pub fps: Option<f64>,
+    pub remaining_seconds: Option<f64>,
 }
 
 #[derive(Default)]
@@ -81,6 +91,36 @@ struct Inner {
     running_cancel: Vec<(String, Arc<AtomicBool>)>,
     /// 运行中下载任务的暂停标志
     running_pause: Vec<(String, Arc<AtomicBool>)>,
+}
+
+/// 任务列表上限：超过后优先裁剪最旧的已结束任务，避免列表随下载/转码持续增长
+const MAX_TASKS: usize = 256;
+
+impl Inner {
+    /// 裁剪任务列表：超出上限时从最旧的已结束任务（Done/Error/Cancelled 且无运行标志）开始移除，
+    /// 直到回到上限；Queued/Running/Paused 不参与裁剪。
+    fn trim_tasks(&mut self) {
+        if self.tasks.len() <= MAX_TASKS {
+            return;
+        }
+        let mut excess = self.tasks.len() - MAX_TASKS;
+        let mut i = 0;
+        while excess > 0 && i < self.tasks.len() {
+            let id = self.tasks[i].id.clone();
+            let finished = matches!(
+                self.tasks[i].state,
+                TaskState::Done | TaskState::Error | TaskState::Cancelled
+            );
+            let running = self.running_cancel.iter().any(|(rid, _)| rid == &id)
+                || self.running_pause.iter().any(|(rid, _)| rid == &id);
+            if finished && !running {
+                self.tasks.remove(i);
+                excess -= 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// 线程安全的转码任务队列
@@ -97,8 +137,9 @@ impl ConvertQueue {
         media_id: String,
         title: String,
         overwrite: bool,
+        options: TranscodeOptions,
     ) -> Result<ConvertTask, String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.tasks.iter().any(|t| {
             t.media_id == media_id && matches!(t.state, TaskState::Queued | TaskState::Running)
         }) {
@@ -110,6 +151,7 @@ impl ConvertQueue {
             title,
             kind: TaskKind::Transcode,
             overwrite,
+            options,
             first_ms: None,
             state: TaskState::Queued,
             percent: None,
@@ -119,11 +161,16 @@ impl ConvertQueue {
             peer_ip: None,
             peer_port: None,
             peer_media_id: None,
+            expected_hash: None,
             dest_path: None,
             received: None,
             total: None,
+            speed: None,
+            fps: None,
+            remaining_seconds: None,
         };
         inner.tasks.push(task.clone());
+        inner.trim_tasks();
         Ok(task)
     }
 
@@ -134,8 +181,9 @@ impl ConvertQueue {
         title: String,
         overwrite: bool,
         first_ms: u64,
+        options: TranscodeOptions,
     ) -> Result<ConvertTask, String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.tasks.iter().any(|t| {
             t.media_id == media_id && matches!(t.state, TaskState::Queued | TaskState::Running)
         }) {
@@ -147,6 +195,7 @@ impl ConvertQueue {
             title,
             kind: TaskKind::Segment,
             overwrite,
+            options,
             first_ms: Some(first_ms),
             state: TaskState::Queued,
             percent: None,
@@ -156,11 +205,16 @@ impl ConvertQueue {
             peer_ip: None,
             peer_port: None,
             peer_media_id: None,
+            expected_hash: None,
             dest_path: None,
             received: None,
             total: None,
+            speed: None,
+            fps: None,
+            remaining_seconds: None,
         };
         inner.tasks.push(task.clone());
+        inner.trim_tasks();
         Ok(task)
     }
 
@@ -171,7 +225,7 @@ impl ConvertQueue {
         media_id: &str,
         title: String,
     ) -> Result<(ConvertTask, Arc<AtomicBool>), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.tasks.iter().any(|t| {
             t.media_id == media_id && matches!(t.state, TaskState::Queued | TaskState::Running)
         }) {
@@ -183,6 +237,7 @@ impl ConvertQueue {
             title,
             kind: TaskKind::Hls,
             overwrite: false,
+            options: TranscodeOptions::default(),
             first_ms: None,
             state: TaskState::Running,
             percent: None,
@@ -192,13 +247,18 @@ impl ConvertQueue {
             peer_ip: None,
             peer_port: None,
             peer_media_id: None,
+            expected_hash: None,
             dest_path: None,
             received: None,
             total: None,
+            speed: None,
+            fps: None,
+            remaining_seconds: None,
         };
         let flag = Arc::new(AtomicBool::new(false));
         inner.running_cancel.push((task.id.clone(), flag.clone()));
         inner.tasks.push(task.clone());
+        inner.trim_tasks();
         Ok((task, flag))
     }
 
@@ -212,8 +272,9 @@ impl ConvertQueue {
         peer_ip: String,
         peer_port: u16,
         dest_path: String,
+        expected_hash: Option<String>,
     ) -> Result<(ConvertTask, Arc<AtomicBool>, Arc<AtomicBool>), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let active = |t: &ConvertTask| {
             t.kind == TaskKind::Download
                 && matches!(
@@ -241,6 +302,7 @@ impl ConvertQueue {
             title,
             kind: TaskKind::Download,
             overwrite: false,
+            options: TranscodeOptions::default(),
             first_ms: None,
             state: TaskState::Running,
             percent: Some(0.0),
@@ -250,21 +312,26 @@ impl ConvertQueue {
             peer_ip: Some(peer_ip),
             peer_port: Some(peer_port),
             peer_media_id: Some(peer_media_id),
+            expected_hash,
             dest_path: Some(dest_path),
             received: Some(0),
             total: None,
+            speed: None,
+            fps: None,
+            remaining_seconds: None,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         inner.running_cancel.push((task.id.clone(), cancel.clone()));
         inner.running_pause.push((task.id.clone(), pause.clone()));
         inner.tasks.push(task.clone());
+        inner.trim_tasks();
         Ok((task, cancel, pause))
     }
 
     /// 暂停下载任务（仅运行中）：置位暂停标志，由下载执行器保存进度并转入 Paused
     pub fn pause_download(&self, task_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(task) = inner.tasks.iter_mut().find(|t| t.id == task_id) else {
             return Err("任务不存在".into());
         };
@@ -284,7 +351,7 @@ impl ConvertQueue {
         &self,
         task_id: &str,
     ) -> Result<(ConvertTask, Arc<AtomicBool>, Arc<AtomicBool>), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let task = {
             let Some(task) = inner.tasks.iter_mut().find(|t| t.id == task_id) else {
                 return Err("任务不存在".into());
@@ -316,7 +383,7 @@ impl ConvertQueue {
         total: Option<u64>,
         percent: Option<f64>,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
             t.received = Some(received);
             if total.is_some() {
@@ -328,7 +395,7 @@ impl ConvertQueue {
 
     /// 下载执行器：转入已暂停（保存已接收进度并清理运行标志）
     pub fn mark_download_paused(&self, task_id: &str, received: u64, total: Option<u64>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
             if t.state == TaskState::Running {
                 t.state = TaskState::Paused;
@@ -344,7 +411,7 @@ impl ConvertQueue {
 
     /// 开始任务：将排队中的任务移到队列最前（当前任务完成后立即执行）
     pub fn start_now(&self, task_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pos) = inner.tasks.iter().position(|t| t.id == task_id) else {
             return Err("任务不存在".into());
         };
@@ -363,7 +430,7 @@ impl ConvertQueue {
 
     /// 取消任务：排队中直接标记取消；进行中设置取消标志（由执行器终止 ffmpeg）
     pub fn cancel(&self, task_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(task) = inner.tasks.iter_mut().find(|t| t.id == task_id) else {
             return Err("任务不存在".into());
         };
@@ -371,6 +438,9 @@ impl ConvertQueue {
             TaskState::Queued | TaskState::Paused => {
                 // 排队中直接标记取消；已暂停的下载任务由调用方清理临时文件
                 task.state = TaskState::Cancelled;
+                task.speed = None;
+                task.fps = None;
+                task.remaining_seconds = None;
                 Ok(())
             }
             TaskState::Running => {
@@ -386,7 +456,7 @@ impl ConvertQueue {
 
     /// 移除一条已结束任务的记录
     pub fn remove(&self, task_id: &str) -> Result<(), String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pos) = inner.tasks.iter().position(|t| t.id == task_id) else {
             return Err("任务不存在".into());
         };
@@ -402,7 +472,7 @@ impl ConvertQueue {
 
     /// 清除全部已结束任务的记录
     pub fn clear_finished(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .tasks
             .retain(|t| matches!(t.state, TaskState::Queued | TaskState::Running));
@@ -410,19 +480,19 @@ impl ConvertQueue {
 
     /// 是否存在该媒体的排队/进行中任务
     pub fn has_active(&self, media_id: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.tasks.iter().any(|t| {
             t.media_id == media_id && matches!(t.state, TaskState::Queued | TaskState::Running)
         })
     }
 
     pub fn list(&self) -> Vec<ConvertTask> {
-        self.inner.lock().unwrap().tasks.clone()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).tasks.clone()
     }
 
     /// 取出下一个排队任务并标记为运行中，返回 (任务, 取消标志)
     pub fn take_next(&self) -> Option<(ConvertTask, Arc<AtomicBool>)> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let pos = inner
             .tasks
             .iter()
@@ -436,26 +506,38 @@ impl ConvertQueue {
 
     /// 清除运行标记（任务结束或提前返回时调用，避免取消标志悬空）
     pub fn clear_running(&self, task_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.running_cancel.retain(|(id, _)| id != task_id);
     }
 
     pub fn set_percent(&self, task_id: &str, percent: f64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
             t.percent = Some(percent);
         }
     }
 
+    pub fn set_telemetry(&self, task_id: &str, speed: Option<f64>, fps: Option<f64>, remaining_seconds: Option<f64>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
+            t.speed = speed;
+            t.fps = fps;
+            t.remaining_seconds = remaining_seconds;
+        }
+    }
+
     /// 标记任务结束（完成/失败/取消）并清除运行标记
     pub fn finish(&self, task_id: &str, state: TaskState, error: Option<String>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
             t.state = state;
             if state == TaskState::Done {
                 t.percent = Some(100.0);
             }
             t.error = error;
+            t.speed = None;
+            t.fps = None;
+            t.remaining_seconds = None;
         }
         inner.running_cancel.retain(|(id, _)| id != task_id);
         inner.running_pause.retain(|(id, _)| id != task_id);
@@ -464,7 +546,7 @@ impl ConvertQueue {
     /// 仅当任务仍处于 Running 时标记结束（供 HLS 后台任务使用，
     /// 避免与其它结束路径重复转移状态）
     pub fn finish_if_running(&self, task_id: &str, state: TaskState, error: Option<String>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = inner.tasks.iter_mut().find(|t| t.id == task_id) {
             if t.state != TaskState::Running {
                 return;
@@ -474,6 +556,9 @@ impl ConvertQueue {
                 t.percent = Some(100.0);
             }
             t.error = error;
+            t.speed = None;
+            t.fps = None;
+            t.remaining_seconds = None;
         }
         inner.running_cancel.retain(|(id, _)| id != task_id);
         inner.running_pause.retain(|(id, _)| id != task_id);
@@ -487,9 +572,9 @@ mod tests {
     #[test]
     fn test_enqueue_dedup_and_start_now() {
         let q = ConvertQueue::default();
-        let a = q.enqueue("m1".into(), "A".into(), false).unwrap();
-        let _b = q.enqueue("m2".into(), "B".into(), false).unwrap();
-        assert!(q.enqueue("m1".into(), "A".into(), false).is_err());
+        let a = q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).unwrap();
+        let _b = q.enqueue("m2".into(), "B".into(), false, TranscodeOptions::default()).unwrap();
+        assert!(q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).is_err());
 
         // B 开始后应排在 A 之前
         assert!(q.start_now(&_b.id).is_ok());
@@ -503,7 +588,7 @@ mod tests {
         let q = ConvertQueue::default();
         assert!(q.take_next().is_none());
 
-        let a = q.enqueue("m1".into(), "A".into(), false).unwrap();
+        let a = q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).unwrap();
         let (task, flag) = q.take_next().unwrap();
         assert_eq!(task.media_id, "m1");
         assert_eq!(task.state, TaskState::Running);
@@ -520,7 +605,7 @@ mod tests {
         assert_eq!(done.percent, Some(100.0));
 
         // 排队中的任务直接取消
-        let _ = q.enqueue("m2".into(), "B".into(), false).unwrap();
+        let _ = q.enqueue("m2".into(), "B".into(), false, TranscodeOptions::default()).unwrap();
         let b = q.list().into_iter().find(|t| t.media_id == "m2").unwrap();
         assert!(q.cancel(&b.id).is_ok());
         let b = q.list().into_iter().find(|t| t.id == b.id).unwrap();
@@ -536,7 +621,7 @@ mod tests {
     fn test_hls_task_and_finish_if_running() {
         let q = ConvertQueue::default();
         // 排队中的转码任务会阻止 HLS 注册
-        let a = q.enqueue("m1".into(), "A".into(), false).unwrap();
+        let a = q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).unwrap();
         assert!(q.start_hls_task("m1", "A".into()).is_err());
         // 取消并移除排队中的转码任务
         assert!(q.cancel(&a.id).is_ok());
@@ -547,10 +632,10 @@ mod tests {
         assert_eq!(hls.kind, TaskKind::Hls);
         assert_eq!(hls.state, TaskState::Running);
         assert!(q.start_hls_task("m1", "A".into()).is_err());
-        assert!(q.enqueue("m1".into(), "A".into(), false).is_err());
+        assert!(q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).is_err());
 
         // HLS 任务不占用转码 worker（take_next 只取 Queued）
-        let _b = q.enqueue("m2".into(), "B".into(), false).unwrap();
+        let _b = q.enqueue("m2".into(), "B".into(), false, TranscodeOptions::default()).unwrap();
         let (next, _) = q.take_next().unwrap();
         assert_eq!(next.media_id, "m2");
 
@@ -578,6 +663,7 @@ mod tests {
                 "10.0.0.2".into(),
                 17001,
                 "C:\\dl\\video.mp4".into(),
+                Some("deadbeef".into()),
             )
             .unwrap();
         assert_eq!(task.kind, TaskKind::Download);
@@ -592,7 +678,8 @@ mod tests {
                 "video.mp4".into(),
                 "10.0.0.2".into(),
                 17001,
-                "x".into()
+                "x".into(),
+                None
             )
             .is_err());
         assert!(q
@@ -602,12 +689,13 @@ mod tests {
                 "video.mp4".into(),
                 "10.0.0.3".into(),
                 17001,
-                "x".into()
+                "x".into(),
+                None
             )
             .is_err());
 
         // 下载任务不占用转码 worker
-        let _t = q.enqueue("m1".into(), "A".into(), false).unwrap();
+        let _t = q.enqueue("m1".into(), "A".into(), false, TranscodeOptions::default()).unwrap();
         let (next, _) = q.take_next().unwrap();
         assert_eq!(next.kind, TaskKind::Transcode);
 
@@ -641,12 +729,40 @@ mod tests {
         let (tr, _) = {
             let _ = cancel;
             let _ = pause;
-            q.enqueue("m2".into(), "B".into(), false).unwrap();
+            q.enqueue("m2".into(), "B".into(), false, TranscodeOptions::default()).unwrap();
             let (tr, flag) = q.take_next().unwrap();
             (tr, flag)
         };
         assert!(q.pause_download(&tr.id).is_err());
         assert!(q.resume_download(&tr.id).is_err());
         assert!(q.cancel(&tr.id).is_ok());
+    }
+
+    #[test]
+    fn test_task_trim_caps_and_drops_oldest_finished() {
+        // 连续登记并结束任务，列表长度应被裁剪到上限
+        let q = ConvertQueue::default();
+        for i in 0..(MAX_TASKS + 10) {
+            let t = q
+                .enqueue(format!("m{}", i), "T".into(), false, TranscodeOptions::default())
+                .unwrap();
+            q.finish(&t.id, TaskState::Done, None);
+        }
+        assert_eq!(q.list().len(), MAX_TASKS);
+        // 最旧的已结束任务被移除，最新的仍保留
+        assert!(!q.list().iter().any(|t| t.media_id == "m0"));
+        assert!(q.list().iter().any(|t| t.media_id == format!("m{}", MAX_TASKS + 9)));
+
+        // 进行中的任务不参与裁剪
+        let q2 = ConvertQueue::default();
+        let run = q2.enqueue("keep".into(), "K".into(), false, TranscodeOptions::default()).unwrap();
+        q2.take_next();
+        for i in 0..(MAX_TASKS + 5) {
+            let t = q2
+                .enqueue(format!("x{}", i), "X".into(), false, TranscodeOptions::default())
+                .unwrap();
+            q2.finish(&t.id, TaskState::Done, None);
+        }
+        assert!(q2.list().iter().any(|t| t.id == run.id));
     }
 }

@@ -44,6 +44,8 @@ const segments = ref<SegmentEntry[]>([])
 const segmentHint = ref('')
 const copiedId = ref('')
 let unlisten: UnlistenFn | null = null
+/// 每次重建自增；开关弹窗、切换媒体/模式/格式时旧请求失效，迟到结果被丢弃
+let rebuildGeneration = 0
 
 const modeOptions: { value: UrlMode; label: string; icon: typeof Laptop }[] = [
   { value: 'localhost', label: '本地模式', icon: Laptop },
@@ -78,19 +80,23 @@ onUnmounted(() => {
 })
 
 watch(
-  () => props.open,
-  async (isOpen) => {
-    if (!isOpen || !props.item) return
+  [() => props.open, () => props.item?.id],
+  async ([isOpen]) => {
+    // 关闭或切换媒体：使此前所有在途请求失效
+    const ticket = ++rebuildGeneration
     copiedId.value = ''
     urlError.value = ''
     url.value = ''
     segments.value = []
     segmentHint.value = ''
+    if (!isOpen || !props.item) return
     format.value = props.initialFormat ?? 'whole'
     try {
       const settings = await loadSettings()
+      if (ticket !== rebuildGeneration) return
       mode.value = settings.defaultUrlMode
     } catch {
+      if (ticket !== rebuildGeneration) return
       mode.value = 'localhost'
     }
     await rebuild()
@@ -102,26 +108,31 @@ watch([mode, format], () => {
 })
 
 async function rebuild() {
+  const ticket = ++rebuildGeneration
   url.value = ''
   urlError.value = ''
   segments.value = []
   segmentHint.value = ''
-  if (!props.item) return
+  const id = props.item?.id
+  if (!id) return
   try {
     if (format.value === 'whole') {
-      url.value = await buildMediaUrl(props.item.id, mode.value)
+      const result = await buildMediaUrl(id, mode.value)
+      if (ticket !== rebuildGeneration) return
+      url.value = result
     } else {
       const sid = sourceId.value
       if (!sid) return
       const list = await listSegments(sid)
-      const entries: SegmentEntry[] = []
-      for (let i = 0; i < list.length; i++) {
-        entries.push({
-          id: list[i].id,
+      // 并发获取各段链接；完毕后若已被更新请求取代则整体丢弃
+      const entries: SegmentEntry[] = await Promise.all(
+        list.map(async (seg, i) => ({
+          id: seg.id,
           label: `第 ${i + 1} 段`,
-          url: await buildMediaUrl(list[i].id, mode.value),
-        })
-      }
+          url: await buildMediaUrl(seg.id, mode.value),
+        }))
+      )
+      if (ticket !== rebuildGeneration) return
       segments.value = entries
       if (!entries.length) {
         segmentHint.value = '分段尚未生成：第一段转码完成后会自动弹出本窗口'
@@ -133,6 +144,7 @@ async function rebuild() {
       }
     }
   } catch (e) {
+    if (ticket !== rebuildGeneration) return
     urlError.value = errMsg(e)
   }
 }

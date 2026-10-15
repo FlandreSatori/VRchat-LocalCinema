@@ -18,6 +18,7 @@ import {
   CornerUpLeft,
   Scissors,
   Check,
+  TriangleAlert,
 } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -26,6 +27,7 @@ import ContextMenu from './ui/ContextMenu.vue'
 import Button from './ui/Button.vue'
 import Badge from './ui/Badge.vue'
 import MediaInfoDialog from './MediaInfoDialog.vue'
+import TranscodeDialog from './TranscodeDialog.vue'
 import type { MenuEntry } from '../lib/menu'
 import {
   buildMediaUrl,
@@ -35,9 +37,10 @@ import {
   refreshMedia,
   setCustomThumbnail,
   removeMedia,
-  transcodeMedia,
-  transcodeOutputExists,
   generateSample,
+  audioDecoderMissingCached,
+  DOLBY_DECODER_URL,
+  openUrl,
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
@@ -62,7 +65,6 @@ const emit = defineEmits<{
   rename: [item: MediaItem]
   move: [item: MediaItem]
   'goto-source': [sourceId: string]
-  'segment-transcode': [item: MediaItem]
   'toggle-select': [id: string]
 }>()
 
@@ -70,6 +72,7 @@ const router = useRouter()
 
 const imgError = ref(false)
 const infoOpen = ref(false)
+const transcodeOpen = ref(false)
 
 watch(
   () => [props.item.id, props.item.thumbnail],
@@ -98,6 +101,38 @@ const busy = computed(
 
 const unsupported = computed(() => props.item.compatStatus === 'unsupported')
 
+/// 本机缺少音频解码器（如 AC-3）：白名单兼容但 VRChat 仍可能无法播放，提示安装 Dolby 解码器
+const decoderWarning = ref<string | null>(null)
+watch(
+  () => [props.item.id, props.item.audioCodec, props.item.compatStatus] as const,
+  async () => {
+    decoderWarning.value = null
+    const codec = props.item.audioCodec
+    if (!codec || props.item.compatStatus !== 'supported') return
+    if (codec !== 'ac3' && codec !== 'eac3') return
+    try {
+      if (await audioDecoderMissingCached(codec)) {
+        decoderWarning.value =
+          codec === 'ac3'
+            ? '本机缺少 AC-3 解码器，VRChat 将无法播放该视频的音轨。可安装 Dolby Digital Plus 解码器后重启 VRChat 解决。'
+            : '本机缺少 E-AC-3 (Dolby Digital Plus) 解码器，VRChat 将无法播放该视频的音轨。可安装 Dolby 解码器后重启 VRChat 解决。'
+      }
+    } catch {
+      // 非 Tauri 环境忽略
+    }
+  },
+  { immediate: true }
+)
+
+/// 安装 Dolby 解码器（打开微软商店页面）
+async function openDecoderInstall() {
+  try {
+    await openUrl(DOLBY_DECODER_URL)
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
 /// 转码产物的「快捷方式」卡片：只允许复制链接 / 跳转源视频位置，不允许再次转码
 const isShortcut = computed(() => props.item.sourceMediaId !== null)
 
@@ -111,24 +146,13 @@ async function copyUrl(mode: UrlMode, label: string) {
   }
 }
 
-async function doTranscode() {
-  try {
-    // 已存在转码产物时，先询问是否覆盖（应用内确认框，替代原生 confirm）
-    let overwrite = false
-    if (await transcodeOutputExists(props.item.id)) {
-      overwrite = await confirmDialog({
-        title: '覆盖转码产物？',
-        description: `「${props.item.title}」已存在转码产物，再次转码将覆盖该文件。`,
-        confirmText: '覆盖',
-        danger: true,
-      })
-      if (!overwrite) return
-    }
-    await transcodeMedia(props.item.id, overwrite)
-    toast.info('已加入转码队列，可在「任务」页查看进度或调整顺序')
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
+/// 打开转码设置对话框（转码范围 / 音轨 / 字幕轨选择、转码方式与高级参数均在其中）。
+/// 延迟到下一帧再打开：先让右键菜单完全关闭，避免菜单收起的同一次点击事件
+/// 把刚弹出的对话框立即关掉（表现为对话框一闪而过、屏幕只剩灰色遮罩）。
+function doTranscode() {
+  setTimeout(() => {
+    transcodeOpen.value = true
+  }, 0)
 }
 
 /// 生成样本：截取视频前 10 秒保存到源视频所在目录，完成后自动打开资源管理器定位
@@ -246,14 +270,22 @@ const menuItems = computed<MenuEntry[]>(() => {
     { type: 'item', label: '打开文件所在目录', icon: FolderOpen, onSelect: openFolder },
     { type: 'separator' },
     { type: 'item', label: '查看视频信息', icon: Info, onSelect: () => (infoOpen.value = true) },
-    { type: 'item', label: '转码为 MP4（提前转好，推荐）', icon: FileVideo, onSelect: doTranscode },
     {
       type: 'item',
-      label: '分段转码（先转前 10%，先看后等）',
-      icon: ListVideo,
-      disabled: props.item.durationMs === null,
-      onSelect: () => emit('segment-transcode', props.item),
+      label: '转码为…',
+      icon: FileVideo,
+      onSelect: doTranscode,
     },
+    ...(decoderWarning.value
+      ? [
+          {
+            type: 'item' as const,
+            label: '安装 Dolby 解码器（AC-3/E-AC-3）…',
+            icon: TriangleAlert,
+            onSelect: openDecoderInstall,
+          },
+        ]
+      : []),
     { type: 'item', label: '生成样本（前 10 秒）', icon: Scissors, onSelect: doSample },
     { type: 'item', label: '刷新媒体信息', icon: RefreshCw, onSelect: doRefresh },
     { type: 'item', label: '更换封面', icon: ImageIcon, onSelect: changeThumbnail },
@@ -321,6 +353,16 @@ function navigateToConvert() {
         >
           转码产物
         </Badge>
+        <Badge
+          v-if="decoderWarning"
+          variant="warning"
+          class="absolute right-2 cursor-help"
+          :class="item.status === 'ok' && !unsupported ? 'top-2' : 'top-9'"
+          :title="decoderWarning"
+        >
+          <TriangleAlert class="mr-1 h-3 w-3" />
+          缺解码器
+        </Badge>
         <span
           v-if="item.durationMs !== null"
           class="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-xs text-white"
@@ -352,20 +394,9 @@ function navigateToConvert() {
           {{ item.compatReason ?? '不支持该视频格式或编码组合' }}
         </div>
         <div v-if="unsupported && !isShortcut" class="mt-2 flex gap-1.5">
-          <Button size="sm" variant="outline" :disabled="busy" class="h-7 flex-1 px-2 text-xs" title="转码为 MP4（H.264 + AAC），提前转好推荐用这个" @click="doTranscode">
+          <Button size="sm" variant="outline" :disabled="busy" class="h-7 flex-1 px-2 text-xs" title="打开转码设置：可选全部转码或分段转码、音轨与字幕" @click="doTranscode">
             <FileVideo class="h-3 w-3" />
-            转码 MP4
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            :disabled="busy || item.durationMs === null"
-            class="h-7 flex-1 px-2 text-xs"
-            :title="item.durationMs === null ? '视频时长未知，请先刷新媒体信息' : '先转前 10% 马上看，第二段后台继续'"
-            @click="emit('segment-transcode', item)"
-          >
-            <ListVideo class="h-3 w-3" />
-            分段转码
+            转码为…
           </Button>
         </div>
         <div v-else-if="isShortcut" class="mt-2 flex gap-1.5">
@@ -387,4 +418,6 @@ function navigateToConvert() {
     </div>
     <MediaInfoDialog v-model:open="infoOpen" :item="props.item" />
   </ContextMenu>
+  <!-- 转码对话框放在菜单触发器之外：避免与右键菜单的打开/关闭相互干扰 -->
+  <TranscodeDialog v-model:open="transcodeOpen" :item="props.item" />
 </template>

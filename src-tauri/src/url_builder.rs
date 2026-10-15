@@ -8,9 +8,40 @@ pub fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, SEGMENT).to_string()
 }
 
+/// Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9 等，扩展名不影响判定）
+fn is_reserved_device_name(stem: &str) -> bool {
+    let up = stem
+        .trim_end_matches(|c| c == ' ' || c == '.')
+        .to_ascii_uppercase();
+    if matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$") {
+        return true;
+    }
+    for pfx in ["COM", "LPT"] {
+        if let Some(rest) = up.strip_prefix(pfx) {
+            if rest.len() == 1 && rest.chars().all(|c| ('1'..='9').contains(&c)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn valid_basename(s: &str) -> bool {
-    !s.is_empty() && s != "." && s != ".."
-        && !s.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' ))
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    // Windows 文件名不允许以点或空格结尾
+    if s.ends_with('.') || s.ends_with(' ') {
+        return false;
+    }
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    {
+        return false;
+    }
+    // 拒绝 Windows 保留设备名（如 CON.mp4 / aux）
+    let stem = s.split('.').next().unwrap_or(s);
+    !is_reserved_device_name(stem)
 }
 
 pub struct UrlInput {

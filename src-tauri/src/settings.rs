@@ -217,7 +217,10 @@ impl Settings {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        fs::write(path, text)?;
+        // 先写临时文件再原子替换，避免写入过程中断导致配置损坏
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 

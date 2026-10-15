@@ -444,7 +444,7 @@ onUnmounted(() => {
         </div>
         <div class="space-y-1.5">
           <Label>房间密码</Label>
-          <Input v-model="cfg.roomPassword" placeholder="123" />
+          <Input v-model="cfg.roomPassword" type="password" placeholder="123" />
         </div>
         <div class="space-y-1.5">
           <Label>成员名</Label>

@@ -204,20 +204,20 @@ impl EasytierManager {
     }
 
     pub fn status(&self) -> EasytierStatus {
-        self.status.read().unwrap().clone()
+        self.status.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 设置本机虚拟 IP（EasyTier 停止时应清空）
     pub fn set_virtual_ip(&self, ip: Option<String>) {
-        *self.virtual_ip.write().unwrap() = ip;
+        *self.virtual_ip.write().unwrap_or_else(|e| e.into_inner()) = ip;
     }
 
     pub fn cached_virtual_ip(&self) -> Option<String> {
-        self.virtual_ip.read().unwrap().clone()
+        self.virtual_ip.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_status(&self, f: impl FnOnce(&mut EasytierStatus)) {
-        let mut guard = self.status.write().unwrap();
+        let mut guard = self.status.write().unwrap_or_else(|e| e.into_inner());
         f(&mut guard);
     }
 
@@ -262,7 +262,7 @@ impl EasytierManager {
             AppError::Msg("计划任务已触发但未检测到 easytier-core 进程，请查看 easytier-core 日志".to_string())
         })?;
 
-        *self.child.lock().unwrap() = None;
+        *self.child.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.set_status(|s| {
             s.running = true;
             s.pid = Some(pid);
@@ -276,7 +276,7 @@ impl EasytierManager {
     /// 停止 easytier-core（手动停止：计划任务终止 + 停止任务免 UAC 清理残留）。
     pub async fn stop(&self) {
         {
-            let mut guard = self.child.lock().unwrap();
+            let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut child) = guard.take() {
                 let _ = child.start_kill();
             }
@@ -313,7 +313,7 @@ impl EasytierManager {
     /// 停止 easytier-core（应用退出场景：计划任务终止无需 UAC，同步快速执行）。
     pub fn stop_detached(&self) {
         {
-            let mut guard = self.child.lock().unwrap();
+            let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut child) = guard.take() {
                 let _ = child.start_kill();
             }
@@ -334,7 +334,7 @@ impl EasytierManager {
 
     /// 刷新运行状态：计划任务模式下按进程存在性判断（同时可检测意外退出）。
     pub fn refresh(&self) {
-        let mut guard = self.child.lock().unwrap();
+        let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             // 兼容旧本地子进程模式
             let exited = match guard.as_mut().unwrap().try_wait() {
@@ -355,7 +355,7 @@ impl EasytierManager {
         }
         drop(guard);
 
-        let was_running = self.status.read().unwrap().running;
+        let was_running = self.status.read().unwrap_or_else(|e| e.into_inner()).running;
         match core_processes().first() {
             Some(proc) => {
                 self.set_status(|s| {
@@ -530,8 +530,8 @@ async fn task_action_matches(data_dir: &Path) -> Option<bool> {
 
 /// 以管理员权限注册/覆盖运行与停止两个计划任务（首次 UAC 一次，之后不再需要）
 async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
-    // 注册逻辑写入独立脚本文件后提权 -File 执行，避免嵌套引号问题
-    let reg = run_ps1_path(data_dir).with_file_name("register-task.ps1");
+    // 注册脚本通过 -EncodedCommand 内联传入提权进程，不落地到用户可写目录，
+    // 避免「先写文件、再提权执行」之间的替换窗口（TOCTOU / 本地提权）。
     let script = format!(
         "$ErrorActionPreference = 'Stop'\n$rv = {}\n$sv = {}\n$u = \"$env:USERDOMAIN\\$env:USERNAME\"\n$principal = New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Highest\n$set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew\n$a1 = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $rv + '\"')\nRegister-ScheduledTask -TaskName '{}' -Action $a1 -Principal $principal -Settings $set -Force | Out-Null\n$a2 = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B \"' + $sv + '\"')\nRegister-ScheduledTask -TaskName '{}' -Action $a2 -Principal $principal -Settings $set -Force | Out-Null\nWrite-Output 'OK'\n",
         ps_quote(&run_hidden_vbs_path(data_dir).to_string_lossy()),
@@ -539,15 +539,48 @@ async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
         EASYTIER_TASK_NAME,
         EASYTIER_TASK_NAME_STOP
     );
-    write_utf8_bom(&reg, &script)?;
+    let encoded = encode_powershell_command(&script);
 
     let wrapper = format!(
-        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|注册脚本执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
-        ps_quote(&reg.to_string_lossy())
+        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|注册脚本执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
+        ps_quote(&encoded)
     );
-    let result = run_powershell_script(&wrapper).await;
-    let _ = std::fs::remove_file(&reg);
-    result
+    run_powershell_script(&wrapper).await
+}
+
+/// 将脚本编码为 PowerShell `-EncodedCommand` 所需的 Base64（UTF-16LE，含 BOM 无关）。
+/// 内联传参可完全规避引号/编码问题，且无需落地脚本文件。
+fn encode_powershell_command(script: &str) -> String {
+    let utf16: Vec<u8> = script
+        .encode_utf16()
+        .flat_map(|unit| unit.to_le_bytes())
+        .collect();
+    base64_encode(&utf16)
+}
+
+/// 标准 Base64 编码（无外部依赖）
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// 确保运行/停止两个计划任务已注册且动作指向当前 vbs
@@ -1213,6 +1246,17 @@ mod tests {
         assert!(text.contains("'影院房间'"));
         assert!(text.contains("'p''w\"d'"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_encode_powershell_command() {
+        // 标准 Base64；UTF-16LE 编码（PowerShell -EncodedCommand 要求）
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b""), "");
+        // 'A' = 0x41 → UTF-16LE 为 41 00 → Base64 "QQA="
+        assert_eq!(encode_powershell_command("A"), "QQA=");
     }
 
     #[test]

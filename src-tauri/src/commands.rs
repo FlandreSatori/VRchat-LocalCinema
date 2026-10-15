@@ -29,6 +29,9 @@ pub struct AppState {
     pub recent_logs: RecentLogs,
     /// 是否允许对等节点查看本机媒体库（与设置同步，供 HTTP 服务读取）
     pub allow_peer_view: Arc<AtomicBool>,
+    /// 监听模式是否由「启动内置 EasyTier 组网」自动切换为局域网；
+    /// 组网停止时据此自动恢复为本地模式，用户手动设置的局域网模式不受影响
+    pub easytier_forced_lan: AtomicBool,
     pub easytier: easytier::EasytierManager,
     /// 转码任务队列（按任务序列执行）
     pub convert_queue: crate::convert_queue::ConvertQueue,
@@ -38,7 +41,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn current_settings(&self) -> Settings {
-        self.settings.read().unwrap().clone()
+        self.settings.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn emit_status(app: &AppHandle, server: &HttpServer) {
@@ -70,9 +73,20 @@ pub async fn save_settings(
         return Err(AppError::Msg("端口必须在 1-65535 之间".to_string()));
     }
     settings.normalize_network_mode();
+    // 内置组网运行中且局域网监听是自动切换来的 → 不允许手动切回本地模式（否则组网成员无法访问）
+    if settings.listen_mode == ListenMode::Loopback
+        && state.easytier_forced_lan.load(Ordering::SeqCst)
+    {
+        return Err(AppError::Msg(
+            "内置组网（EasyTier）运行中，媒体共享需保持局域网监听模式；请先在「组网」页停止组网，再切换为本地模式"
+                .to_string(),
+        ));
+    }
     let old = state.current_settings();
-    let net_changed =
-        old.bind_ip() != settings.bind_ip() || old.port != settings.port;
+    // 「允许他人查看」切换会改变实际绑定的监听地址（关闭时强制只监听环回地址），因此需重建服务
+    let net_changed = old.bind_ip() != settings.bind_ip()
+        || old.port != settings.port
+        || old.allow_peer_view != settings.allow_peer_view;
     let autostart_changed = old.autostart != settings.autostart;
 
     // 同步「允许他人查看媒体库」的入站防火墙规则：开启（或端口变化）需要提权放行；
@@ -88,7 +102,7 @@ pub async fn save_settings(
     }
 
     {
-        let mut guard = state.settings.write().unwrap();
+        let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
         *guard = settings.clone();
     }
     state
@@ -161,7 +175,7 @@ pub async fn restart_server(app: AppHandle, state: State<'_, AppState>) -> AppRe
 
 #[tauri::command]
 pub async fn list_media(state: State<'_, AppState>) -> AppResult<Vec<MediaItem>> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let mut items = db.list()?;
     // 轻量级状态检查：仅 stat 文件存在性
     for item in items.iter_mut() {
@@ -186,7 +200,7 @@ fn spawn_probe_task(app: AppHandle, id: String) {
         let thumb_dir = thumb_dir_of(&state);
 
         let item = {
-            let db = db.lock().unwrap();
+            let db = db.lock().unwrap_or_else(|e| e.into_inner());
             match db.get(&id) {
                 Ok(Some(v)) => v,
                 _ => return,
@@ -195,7 +209,7 @@ fn spawn_probe_task(app: AppHandle, id: String) {
         let file_path = PathBuf::from(&item.file_path);
 
         if !file_path.is_file() {
-            let db = db.lock().unwrap();
+            let db = db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = db.set_status(&id, MediaStatus::Missing);
             if let Ok(Some(item)) = db.get(&id) {
                 let _ = app.emit("media-updated", &item);
@@ -256,7 +270,7 @@ fn spawn_probe_task(app: AppHandle, id: String) {
         }
 
         let item = {
-            let db = db.lock().unwrap();
+            let db = db.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(h) = &hash {
                 let _ = db.set_hash(&id, h);
             }
@@ -283,7 +297,7 @@ fn spawn_probe_task(app: AppHandle, id: String) {
                     && !it.compat_resolved
                 {
                     let updated = {
-                        let db = db.lock().unwrap();
+                        let db = db.lock().unwrap_or_else(|e| e.into_inner());
                         let _ =
                             db.set_media_folder(&id, Some(crate::media_library::BUILTIN_INCOMPATIBLE_ID));
                         db.get(&id).ok().flatten()
@@ -373,7 +387,7 @@ pub async fn import_files(
                     let folder = state
                         .db
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get_or_create_folder(seg, parent_id.as_deref())?;
                     parent_id = Some(folder.id);
                 }
@@ -386,7 +400,7 @@ pub async fn import_files(
     }
 
     let file_paths: Vec<String> = expanded.iter().map(|(f, _)| f.clone()).collect();
-    let result = state.db.lock().unwrap().import_paths(&file_paths);
+    let result = state.db.lock().unwrap_or_else(|e| e.into_inner()).import_paths(&file_paths);
     // 将导入条目放入对应的媒体库文件夹
     if folder_created {
         // register() 内部会 canonicalize 路径（Windows 下带 \\?\ 前缀），
@@ -399,7 +413,7 @@ pub async fn import_files(
                 .unwrap_or_else(|_| f.clone());
             folder_by_path.insert(key, fid.clone());
         }
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         for item in &result.items {
             if let Some(Some(fid)) = folder_by_path.get(&item.file_path) {
                 let _ = db.set_media_folder(&item.id, Some(fid));
@@ -421,15 +435,16 @@ async fn refresh_media_internal(
     id: &str,
 ) -> AppResult<MediaItem> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.get(id)?.ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
     let path = PathBuf::from(&item.file_path);
     if !path.is_file() {
         let updated = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
             db.set_status(id, MediaStatus::Missing)?;
-            db.get(id)?.unwrap()
+            db.get(id)?
+                .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
         };
         let _ = app.emit("media-updated", &updated);
         return Ok(updated);
@@ -451,7 +466,7 @@ pub async fn refresh_media(
 #[tauri::command]
 pub async fn remove_media(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let removed = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.remove(&id)?
     };
     if let Some(item) = removed {
@@ -471,6 +486,10 @@ pub async fn set_custom_thumbnail(
     id: String,
     image_path: String,
 ) -> AppResult<MediaItem> {
+    // id 会被拼进封面文件名，先校验其形态，避免路径逃逸
+    if !is_safe_media_id(&id) {
+        return Err(AppError::Msg("媒体 id 非法".to_string()));
+    }
     let src = PathBuf::from(&image_path);
     if !src.is_file() {
         return Err(AppError::Msg("封面图片不存在".to_string()));
@@ -483,16 +502,28 @@ pub async fn set_custom_thumbnail(
     if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
         return Err(AppError::Msg("封面必须是 jpg/png/webp 图片".to_string()));
     }
+    // 先确认条目存在，再写入封面文件
+    {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        if db.get(&id)?.is_none() {
+            return Err(AppError::Msg("媒体条目不存在".to_string()));
+        }
+    }
     let thumb_name = format!("{}.{}", id, ext);
     let out = thumb_dir_of(&state).join(&thumb_name);
     thumbnail::import_custom_thumbnail(&src, &out)?;
     let updated = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.update_after_probe(&id, None, Some(thumb_name), MediaStatus::Ok, None, None)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
     let _ = app.emit("media-updated", &updated);
     Ok(updated)
+}
+
+/// 媒体 id 形如 UUID（36 位十六进制 + 连字符），用于拼接文件名前的安全校验
+fn is_safe_media_id(id: &str) -> bool {
+    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
 #[tauri::command]
@@ -531,7 +562,7 @@ pub async fn build_media_url(
 ) -> AppResult<String> {
     let settings = state.current_settings();
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let item = db.get(&id)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?;
         db.resolve_basename(&item.file_name)?
@@ -588,7 +619,7 @@ pub async fn open_in_folder(state: State<'_, AppState>, id: String) -> AppResult
 }
 
 fn get_item_checked(state: &State<'_, AppState>, id: &str) -> AppResult<MediaItem> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let item = db
         .get(id)?
         .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?;
@@ -629,7 +660,7 @@ pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> AppResult<u64>
     let mut removed: u64 = 0;
     // 仅清理当前媒体库未引用的缓存
     let used: std::collections::HashSet<String> = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.list()?
             .into_iter()
             .filter_map(|m| m.thumbnail)
@@ -749,7 +780,7 @@ pub async fn clear_convert_cache(_app: AppHandle, state: State<'_, AppState>) ->
     // 从媒体库移除指向转码产物的记录；源视频的 HLS 标记一并清空
     let mut removed_records = 0u64;
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         for item in db.list()? {
             let in_converted = std::path::Path::new(&item.file_path).starts_with(&converted);
             if in_converted {
@@ -777,14 +808,12 @@ pub async fn clear_convert_cache(_app: AppHandle, state: State<'_, AppState>) ->
     })
 }
 
-/// 计算文件 SHA-256（流式分块读取，避免占用大量内存）
-async fn hash_file(path: &std::path::Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-
+/// 计算文件 BLAKE3（流式分块读取，避免占用大量内存；比 SHA-256 更快）
+pub(crate) async fn hash_file(path: &std::path::Path) -> Option<String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path).ok()?;
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         let mut buf = vec![0u8; 1 << 20];
         loop {
             let n = std::io::Read::read(&mut file, &mut buf).ok()?;
@@ -793,7 +822,7 @@ async fn hash_file(path: &std::path::Path) -> Option<String> {
             }
             hasher.update(&buf[..n]);
         }
-        Some(hex::encode(hasher.finalize()))
+        Some(hasher.finalize().to_hex().to_string())
     })
     .await
     .ok()
@@ -866,10 +895,12 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
     if settings.listen_mode == ListenMode::Loopback {
         settings.listen_mode = ListenMode::Lan;
         {
-            let mut guard = state.settings.write().unwrap();
+            let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
             *guard = settings.clone();
         }
         settings.save(&state.paths.settings_file)?;
+        // 记录「由启动组网自动切换」，组网停止时据此自动恢复本地模式
+        state.easytier_forced_lan.store(true, Ordering::SeqCst);
         let server = state.server.clone();
         server.stop();
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -918,6 +949,25 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
 #[tauri::command]
 pub async fn stop_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
     state.easytier.stop().await;
+    // 局域网监听是启动组网时自动切换的 → 停止组网后自动恢复为本地模式；
+    // 若局域网模式是用户手动设置（forced_lan 未置位）则保持不变。
+    if state.easytier_forced_lan.swap(false, Ordering::SeqCst) {
+        let mut settings = state.current_settings();
+        if settings.listen_mode == ListenMode::Lan {
+            settings.listen_mode = ListenMode::Loopback;
+            {
+                let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
+                *guard = settings.clone();
+            }
+            settings.save(&state.paths.settings_file)?;
+            let server = state.server.clone();
+            server.stop();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            server.start(&settings.bind_ip(), settings.port).await?;
+            AppState::emit_status(&app, &server);
+            tracing::info!("组网已停止，监听模式自动恢复为本地模式");
+        }
+    }
     let status = state.easytier.status();
     let _ = app.emit("easytier-status-changed", &status);
     Ok(status)
@@ -1122,6 +1172,7 @@ pub async fn download_peer_media_task(
     file_name: String,
     file_size: u64,
     title: String,
+    hash: Option<String>,
 ) -> AppResult<crate::convert_queue::ConvertTask> {
     let safe_name = std::path::Path::new(&file_name)
         .file_name()
@@ -1137,10 +1188,9 @@ pub async fn download_peer_media_task(
 
     // 本地已有预检：同名同大小的条目视为已拥有，避免重复下载后入库冲突
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let dup = db.list()?.into_iter().find(|m| {
-            m.status != MediaStatus::Missing
-                && m.file_name.to_lowercase() == safe_name.to_lowercase()
+            m.status != MediaStatus::Missing && m.file_name == safe_name
         });
         if let Some(existing) = dup {
             if existing.file_size == file_size {
@@ -1153,7 +1203,9 @@ pub async fn download_peer_media_task(
 
     let dir = download_dir_of(&state);
     std::fs::create_dir_all(&dir)?;
-    let dest = unique_dest(&dir, &safe_name);
+    // 下载收尾会依据 dest.exists() 决定是否顺延序号，且长时间只写 .part，
+    // 故此处仅探测不占位，避免预先创建空文件影响收尾流程。
+    let dest = unique_dest_peek(&dir, &safe_name);
 
     let (task, cancel_flag, pause_flag) = state
         .convert_queue
@@ -1164,6 +1216,7 @@ pub async fn download_peer_media_task(
             ip.clone(),
             port,
             dest.to_string_lossy().to_string(),
+            hash.map(|h| h.to_lowercase()),
         )
         .map_err(AppError::Msg)?;
     tracing::info!("加入下载任务: {} <- {}:{}{}", safe_name, ip, port, id);
@@ -1336,7 +1389,7 @@ async fn run_download_session(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "video".into());
-        unique_dest(dir, &name)
+        unique_dest_peek(dir, &name)
     } else {
         dest.to_path_buf()
     };
@@ -1383,6 +1436,8 @@ async fn run_download_task(
     let progress_task_id = task_id.clone();
     let mut last_emit = std::time::Instant::now();
     let mut last_pct = -1i64;
+    let mut speed_sample: Option<(std::time::Instant, u64)> = None;
+    queue.set_telemetry(&task_id, None, None, None);
     let end = run_download_session(
         &ip,
         port,
@@ -1392,6 +1447,15 @@ async fn run_download_task(
         &cancel_flag,
         &pause_flag,
         move |received, total, percent| {
+            let now = std::time::Instant::now();
+            let (sample_time, sample_bytes) = *speed_sample.get_or_insert((now, received));
+            if now.duration_since(sample_time).as_secs_f64() >= 0.3 {
+                let speed = received.saturating_sub(sample_bytes) as f64 / now.duration_since(sample_time).as_secs_f64();
+                let remaining = total.filter(|_| speed > 0.0)
+                    .map(|t| t.saturating_sub(received) as f64 / speed);
+                progress_queue.set_telemetry(&progress_task_id, Some(speed), None, remaining);
+                speed_sample = Some((now, received));
+            }
             let pct = percent.map(|p| p as i64).unwrap_or(-1);
             if last_emit.elapsed() >= std::time::Duration::from_millis(300) || pct != last_pct {
                 last_emit = std::time::Instant::now();
@@ -1408,8 +1472,38 @@ async fn run_download_task(
         cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
     match end {
         DownloadEnd::Done => {
+            // 完整性校验：对比文件大小与对端哈希，避免半截或损坏文件入库
+            let size = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
+            let mut verify_err: Option<String> = None;
+            if let Some(total) = task.total {
+                if size != total {
+                    verify_err = Some(format!(
+                        "文件大小校验失败（期望 {} 字节，实际 {} 字节）",
+                        total, size
+                    ));
+                }
+            }
+            if verify_err.is_none() {
+                if let Some(expected) = task.expected_hash.as_deref() {
+                    match hash_file(&dest).await {
+                        Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+                        Some(_) => verify_err = Some("文件哈希校验失败".into()),
+                        None => tracing::warn!("下载文件哈希计算失败，跳过哈希校验"),
+                    }
+                }
+            }
+            if let Some(msg) = verify_err {
+                let _ = tokio::fs::remove_file(&dest).await;
+                queue.finish(
+                    &task_id,
+                    crate::convert_queue::TaskState::Error,
+                    Some(format!("{}，已删除下载文件", msg)),
+                );
+                emit_convert_tasks(&app);
+                return;
+            }
             let reg = {
-                let db = st.db.lock().unwrap();
+                let db = st.db.lock().unwrap_or_else(|e| e.into_inner());
                 db.register(&dest)
             };
             match reg {
@@ -1453,8 +1547,46 @@ async fn run_download_task(
     emit_convert_tasks(&app);
 }
 
-/// 目标文件重名时追加序号，避免覆盖
+/// 尝试以原子方式独占路径：用 create_new 打开成功即为空文件占位，失败（已存在等）返回 false
+fn try_claim(path: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .is_ok()
+}
+
+/// 目标文件重名时追加序号，避免覆盖。
+/// 采用 create_new 原子占位：创建成功即返回该路径（已被空文件占据），
+/// 已存在则顺延到下一个序号，避免并发写入者选到同一名字而互相覆盖。
+/// 调用方需保证后续会写入/改名到该路径（如 ffmpeg 输出到 .part 再 promote）。
 fn unique_dest(dir: &std::path::Path, file_name: &str) -> PathBuf {
+    let mut candidate = dir.join(file_name);
+    if try_claim(&candidate) {
+        return candidate;
+    }
+    let path = std::path::Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "video".to_string());
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+    for i in 1..1000 {
+        let name = match &ext {
+            Some(e) => format!("{} ({}).{}", stem, i, e),
+            None => format!("{} ({})", stem, i),
+        };
+        candidate = dir.join(name);
+        if try_claim(&candidate) {
+            break;
+        }
+    }
+    candidate
+}
+
+/// 只探测不占位的旧实现：返回一个「看起来没人用」的路径（存在 TOCTOU）。
+/// 供后续自行判断 exists()/改名（如下载收尾）的调用方使用，避免预先创建空文件打乱其逻辑。
+fn unique_dest_peek(dir: &std::path::Path, file_name: &str) -> PathBuf {
     let mut candidate = dir.join(file_name);
     if !candidate.exists() {
         return candidate;
@@ -1528,18 +1660,40 @@ fn hide_console_tokio(cmd: &mut tokio::process::Command) {
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 }
 
-/// 运行 ffmpeg 并解析 `-progress pipe:1` 输出上报进度（out_time_ms 单位为微秒）；
-/// 传入 cancel 标志后可随时终止进程（转码队列取消任务用）
+#[derive(Debug, Default, Clone, Copy)]
+struct FfmpegProgress {
+    percent: Option<f64>,
+    fps: Option<f64>,
+    speed: Option<f64>,
+    remaining_seconds: Option<f64>,
+}
+
+fn progress_number(value: &str) -> Option<f64> {
+    value.trim().trim_end_matches('x').parse::<f64>().ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// 运行 ffmpeg 并按 progress 块解析遥测；ETA 由剩余媒体时长 / speed 计算。
+/// 传入 cancel 标志后可随时终止进程（转码队列取消任务用）。
+/// `cwd` 用于烧录字幕时把工作目录切到字幕所在目录（见 `transcode::subtitle_filter_cwd`）。
 async fn run_ffmpeg_with_progress(
     ffmpeg: &PathBuf,
     args: &[String],
     duration_ms: Option<u64>,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
-    mut on_progress: impl FnMut(f64),
+    cwd: Option<&std::path::Path>,
+    mut on_progress: impl FnMut(FfmpegProgress),
 ) -> AppResult<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let mut cmd = tokio::process::Command::new(ffmpeg);
+    if let Some(d) = cwd {
+        cmd.current_dir(d);
+    }
+    cmd.kill_on_drop(true);
+    if cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(AppError::Msg("任务已取消".into()));
+    }
     cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1570,33 +1724,51 @@ async fn run_ffmpeg_with_progress(
         collected
     });
 
-    let mut last_percent = -1.0f64;
+    let mut progress = FfmpegProgress::default();
+    let mut out_seconds = None;
     let mut lines = BufReader::new(stdout).lines();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
     loop {
-        if let Some(flag) = &cancel {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(AppError::Msg("任务已取消".into()));
+        let line = tokio::select! {
+            _ = tick.tick() => {
+                if cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+                    let _ = child.kill().await;
+                    let _ = err_task.await;
+                    return Err(AppError::Msg("任务已取消".into()));
+                }
+                continue;
             }
-        }
-        match lines.next_line().await {
+            line = lines.next_line() => line,
+        };
+        match line {
             Ok(Some(line)) => {
-                if let Some(v) = line.strip_prefix("out_time_ms=") {
-                    if let Ok(us) = v.trim().parse::<u64>() {
-                        if let Some(total) = duration_ms.filter(|d| *d > 0) {
-                            let pct = ((us as f64 / 1000.0) / total as f64 * 100.0).min(100.0);
-                            // 每 1% 上报一次，避免事件风暴
-                            if pct - last_percent >= 1.0 {
-                                last_percent = pct;
-                                on_progress(pct);
-                            }
+                if let Some((key, value)) = line.split_once('=') {
+                    match key {
+                        "fps" => progress.fps = progress_number(value),
+                        "speed" => progress.speed = progress_number(value).filter(|s| *s > 0.0),
+                        "out_time_us" | "out_time_ms" => {
+                            out_seconds = progress_number(value).map(|us| us / 1_000_000.0);
                         }
+                        "progress" => {
+                            let duration = duration_ms.filter(|d| *d > 0).map(|d| d as f64 / 1000.0);
+                            progress.percent = duration.zip(out_seconds)
+                                .map(|(d, t)| (t / d * 100.0).clamp(0.0, 100.0));
+                            progress.remaining_seconds = duration.zip(out_seconds).zip(progress.speed)
+                                .map(|((d, t), s)| (d - t).max(0.0) / s);
+                            on_progress(progress);
+                            progress = FfmpegProgress::default();
+                            out_seconds = None;
+                        }
+                        _ => {}
                     }
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(AppError::Msg(format!("读取 ffmpeg 进度失败: {}", e))),
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = err_task.await;
+                return Err(AppError::Msg(format!("读取 ffmpeg 进度失败: {}", e)));
+            }
         }
     }
 
@@ -1605,21 +1777,22 @@ async fn run_ffmpeg_with_progress(
         .await
         .unwrap_or_else(|_| "无法获取错误详情".to_string());
     if !status.success() {
-        let brief: String = err_text
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("未知错误")
-            .chars()
-            .take(300)
-            .collect();
+        // 完整 stderr 写入应用日志（供远程排查导出），弹窗仅带末尾几行关键信息
+        tracing::warn!("ffmpeg 失败（退出码 {:?}）args={:?} stderr:\n{}", status.code(), args, err_text);
+        let non_empty: Vec<&str> = err_text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let tail: Vec<&str> = non_empty.iter().rev().take(3).rev().copied().collect();
+        let brief: String = tail.join(" | ").chars().take(500).collect();
         return Err(AppError::Msg(format!(
             "ffmpeg 退出码 {:?}: {}",
             status.code(),
-            brief
+            if brief.is_empty() { "未知错误".into() } else { brief }
         )));
     }
-    on_progress(100.0);
+    on_progress(FfmpegProgress {
+        percent: Some(100.0),
+        remaining_seconds: Some(0.0),
+        ..Default::default()
+    });
     Ok(())
 }
 
@@ -1632,48 +1805,130 @@ fn emit_convert_tasks(app: &AppHandle) {
     }
 }
 
-/// 构建转码为 MP4（H.264 8-bit yuv420p + AAC）的 ffmpeg 参数；
-/// start_sec/dur_sec 用于分段转码（-ss 快速定位起点，-t 限定时长）
-fn transcode_args(
-    input: &str,
-    dest: &std::path::Path,
-    start_sec: Option<f64>,
-    dur_sec: Option<f64>,
-) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-y".into()];
-    if let Some(s) = start_sec {
-        args.extend(["-ss".into(), format!("{:.3}", s)]);
+/// 按实际流信息校正用户配置：不可直拷进 MP4 的编码强制重编码，
+/// 烧录时若未指定字幕轨则自动选第一条文本字幕。返回 (校正后的配置, 选中的字幕编码)。
+fn sanitize_options(
+    o: &crate::transcode::TranscodeOptions,
+    streams: &[crate::transcode::StreamInfo],
+) -> (
+    crate::transcode::TranscodeOptions,
+    Option<crate::transcode::StreamInfo>,
+) {
+    let mut out = o.clone();
+    // 显式指定的流索引必须与实际流类型匹配，否则视为未指定（避免把音频/字幕索引当视频用）
+    if let Some(i) = out.video_stream {
+        if !streams.iter().any(|s| s.index == i && s.kind == "video") {
+            out.video_stream = None;
+        }
     }
-    args.extend([
+    if let Some(i) = out.audio_stream {
+        if !streams.iter().any(|s| s.index == i && s.kind == "audio") {
+            out.audio_stream = None;
+        }
+    }
+    // 视频：直拷目标编码不在 MP4 允许列表时改为重编码
+    if out.video_copy() {
+        let ok = out
+            .video_stream
+            .and_then(|i| streams.iter().find(|s| s.index == i))
+            .or_else(|| streams.iter().find(|s| s.kind == "video"))
+            .map(|s| s.copyable)
+            .unwrap_or(false);
+        if !ok {
+            out.video_mode = Some("h264".into());
+        }
+    }
+    // 音频：DTS / TrueHD 等无法直拷进 MP4
+    if out.include_audio() && out.audio_copy() {
+        let ok = out
+            .audio_stream
+            .and_then(|i| streams.iter().find(|s| s.index == i))
+            .or_else(|| streams.iter().find(|s| s.kind == "audio"))
+            .map(|s| s.copyable)
+            .unwrap_or(false);
+        if !ok {
+            out.audio_mode = Some("aac".into());
+        }
+    }
+    // 字幕：确定要用的字幕轨（显式指定优先，否则自动选第一条文本字幕；烧录模式可退而选图形字幕）
+    let sub = if out.wants_subtitle() {
+        let chosen = out
+            .subtitle_stream
+            .and_then(|i| streams.iter().find(|s| s.index == i && s.kind == "subtitle"))
+            .or_else(|| {
+                streams
+                    .iter()
+                    .find(|s| s.kind == "subtitle" && s.text_subtitle)
+            })
+            .or_else(|| {
+                if out.burn_subtitles() {
+                    streams
+                        .iter()
+                        .find(|s| s.kind == "subtitle" && s.graphic_subtitle)
+                } else {
+                    None
+                }
+            });
+        // 内嵌 / 外挂只能处理文本字幕；烧录可处理文本或图形字幕
+        let usable = chosen.filter(|s| {
+            if out.embed_subtitles() || out.external_subtitles() {
+                s.text_subtitle
+            } else {
+                s.text_subtitle || s.graphic_subtitle
+            }
+        });
+        match usable {
+            Some(s) => {
+                out.subtitle_stream = Some(s.index);
+                out.subtitle_graphic = Some(s.graphic_subtitle);
+                Some(s.clone())
+            }
+            // 找不到可用的字幕轨时放弃字幕，避免整个任务失败
+            _ => {
+                out.subtitle_mode = None;
+                out.subtitle_stream = None;
+                out.subtitle_graphic = None;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    (out, sub)
+}
+
+/// 把指定字幕流抽取为独立临时文件（烧录用）。返回临时文件路径；
+/// 失败时返回 None（调用方退化为不烧录字幕）。
+async fn extract_subtitle_file(
+    ffmpeg: &std::path::PathBuf,
+    input: &str,
+    index: usize,
+    codec: &str,
+    cancel: Arc<AtomicBool>,
+) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("vrchat-localcinema");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join(format!("sub-{}-{}.{}", uuid::Uuid::new_v4(), index, crate::transcode::subtitle_ext(codec)));
+    let args: Vec<String> = vec![
+        "-y".into(),
         "-i".into(),
         input.to_string(),
         "-map".into(),
-        "0:v:0".into(),
-        "-map".into(),
-        "0:a:0".into(),
-        "-c:v".into(),
-        "libx264".into(),
-        "-preset".into(),
-        "medium".into(),
-        "-crf".into(),
-        "20".into(),
-        "-pix_fmt".into(),
-        "yuv420p".into(),
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "192k".into(),
-        "-movflags".into(),
-        "+faststart".into(),
+        format!("0:{}", index),
+        "-c:s".into(),
+        if matches!(codec, "ass" | "ssa") { "ass".into() } else { "srt".into() },
         "-progress".into(),
         "pipe:1".into(),
         "-nostats".into(),
-    ]);
-    if let Some(d) = dur_sec {
-        args.extend(["-t".into(), format!("{:.3}", d)]);
+        dest.to_string_lossy().to_string(),
+    ];
+    match run_ffmpeg_with_progress(ffmpeg, &args, None, Some(cancel), None, |_| {}).await {
+        Ok(()) => Some(dest),
+        Err(_) => {
+            let _ = std::fs::remove_file(dest);
+            None
+        }
     }
-    args.push(dest.to_string_lossy().to_string());
-    args
 }
 
 /// 转码临时产物路径（`<原名>.part.mp4`）：ffmpeg 先写临时文件，成功后改名为正式产物，
@@ -1687,30 +1942,73 @@ fn transcode_part_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_file_name(format!("{}.part.mp4", name))
 }
 
-/// 转码成功后把临时产物改名到最终路径（Windows 上 rename 不能覆盖已存在文件，先删再改）
+/// 转码成功后把临时产物改名到最终路径。
+/// Windows 上 rename 不能覆盖已存在文件，因此目标已存在时先把它挪到 .bak 再改名，
+/// 任一步失败都回滚，避免先删后改名期间崩溃导致旧产物丢失。
 fn promote_part(part: &std::path::Path, dest: &std::path::Path) -> AppResult<()> {
-    let _ = std::fs::remove_file(dest);
-    std::fs::rename(part, dest)
-        .map_err(|e| AppError::Msg(format!("保存转码产物失败: {}", e)))?;
-    Ok(())
+    if std::fs::rename(part, dest).is_ok() {
+        return Ok(());
+    }
+    let file_name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let bak = dest.with_file_name(format!("{}.bak", file_name));
+    let had_dest = dest.exists();
+    if had_dest {
+        std::fs::rename(dest, &bak)
+            .map_err(|e| AppError::Msg(format!("保存转码产物失败: {}", e)))?;
+    }
+    match std::fs::rename(part, dest) {
+        Ok(()) => {
+            if had_dest {
+                let _ = std::fs::remove_file(&bak);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_dest {
+                let _ = std::fs::rename(&bak, dest);
+            }
+            Err(AppError::Msg(format!("保存转码产物失败: {}", e)))
+        }
+    }
+}
+
+/// 查询该视频的全部媒体流（视频 / 音频 / 字幕），供「转码设置」对话框展示与选择
+#[tauri::command]
+pub async fn get_media_streams(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<Vec<crate::transcode::StreamInfo>> {
+    let item = get_item_checked(&state, &id)?;
+    let settings = state.current_settings();
+    let (ffprobe, _) = components::ffprobe_binary(&settings, &state.paths);
+    let ffprobe =
+        ffprobe.ok_or_else(|| AppError::Msg("未检测到 ffprobe，请先在设置中指定 FFmpeg 组件".into()))?;
+    let json = thumbnail::probe_media_json(&ffprobe, std::path::Path::new(&item.file_path)).await?;
+    Ok(crate::transcode::parse_streams(&json))
 }
 
 /// 加入转码队列（按任务序列执行），可在「转码任务」页查看进度、开始或取消；
-/// overwrite 为 true 时直接覆盖已存在的转码产物（前端已弹出覆盖确认）
+/// overwrite 为 true 时直接覆盖已存在的转码产物（前端已弹出覆盖确认）；
+/// options 为「转码设置」对话框产出的配置，缺省时按完整转码（H.264 + AAC）处理
 #[tauri::command]
 pub async fn transcode_media(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
     overwrite: Option<bool>,
+    options: Option<crate::transcode::TranscodeOptions>,
 ) -> AppResult<crate::convert_queue::ConvertTask> {
     let item = get_item_checked(&state, &id)?;
-    if state.hls_jobs.read().unwrap().contains(&id) {
+    if state.hls_jobs.read().unwrap_or_else(|e| e.into_inner()).contains(&id) {
         return Err(AppError::Msg("该视频正在边转边播，请等待完成或先取消".into()));
     }
+    let options = options.unwrap_or_default();
     let task = state
         .convert_queue
-        .enqueue(id, item.title, overwrite.unwrap_or(false))
+        .enqueue(id, item.title, overwrite.unwrap_or(false), options)
         .map_err(AppError::Msg)?;
     emit_convert_tasks(&app);
     Ok(task)
@@ -1788,7 +2086,9 @@ pub async fn generate_sample(
     Ok(())
 }
 
-/// 构建样本截取参数：流复制（-c copy）保持原编码与原封装格式，仅重封装前 10 秒，不重新转码
+/// 构建样本截取参数：流复制（-c copy）保持原编码与原封装格式，仅重封装前 10 秒，不重新转码。
+/// 样本保留所有视频/音频/字幕轨，以便代表原文件的完整信息；
+/// 通过保留原封装格式（原扩展名）确保多轨兼容性（mkv 支持多轨，不会像强制 MP4 那样报 -22）。
 fn sample_args(input: &str, dest: &std::path::Path) -> Vec<String> {
     vec![
         "-y".into(),
@@ -1811,6 +2111,22 @@ fn sample_args(input: &str, dest: &std::path::Path) -> Vec<String> {
     ]
 }
 
+/// 样本临时文件：与最终产物同名但保留原扩展名（`xxx (样本).mkv.part.mkv`）。
+/// ffmpeg 按扩展名选择封装器，不能复用转码的 `.part.mp4` —— 否则 mkv/webm 等
+/// 非 MP4 样本会被错误封装为 MP4，流复制不兼容的轨（DTS/字幕/多视频轨）直接报
+/// Invalid argument（退出码 -22）。
+fn sample_part_path(dest: &std::path::Path) -> std::path::PathBuf {
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "sample".into());
+    let ext = dest
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mkv".into());
+    dest.with_file_name(format!("{}.part.{}", name, ext))
+}
+
 /// 截取视频前 10 秒生成样本文件：-c copy 流复制（保持原格式和原封装，速度极快），
 /// 命名为 `<原名> (样本).<原扩展名>`，保存到源视频所在目录
 async fn run_sample_ffmpeg(ffmpeg: &PathBuf, file_path: &str) -> AppResult<PathBuf> {
@@ -1825,15 +2141,25 @@ async fn run_sample_ffmpeg(ffmpeg: &PathBuf, file_path: &str) -> AppResult<PathB
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_else(|| "mp4".into());
     let dest = unique_dest(dir, &format!("{} (样本).{}", stem, ext));
-    let part = transcode_part_path(&dest);
+    let part = sample_part_path(&dest);
     let args = sample_args(file_path, &part);
-    let result = run_ffmpeg_with_progress(ffmpeg, &args, Some(10_000), None, |_| {}).await;
+    let result = run_ffmpeg_with_progress(ffmpeg, &args, Some(10_000), None, None, |_| {}).await;
     if let Err(e) = result {
+        // 失败时清理临时产物，并移除预先原子占位的空目标文件
         let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&dest);
         return Err(e);
     }
     promote_part(&part, &dest)?;
     Ok(dest)
+}
+
+/// 检查本机是否缺少指定音频编码的系统解码器（codec: "ac3" | "eac3"）。
+/// VRChat/AVPro 用系统 Media Foundation 解码，原生 Windows 不带 Dolby 解码器；
+/// 检测失败一律按「不缺」处理，避免误报。
+#[tauri::command]
+pub async fn system_audio_decoder_missing(codec: String) -> AppResult<bool> {
+    Ok(!crate::system_codecs::audio_decoder_available(&codec))
 }
 
 /// 在资源管理器中定位文件（选中该文件）
@@ -1851,9 +2177,10 @@ pub async fn segment_transcode(
     id: String,
     first_ms: u64,
     overwrite: Option<bool>,
+    options: Option<crate::transcode::TranscodeOptions>,
 ) -> AppResult<crate::convert_queue::ConvertTask> {
     let item = get_item_checked(&state, &id)?;
-    if state.hls_jobs.read().unwrap().contains(&id) {
+    if state.hls_jobs.read().unwrap_or_else(|e| e.into_inner()).contains(&id) {
         return Err(AppError::Msg("该视频正在边转边播，请等待完成或先取消".into()));
     }
     if item.duration_ms.is_none() {
@@ -1864,7 +2191,7 @@ pub async fn segment_transcode(
     }
     let task = state
         .convert_queue
-        .enqueue_segment(id, item.title, overwrite.unwrap_or(false), first_ms)
+        .enqueue_segment(id, item.title, overwrite.unwrap_or(false), first_ms, options.unwrap_or_default())
         .map_err(AppError::Msg)?;
     emit_convert_tasks(&app);
     Ok(task)
@@ -1876,7 +2203,7 @@ pub async fn list_segments(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<Vec<MediaItem>> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
     Ok(db.list_segments_of(&id)?)
 }
 
@@ -1965,7 +2292,7 @@ async fn run_queued_transcode(
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> AppResult<Option<MediaItem>> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.get(&task.media_id)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
@@ -1993,26 +2320,43 @@ async fn run_queued_transcode(
     };
 
     let part = transcode_part_path(&dest);
-    let args = transcode_args(&item.file_path, &part, None, None);
+
+    let (options, subtitle_file) = prepare_transcode_options(state, &ffmpeg, &item, &task.options, cancel.clone()).await;
+    let args = crate::transcode::build_args(
+        &item.file_path,
+        &part,
+        &options,
+        subtitle_file.as_deref(),
+        None,
+        None,
+    );
 
     let progress_app = app.clone();
     let progress_media_id = task.media_id.clone();
     let progress_task_id = task.id.clone();
     let progress_queue = state.convert_queue.clone();
+    let sub_cwd = subtitle_file
+        .as_deref()
+        .and_then(crate::transcode::subtitle_filter_cwd);
     let result = run_ffmpeg_with_progress(
         &ffmpeg,
         &args,
         item.duration_ms,
         Some(cancel),
-        move |pct| {
-            progress_queue.set_percent(&progress_task_id, pct);
+        sub_cwd.as_deref(),
+        move |progress| {
+            if let Some(pct) = progress.percent {
+                progress_queue.set_percent(&progress_task_id, pct);
+            }
+            progress_queue.set_telemetry(&progress_task_id, progress.speed, progress.fps, progress.remaining_seconds);
+            emit_convert_tasks(&progress_app);
             emit_convert(
                 &progress_app,
                 ConvertProgress {
                     id: progress_media_id.clone(),
                     kind: "transcode",
                     status: "running",
-                    percent: Some(pct),
+                    percent: progress.percent,
                     error: None,
                     item: None,
                 },
@@ -2022,14 +2366,25 @@ async fn run_queued_transcode(
     .await;
 
     if let Err(e) = result {
+        // 失败时清理临时产物；非覆盖模式下 dest 为原子占位空文件，一并移除（覆盖模式需保留原文件）
         let _ = std::fs::remove_file(&part);
+        if !task.overwrite {
+            let _ = std::fs::remove_file(&dest);
+        }
         return Err(e);
     }
     promote_part(&part, &dest)?;
+    if options.external_subtitles() {
+        if let Some(f) = subtitle_file.as_deref() {
+            if let Err(e) = std::fs::copy(f, dest.with_extension(f.extension().unwrap_or_default())) {
+                tracing::warn!("写出外挂字幕失败: {}", e);
+            }
+        }
+    }
 
     // 源条目视为已处理；保留在「不兼容」文件夹原位置，由转码产物的快捷方式卡片承接跳转
     let updated = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = db.set_compat_resolved(&task.media_id, true);
         db.get(&task.media_id).ok().flatten()
     };
@@ -2037,9 +2392,8 @@ async fn run_queued_transcode(
         let _ = app.emit("media-updated", &u);
     }
 
-    // 转码产物入库（继承原名，含 (转码) 后缀），并记录与源视频的关联
     let registered = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.register(&dest) {
             Ok((new_item, _)) => {
                 let _ = db.set_source_media(&new_item.id, &task.media_id);
@@ -2051,13 +2405,65 @@ async fn run_queued_transcode(
             }
         }
     };
-    match registered {
-        Some(new_item) => {
-            spawn_probe_task(app.clone(), new_item.id.clone());
-            Ok(Some(new_item))
-        }
-        None => Ok(None),
+    if let Some(new_item) = &registered {
+        spawn_probe_task(app.clone(), new_item.id.clone());
     }
+    Ok(registered)
+}
+
+struct SubtitleFile(Option<PathBuf>);
+
+impl SubtitleFile {
+    fn as_deref(&self) -> Option<&Path> {
+        self.0.as_deref()
+    }
+}
+
+impl Drop for SubtitleFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn prepare_transcode_options(
+    state: &AppState,
+    ffmpeg: &PathBuf,
+    item: &MediaItem,
+    requested: &crate::transcode::TranscodeOptions,
+    cancel: Arc<AtomicBool>,
+) -> (crate::transcode::TranscodeOptions, SubtitleFile) {
+    let settings = state.current_settings();
+    let streams = if requested.video_copy()
+        || requested.audio_copy()
+        || requested.wants_subtitle()
+    {
+        let (ffprobe, _) = components::ffprobe_binary(&settings, &state.paths);
+        match ffprobe {
+            Some(p) => thumbnail::probe_media_json(&p, std::path::Path::new(&item.file_path))
+                .await
+                .map(|j| crate::transcode::parse_streams(&j))
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    let (options, subtitle_stream) = sanitize_options(requested, &streams);
+
+    // 烧录 / 外挂模式：先把字幕抽成独立临时文件（文本烧录交给 subtitles 滤镜，外挂则复制到产物旁）。
+    // 图形字幕烧录走 overlay 滤镜，不抽取为文本文件。
+    let mut subtitle_file: Option<std::path::PathBuf> = None;
+    let needs_text_extract =
+        options.external_subtitles() || (options.burn_subtitles() && !options.subtitle_graphic());
+    if needs_text_extract {
+        if let Some(s) = &subtitle_stream {
+            subtitle_file =
+                extract_subtitle_file(ffmpeg, &item.file_path, s.index, &s.codec, cancel).await;
+        }
+    }
+    (options, SubtitleFile(subtitle_file))
 }
 
 /// 分段转码默认第一段时长：总时长的 10% 向上取整到 5 分钟（如 10、15、20 分钟）
@@ -2065,6 +2471,15 @@ fn default_first_segment_ms(total_ms: u64) -> u64 {
     const FIVE_MIN: u64 = 300_000;
     let raw = (total_ms as f64 * 0.1).ceil() as u64;
     ((raw + FIVE_MIN - 1) / FIVE_MIN) * FIVE_MIN
+}
+
+fn align_segment_subtitles(args: &mut [String], start_sec: f64) {
+    if start_sec > 0.0 {
+        if let Some(i) = args.iter().position(|a| a == "-vf") {
+            // 输入侧 -ss 将帧时间归零；libass 需要原片时间，编码前再恢复段内时间。
+            args[i + 1] = format!("setpts=PTS+{start_sec:.3}/TB,{},setpts=PTS-{start_sec:.3}/TB", args[i + 1]);
+        }
+    }
 }
 
 /// 转码单个分段并入库（登记源关联与段序号），base_pct/scale_pct 用于映射整体进度
@@ -2085,7 +2500,19 @@ async fn transcode_segment(
     segment_index: i64,
 ) -> AppResult<MediaItem> {
     let part = transcode_part_path(dest);
-    let args = transcode_args(&source.file_path, &part, start_sec, dur_sec);
+    let (options, subtitle_file) = prepare_transcode_options(state, ffmpeg, source, &task.options, cancel.clone()).await;
+    let mut args = crate::transcode::build_args(
+        &source.file_path,
+        &part,
+        &options,
+        subtitle_file.as_deref(),
+        start_sec,
+        dur_sec,
+    );
+    if options.burn_subtitles() && subtitle_file.as_deref().is_some() {
+        align_segment_subtitles(&mut args, start_sec.unwrap_or(0.0));
+    }
+    let sub_cwd = subtitle_file.as_deref().and_then(crate::transcode::subtitle_filter_cwd);
     let progress_app = app.clone();
     let progress_media_id = task.media_id.clone();
     let progress_task_id = task.id.clone();
@@ -2094,17 +2521,28 @@ async fn transcode_segment(
         ffmpeg,
         &args,
         pass_duration_ms,
-        Some(cancel),
-        move |pct| {
-            let overall = base_pct + pct * scale_pct;
-            progress_queue.set_percent(&progress_task_id, overall);
+        Some(cancel.clone()),
+        sub_cwd.as_deref(),
+        move |progress| {
+            let overall = progress.percent.map(|pct| base_pct + pct * scale_pct);
+            if let Some(pct) = overall {
+                progress_queue.set_percent(&progress_task_id, pct);
+            }
+            // 第一段的 ETA 也包含尚未开始的第二段，使用当前倍速估计。
+            let future_ms = if segment_index == 1 {
+                source.duration_ms.unwrap_or(0).saturating_sub(pass_duration_ms.unwrap_or(0))
+            } else { 0 };
+            let remaining = progress.remaining_seconds.zip(progress.speed)
+                .map(|(eta, speed)| eta + future_ms as f64 / 1000.0 / speed);
+            progress_queue.set_telemetry(&progress_task_id, progress.speed, progress.fps, remaining);
+            emit_convert_tasks(&progress_app);
             emit_convert(
                 &progress_app,
                 ConvertProgress {
                     id: progress_media_id.clone(),
                     kind: "transcode",
                     status: "running",
-                    percent: Some(overall),
+                    percent: overall,
                     error: None,
                     item: None,
                 },
@@ -2113,14 +2551,34 @@ async fn transcode_segment(
     )
     .await;
     if let Err(e) = result {
+        // 失败时清理临时产物；非覆盖模式下 dest 为原子占位空文件，一并移除（覆盖模式需保留原文件）
         let _ = std::fs::remove_file(&part);
+        if !task.overwrite {
+            let _ = std::fs::remove_file(dest);
+        }
         return Err(e);
     }
     promote_part(&part, dest)?;
+    if options.external_subtitles() {
+        if let Some(sub) = subtitle_file.as_deref() {
+            let sidecar = dest.with_extension(sub.extension().unwrap_or_default());
+            let sidecar_part = sidecar.with_file_name(format!("sub-{}.{}", uuid::Uuid::new_v4(), sub.extension().unwrap_or_default().to_string_lossy()));
+            let cleanup = SubtitleFile(Some(sidecar_part.clone()));
+            let mut sub_args = vec!["-y".into(), "-i".into(), sub.to_string_lossy().to_string(),
+                "-ss".into(), format!("{:.3}", start_sec.unwrap_or(0.0))];
+            if let Some(d) = dur_sec {
+                sub_args.extend(["-t".into(), format!("{d:.3}")]);
+            }
+            sub_args.extend(["-progress".into(), "pipe:1".into(), "-nostats".into(), sidecar_part.to_string_lossy().to_string()]);
+            run_ffmpeg_with_progress(ffmpeg, &sub_args, pass_duration_ms, Some(cancel), None, |_| {}).await?;
+            promote_part(&sidecar_part, &sidecar)?;
+            drop(cleanup);
+        }
+    }
 
     // 分段产物入库：登记源关联与段序号
     let registered = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.register(dest) {
             Ok((new_item, _)) => {
                 let _ = db.set_source_media(&new_item.id, &task.media_id);
@@ -2147,7 +2605,7 @@ async fn run_queued_segment_transcode(
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> AppResult<Option<MediaItem>> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.get(&task.media_id)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
@@ -2237,7 +2695,7 @@ async fn run_queued_segment_transcode(
 
     // 源条目视为已处理；保留在原位置，由分段产物卡片承接复制链接
     let updated = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let _ = db.set_compat_resolved(&task.media_id, true);
         db.get(&task.media_id).ok().flatten()
     };
@@ -2329,14 +2787,14 @@ pub async fn make_hls(
     mode: UrlMode,
 ) -> AppResult<String> {
     {
-        let mut jobs = state.hls_jobs.write().unwrap();
+        let mut jobs = state.hls_jobs.write().unwrap_or_else(|e| e.into_inner());
         if !jobs.insert(id.clone()) {
             return Err(AppError::Msg("该视频正在生成边转边播（HLS）".into()));
         }
     }
     // 与转码队列互斥：同一视频不允许同时排队转码和边转边播
     if state.convert_queue.has_active(&id) {
-        state.hls_jobs.write().unwrap().remove(&id);
+        state.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
         return Err(AppError::Msg("该视频已有进行中的转码任务，请先在「转码任务」页取消".into()));
     }
 
@@ -2438,10 +2896,14 @@ pub async fn make_hls(
                 &args,
                 duration_ms,
                 Some(bg_cancel.clone()),
-                move |pct| {
-                    // 同步进度到转码任务队列（「转码任务」页展示）
+                None,
+                move |progress| {
                     if let Some(st) = pct_app.try_state::<AppState>() {
-                        st.convert_queue.set_percent(&pct_task_id, pct);
+                        if let Some(pct) = progress.percent {
+                            st.convert_queue.set_percent(&pct_task_id, pct);
+                        }
+                        st.convert_queue.set_telemetry(&pct_task_id, progress.speed, progress.fps, progress.remaining_seconds);
+                        emit_convert_tasks(&pct_app);
                     }
                     emit_convert(
                         &cb_app,
@@ -2449,7 +2911,7 @@ pub async fn make_hls(
                             id: run_id.clone(),
                             kind: "hls",
                             status: "running",
-                            percent: Some(pct),
+                            percent: progress.percent,
                             error: None,
                             item: None,
                         },
@@ -2464,7 +2926,7 @@ pub async fn make_hls(
                     {
                         let st = progress_app.state::<AppState>();
                         let updated = {
-                            let d = st.db.lock().unwrap();
+                            let d = st.db.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = d.set_compat_resolved(&progress_id, true);
                             let _ = d.set_media_folder(&progress_id, None);
                             d.get(&progress_id).ok().flatten()
@@ -2489,13 +2951,13 @@ pub async fn make_hls(
                     );
                 }
                 Err(e) => {
-                    *err_slot.lock().unwrap() = Some(e.to_string());
+                    *err_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
                     // 清理半成品并回滚登记
                     let st = progress_app.state::<AppState>();
                     let dir = hls_root_of(&st).join(&progress_id);
                     let _ = std::fs::remove_dir_all(&dir);
                     {
-                        let d = st.db.lock().unwrap();
+                        let d = st.db.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = d.clear_hls_playlist(&progress_id);
                         let updated = d.get(&progress_id).ok().flatten();
                         if let Some(u) = updated {
@@ -2530,7 +2992,7 @@ pub async fn make_hls(
             }
 
             if let Some(st) = progress_app.try_state::<AppState>() {
-                st.hls_jobs.write().unwrap().remove(&progress_id);
+                st.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&progress_id);
             }
         });
 
@@ -2538,7 +3000,7 @@ pub async fn make_hls(
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Some(err) = shared_err.lock().unwrap().clone() {
+            if let Some(err) = shared_err.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                 return Err(AppError::Msg(err));
             }
             if let Ok(content) = std::fs::read_to_string(&playlist) {
@@ -2560,7 +3022,7 @@ pub async fn make_hls(
         // 就绪：登记根路径短链接 + 移出「不兼容」文件夹
         // （分片路径改写由 HTTP 层动态完成，静态改写会被 ffmpeg 逐段重写覆盖）
         let stem = {
-            let db = state.db.lock().unwrap();
+            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
             db.get(&id)
                 .ok()
                 .flatten()
@@ -2573,7 +3035,7 @@ pub async fn make_hls(
         };
         let playlist_name = pick_playlist_name(&state, &id, &stem);
         {
-            let d = state.db.lock().unwrap();
+            let d = state.db.lock().unwrap_or_else(|e| e.into_inner());
             let _ = d.set_hls_playlist(&id, &playlist_name);
             let updated = d.get(&id).ok().flatten();
             if let Some(u) = updated {
@@ -2583,7 +3045,7 @@ pub async fn make_hls(
         tracing::info!("边转边播（HLS）已可播放：/{}", playlist_name);
 
         // 链接已就绪，允许后续重新生成；后台任务完成时幂等移除
-        state.hls_jobs.write().unwrap().remove(&id);
+        state.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
 
         let host = match mode {
             UrlMode::Localhost => "127.0.0.1".to_string(),
@@ -2604,7 +3066,7 @@ pub async fn make_hls(
     .await;
 
     if let Err(e) = result {
-        state.hls_jobs.write().unwrap().remove(&id);
+        state.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
         return Err(e);
     }
     result
@@ -2613,7 +3075,7 @@ pub async fn make_hls(
 /// HLS 是否已生成
 #[tauri::command]
 pub async fn get_hls_status(state: State<'_, AppState>, id: String) -> AppResult<bool> {
-    let generating = state.hls_jobs.read().unwrap().contains(&id);
+    let generating = state.hls_jobs.read().unwrap_or_else(|e| e.into_inner()).contains(&id);
     if generating {
         return Ok(false);
     }
@@ -2631,7 +3093,7 @@ pub async fn build_hls_url(
     mode: UrlMode,
 ) -> AppResult<String> {
     let playlist = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let item = db
             .get(&id)?
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?;
@@ -2669,7 +3131,7 @@ pub async fn build_hls_url(
 
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>) -> AppResult<Vec<crate::media_library::Folder>> {
-    Ok(state.db.lock().unwrap().list_folders()?)
+    Ok(state.db.lock().unwrap_or_else(|e| e.into_inner()).list_folders()?)
 }
 
 #[tauri::command]
@@ -2687,12 +3149,12 @@ pub async fn create_folder(
 
 #[tauri::command]
 pub async fn rename_folder(state: State<'_, AppState>, id: String, name: String) -> AppResult<()> {
-    Ok(state.db.lock().unwrap().rename_folder(&id, &name)?)
+    Ok(state.db.lock().unwrap_or_else(|e| e.into_inner()).rename_folder(&id, &name)?)
 }
 
 #[tauri::command]
 pub async fn delete_folder(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    Ok(state.db.lock().unwrap().delete_folder(&id)?)
+    Ok(state.db.lock().unwrap_or_else(|e| e.into_inner()).delete_folder(&id)?)
 }
 
 #[tauri::command]
@@ -2701,7 +3163,7 @@ pub async fn rename_media(
     id: String,
     name: String,
 ) -> AppResult<MediaItem> {
-    let item = state.db.lock().unwrap().rename_media(&id, &name)?;
+    let item = state.db.lock().unwrap_or_else(|e| e.into_inner()).rename_media(&id, &name)?;
     Ok(item)
 }
 
@@ -2712,7 +3174,7 @@ pub async fn move_media(
     folder_id: Option<String>,
 ) -> AppResult<MediaItem> {
     {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.set_media_folder(&id, folder_id.as_deref())?;
         let item = db.get(&id)?.ok_or_else(|| AppError::Msg("媒体条目不存在".into()))?;
         Ok(item)

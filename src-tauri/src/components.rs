@@ -316,6 +316,8 @@ pub struct ReleaseAsset {
     pub version: String,
     pub name: String,
     pub url: String,
+    /// 发布资产字节数（下载后据此校验完整性），API 未提供时为 None
+    pub size: Option<u64>,
 }
 
 fn arch_tag(kind: ComponentKind) -> &'static str {
@@ -330,15 +332,16 @@ fn arch_tag(kind: ComponentKind) -> &'static str {
 }
 
 /// 从发布资产里挑选当前平台可用的 Windows 压缩包
-fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String)> {
+fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String, Option<u64>)> {
     let arch = arch_tag(kind);
-    let mut best: Option<(i32, String, String)> = None;
+    let mut best: Option<(i32, String, String, Option<u64>)> = None;
     for a in assets {
         let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let url = a
             .get("browser_download_url")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let size = a.get("size").and_then(|v| v.as_u64());
         if name.is_empty() || url.is_empty() {
             continue;
         }
@@ -365,11 +368,11 @@ fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String)>
                 20
             }
         };
-        if best.as_ref().map(|(s, _, _)| score > *s).unwrap_or(true) {
-            best = Some((score, name.to_string(), url.to_string()));
+        if best.as_ref().map(|(s, _, _, _)| score > *s).unwrap_or(true) {
+            best = Some((score, name.to_string(), url.to_string(), size));
         }
     }
-    best.map(|(_, n, u)| (n, u))
+    best.map(|(_, n, u, sz)| (n, u, sz))
 }
 
 fn release_api(kind: ComponentKind) -> &'static str {
@@ -417,7 +420,7 @@ pub async fn latest_release_asset(kind: ComponentKind) -> AppResult<ReleaseAsset
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let (name, url) = pick_asset(kind, &assets).ok_or_else(|| {
+    let (name, url, size) = pick_asset(kind, &assets).ok_or_else(|| {
         AppError::Msg(format!(
             "{} 最新发布中未找到适用于当前系统的 Windows 压缩包，请手动下载",
             kind.label()
@@ -427,6 +430,7 @@ pub async fn latest_release_asset(kind: ComponentKind) -> AppResult<ReleaseAsset
         version: tag,
         name,
         url,
+        size,
     })
 }
 
@@ -474,6 +478,18 @@ pub async fn download_and_install(
             on_progress(downloaded, total);
         }
         file.flush().await?;
+        // 完整性校验：与发布资产声明的字节数比对，避免截断/损坏的压缩包被解压安装
+        if let Some(expected) = asset.size {
+            if downloaded != expected {
+                let _ = std::fs::remove_file(&zip_path);
+                return Err(AppError::Msg(format!(
+                    "{} 下载大小校验失败（期望 {} 字节，实际 {} 字节），请重试，或改用完整版安装包（已内置组件）",
+                    kind.label(),
+                    expected,
+                    downloaded
+                )));
+            }
+        }
     }
 
     let zip_for_extract = zip_path.clone();

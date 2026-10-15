@@ -69,17 +69,28 @@ impl HttpServer {
     }
 
     pub fn status(&self) -> ServerStatus {
-        self.status.read().unwrap().clone()
+        self.status.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 启动 HTTP 服务。会检查端口是否被占用。
     pub async fn start(&self, bind_ip: &str, port: u16) -> AppResult<()> {
         {
-            let s = self.status.read().unwrap();
+            let s = self.status.read().unwrap_or_else(|e| e.into_inner());
             if s.running {
                 return Ok(());
             }
         }
+        // 未开启「允许他人查看我的媒体库」时，即使处于局域网模式也只在环回地址监听，
+        // 从而在监听端口上完全阻断来自局域网的 TCP 连接（主机本身仍可被 ping 通）。
+        let bind_ip = if self
+            .state
+            .allow_peer_view
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            bind_ip
+        } else {
+            "127.0.0.1"
+        };
         let addr_str = format!("{}:{}", bind_ip, port);
         let addr: SocketAddr = addr_str
             .parse()
@@ -112,11 +123,11 @@ impl HttpServer {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
         {
-            let mut lock = self.tx.write().unwrap();
+            let mut lock = self.tx.write().unwrap_or_else(|e| e.into_inner());
             *lock = Some(tx);
         }
         {
-            let mut s = self.status.write().unwrap();
+            let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
             *s = ServerStatus {
                 running: true,
                 bind_addr: actual_addr.clone(),
@@ -157,12 +168,12 @@ impl HttpServer {
             });
             if let Err(e) = serve.await {
                 tracing::error!("HTTP 服务错误: {}", e);
-                let mut s = status.write().unwrap();
+                let mut s = status.write().unwrap_or_else(|e| e.into_inner());
                 s.running = false;
                 s.error = Some(e.to_string());
             } else {
                 tracing::info!("HTTP 服务已停止");
-                let mut s = status.write().unwrap();
+                let mut s = status.write().unwrap_or_else(|e| e.into_inner());
                 s.running = false;
             }
         });
@@ -170,7 +181,7 @@ impl HttpServer {
     }
 
     pub fn stop(&self) {
-        let tx = self.tx.read().unwrap().clone();
+        let tx = self.tx.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(t) = tx {
             let _ = t.try_send(());
         }
@@ -184,7 +195,7 @@ impl HttpServer {
             tokio::time::sleep(Duration::from_millis(300)).await;
             if let Err(e) = this.start(&ip, port).await {
                 tracing::error!("HTTP 服务重启失败: {}", e);
-                let mut s = this.status.write().unwrap();
+                let mut s = this.status.write().unwrap_or_else(|e| e.into_inner());
                 s.running = false;
                 s.error = Some(e.to_string());
             }
@@ -227,7 +238,7 @@ async fn api_media(State(state): State<MediaState>) -> Response<Body> {
             .unwrap();
     }
     let summaries = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.list_summaries()
     };
     match summaries {
@@ -246,8 +257,14 @@ async fn api_media(State(state): State<MediaState>) -> Response<Body> {
     }
 }
 
-/// 返回本节点的基本信息
-async fn api_node() -> Response<Body> {
+/// 返回本节点的基本信息（未开启「允许他人查看我的媒体库」时不对外暴露）
+async fn api_node(State(state): State<MediaState>) -> Response<Body> {
+    if !state
+        .allow_peer_view
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return not_found();
+    }
     let body = serde_json::json!({
         "app": "VRchat-LocalCinema",
         "hostname": crate::easytier::default_member_name(),
@@ -270,7 +287,7 @@ async fn serve_download(
     headers: HeaderMap,
 ) -> Response<Body> {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.get(&id) {
             Ok(Some(v)) => v,
             _ => return not_found(),
@@ -310,7 +327,7 @@ async fn serve_media_basename(
     }
     // 在锁内先完成路径解析，避免跨 await 持有互斥锁
     let target = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.resolve_basename(&file_name) {
             Ok(Some(item)) => Target::Media(PathBuf::from(item.file_path)),
             Ok(None) => {
@@ -392,7 +409,7 @@ async fn serve_media(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let item = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.get(&id) {
             Ok(Some(v)) => v,
             _ => return not_found().into_response(),
@@ -443,6 +460,9 @@ async fn serve_thumb(
 }
 
 /// 提供 HLS 播放列表与分片：/hls/{id}/index.m3u8、/hls/{id}/segNNN.ts
+///
+/// **已弃用**：HLS 相关命令已在 `lib.rs` 中注释停用，此路由仅为将来可能重新启用
+/// 而保留（当前期间并不会有新的 HLS 产物生成，因此实际不会被访问）。
 async fn serve_hls(
     State(state): State<MediaState>,
     AxumPath((id, file)): AxumPath<(String, String)>,
@@ -512,14 +532,25 @@ fn sanitize_thumb_path(base: &Path, input: &str) -> Option<PathBuf> {
     }
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// 在字节层面做百分号解码，避免对多字节 UTF-8 字符串做字节切片导致 panic。
+/// 注意：axum 已对路径参数做过一次百分号解码，这里的 % 多是字面量。
 fn percent_decode(s: &str) -> String {
-    let mut out = Vec::with_capacity(s.len());
     let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(h) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(h);
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
@@ -527,7 +558,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Response<Body> {
@@ -541,15 +572,14 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
     };
     let total_len = meta.len();
     if total_len == 0 {
-        let mut hdr = HeaderMap::new();
         let mime = mime_guess::from_path(path).first_or_octet_stream();
-        hdr.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_str(&mime.to_string())
-                .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-        );
         return Response::builder()
             .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&mime.to_string())
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            )
             .body(Body::empty())
             .unwrap();
     }
@@ -580,6 +610,12 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                         }
                     };
                     let content_range = format!("bytes {}-{}/{}", start, end, total_len);
+                    // HEAD 只返回头，不发送正文
+                    let body = if *method == Method::HEAD {
+                        Body::empty()
+                    } else {
+                        body_stream
+                    };
                     return Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(
@@ -594,7 +630,7 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                                 .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
                         )
                         .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
-                        .body(body_stream)
+                        .body(body)
                         .unwrap();
                 }
             }

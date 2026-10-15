@@ -1,4 +1,5 @@
 /交接文档.md
+/agent.md
 
 # Logs
 logs
@@ -20,7 +21,8 @@ dist-portable/
 /components/
 
 # Local media, data and environment settings
-tests/*.mp4
+/tests/
+/videosample/
 data/
 *.db
 *.db-shm

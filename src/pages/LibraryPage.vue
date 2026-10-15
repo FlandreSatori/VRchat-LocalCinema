@@ -28,8 +28,9 @@ import Badge from '../components/ui/Badge.vue'
 import MediaCard from '../components/MediaCard.vue'
 import UrlDialog from '../components/UrlDialog.vue'
 import PeerMediaDialog from '../components/PeerMediaDialog.vue'
+import BatchTranscodeDialog from '../components/BatchTranscodeDialog.vue'
 import type { MenuEntry } from '../lib/menu'
-import type { MediaItem, Folder, PeerInfo, UnlistenFn } from '../lib/api'
+import type { MediaItem, Folder, PeerInfo, UnlistenFn, TranscodeOptions } from '../lib/api'
 import { BUILTIN_INCOMPATIBLE_ID } from '../lib/api'
 import {
   mediaStore,
@@ -49,8 +50,6 @@ import {
   moveMedia,
   removeMedia,
   transcodeMedia,
-  segmentTranscode,
-  transcodeOutputExists,
   onSegmentReady,
   onSampleDone,
   revealPath,
@@ -438,22 +437,34 @@ async function submitBatchMove() {
   toast.success(`已移动 ${ok}/${ids.length} 个视频`)
 }
 
-/// 批量转码：跳过转码产物卡片与已在队列中的条目；已存在产物时使用新文件名（不覆盖）
-async function batchTranscode() {
-  const ids = [...selectedIds.value]
-  let queued = 0
-  let skipped = 0
-  for (const id of ids) {
+/// 批量转码对话框：同一套设置应用到所有可转码条目
+const batchTranscodeOpen = ref(false)
+const batchTranscodeCount = ref(0)
+
+/// 可转码的选中条目：跳过转码产物卡片与已在队列中的条目
+function transcodeCandidates(): string[] {
+  return [...selectedIds.value].filter((id) => {
     const item = mediaStore.items.find((m) => m.id === id)
     const busy = convertTaskStore.tasks.some(
       (t) => t.mediaId === id && (t.state === 'queued' || t.state === 'running')
     )
-    if (!item || item.sourceMediaId !== null || busy) {
-      skipped++
-      continue
-    }
+    return !!item && item.sourceMediaId === null && !busy
+  })
+}
+
+function openBatchTranscode() {
+  batchTranscodeCount.value = transcodeCandidates().length
+  batchTranscodeOpen.value = true
+}
+
+/// 批量转码：已存在产物时使用新文件名（不覆盖）
+async function submitBatchTranscode(options: TranscodeOptions) {
+  const candidates = transcodeCandidates()
+  let queued = 0
+  let skipped = selectedIds.value.size - candidates.length
+  for (const id of candidates) {
     try {
-      await transcodeMedia(id, false)
+      await transcodeMedia(id, false, options)
       queued++
     } catch {
       skipped++
@@ -506,6 +517,10 @@ const peerPickerOpen = ref(false)
 const pickerLoading = ref(false)
 const pickerPeers = ref<PeerInfo[]>([])
 const manualIp = ref('')
+/// 合法 IPv4：四段 0-255
+const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
+/// 手工输入的虚拟 IP 是否为合法 IPv4（空字符串表示未填）
+const manualIpValid = computed(() => IPV4_RE.test(manualIp.value.trim()))
 
 async function openPeerMedia() {
   peerPickerOpen.value = true
@@ -547,6 +562,10 @@ function submitManualIp() {
     toast.error('请输入对方的虚拟 IP')
     return
   }
+  if (!IPV4_RE.test(ip)) {
+    toast.error('请输入有效的 IPv4 地址，例如 10.126.126.2')
+    return
+  }
   peerPickerOpen.value = false
   selectedPeer.value = { hostname: '', ipv4: ip, latencyMs: null, loss: null, cost: '', nat: '', version: '' }
   peerMediaOpen.value = true
@@ -558,63 +577,11 @@ function costText(cost: string): string {
   return cost || '-'
 }
 
-// ---------- 分段转码 ----------
-
-/// 分段转码确认对话框（第一段时长可调整，默认总时长 10% 向上取整到 5 分钟）
-const segmentDialog = reactive<{
-  open: boolean
-  item: MediaItem | null
-  minutes: number
-}>({ open: false, item: null, minutes: 5 })
-
-function defaultFirstSegmentMinutes(totalMs: number): number {
-  const FIVE_MIN = 5
-  const raw = (totalMs / 60000) * 0.1
-  return Math.max(FIVE_MIN, Math.ceil(raw / FIVE_MIN) * FIVE_MIN)
-}
-
-function openSegmentDialog(item: MediaItem) {
-  if (item.durationMs === null) {
-    toast.error('视频时长未知，请先「刷新媒体信息」')
-    return
-  }
-  segmentDialog.item = item
-  segmentDialog.minutes = defaultFirstSegmentMinutes(item.durationMs)
-  segmentDialog.open = true
-}
-
-async function submitSegmentDialog() {
-  const item = segmentDialog.item
-  if (!item || item.durationMs === null) return
-  const minutes = Math.floor(segmentDialog.minutes)
-  if (!minutes || minutes < 1) {
-    toast.error('第一段时长至少 1 分钟')
-    return
-  }
-  const firstMs = minutes * 60_000
-  try {
-    // 已存在分段产物时，先询问是否覆盖（应用内确认框）
-    let overwrite = false
-    if (await transcodeOutputExists(item.id, 'segment')) {
-      overwrite = await confirmDialog({
-        title: '覆盖分段产物？',
-        description: '已存在分段转码产物，再次分段转码将覆盖同名文件。',
-        confirmText: '覆盖',
-        danger: true,
-      })
-      if (!overwrite) return
-    }
-    await segmentTranscode(item.id, firstMs, overwrite)
-    toast.info('已加入转码队列：第一段完成后会自动弹出复制链接窗口')
-    segmentDialog.open = false
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
 // 第一段转码完成：弹出「复制链接」窗口（分段播放）；样本生成完成：提示并打开所在目录
 let unlistenSegmentReady: UnlistenFn | null = null
 let unlistenSampleDone: UnlistenFn | null = null
+/// 组件是否已卸载：卸载发生在监听器注册完成前时，仍要保证返回的 unlisten 被释放
+let unmounted = false
 onMounted(async () => {
   try {
     const fn = await onSegmentReady((seg) => {
@@ -625,7 +592,8 @@ onMounted(async () => {
       toast.success(`「${seg.title}」第一段转码完成，请复制链接`)
       openUrlDialog(source, 'segment')
     })
-    unlistenSegmentReady = fn
+    if (unmounted) fn()
+    else unlistenSegmentReady = fn
   } catch {
     // 非 Tauri 环境忽略
   }
@@ -638,12 +606,14 @@ onMounted(async () => {
         toast.error(`样本生成失败：${e.error ?? '未知错误'}`)
       }
     })
-    unlistenSampleDone = fn
+    if (unmounted) fn()
+    else unlistenSampleDone = fn
   } catch {
     // 非 Tauri 环境忽略
   }
 })
 onUnmounted(() => {
+  unmounted = true
   unlistenSegmentReady?.()
   unlistenSampleDone?.()
 })
@@ -803,7 +773,6 @@ onUnmounted(() => {
         @rename="openRenameFile"
         @move="openMoveFile"
         @goto-source="gotoSource"
-        @segment-transcode="openSegmentDialog"
         @toggle-select="toggleSelect"
       />
     </div>
@@ -823,7 +792,7 @@ onUnmounted(() => {
         <FolderInput class="h-3.5 w-3.5" />
         移动到…
       </Button>
-      <Button size="sm" variant="outline" :disabled="!selectedCount" @click="batchTranscode">
+      <Button size="sm" variant="outline" :disabled="!selectedCount" @click="openBatchTranscode">
         <FileVideo class="h-3.5 w-3.5" />
         转码 MP4
       </Button>
@@ -868,6 +837,9 @@ onUnmounted(() => {
               autofocus
               @keydown.enter="submitManualIp"
             />
+            <p v-if="manualIp.trim() && !manualIpValid" class="text-xs text-destructive">
+              请输入合法的 IPv4 地址，例如 10.126.126.2
+            </p>
           </div>
           <div class="space-y-1.5">
             <label class="text-sm font-medium">端口</label>
@@ -883,7 +855,7 @@ onUnmounted(() => {
         </div>
         <div class="flex justify-end gap-2">
           <Button type="button" variant="outline" @click="peerPickerOpen = false">取消</Button>
-          <Button type="button" @click="submitManualIp">查看</Button>
+          <Button type="button" :disabled="manualIp.trim() !== '' && !manualIpValid" @click="submitManualIp">查看</Button>
         </div>
 
         <!-- 一键选择：仅在 EasyTier 运行且读取到房间成员时显示 -->
@@ -916,32 +888,6 @@ onUnmounted(() => {
     </Dialog>
 
     <PeerMediaDialog v-model:open="peerMediaOpen" :peer="selectedPeer" :port="peerPort" />
-
-    <!-- 分段转码确认：第一段时长可调整 -->
-    <Dialog
-      :open="segmentDialog.open"
-      title="分段转码"
-      description="先转出第一段供马上观看，第二段（剩余部分）在后台继续转码"
-      @update:open="segmentDialog.open = $event"
-    >
-      <form class="space-y-4" @submit.prevent="submitSegmentDialog">
-        <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <template v-if="segmentDialog.item">
-            视频总时长：{{ segmentDialog.item.durationMs !== null ? formatDuration(segmentDialog.item.durationMs) : '未知' }}
-            · 默认第一段为总时长的 10%（向上取整到 5 分钟）
-          </template>
-        </div>
-        <div class="space-y-1.5">
-          <label class="text-sm font-medium">第一段时长（分钟）</label>
-          <Input v-model.number="segmentDialog.minutes" type="number" min="1" step="1" autofocus />
-          <p class="text-xs text-muted-foreground">第一段转码完成后会自动弹出「复制链接」窗口</p>
-        </div>
-        <div class="flex justify-end gap-2">
-          <Button type="button" variant="outline" @click="segmentDialog.open = false">取消</Button>
-          <Button type="submit">开始分段转码</Button>
-        </div>
-      </form>
-    </Dialog>
 
     <!-- 新建/重命名文件夹 -->
     <Dialog
@@ -1009,5 +955,12 @@ onUnmounted(() => {
         </div>
       </form>
     </Dialog>
+
+    <!-- 批量转码设置：同一套设置应用到所有选中视频 -->
+    <BatchTranscodeDialog
+      v-model:open="batchTranscodeOpen"
+      :count="batchTranscodeCount"
+      @submit="submitBatchTranscode"
+    />
   </div>
 </template>

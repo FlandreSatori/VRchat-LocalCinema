@@ -84,8 +84,15 @@ const ALLOWED_PIX_FMTS: &[(&str, &[&str])] = &[
 /// 白名单中允许的音频编码（ac3 仅在特例组合下放行）
 const ALLOWED_AUDIO: &[&str] = &["aac", "mp3", "opus", "ac3"];
 
-/// 归一化容器名。MP4 与 MOV 共享 format_name，需借助 major_brand 区分。
-fn normalize_container(format_name: &str, major_brand: Option<&str>) -> Option<&'static str> {
+/// 归一化容器名。MP4 与 MOV 共享 format_name，需借助 major_brand 区分；
+/// MKV 与 WebM 共享 "matroska,webm"（ffprobe 报告的是 demuxer 名），需借助
+/// Mimetype=video/webm 标签区分：WebM 规范要求该标签且 ffmpeg 的 webm muxer 必写，
+/// 普通 MKV 文件不带此标签。
+fn normalize_container(
+    format_name: &str,
+    major_brand: Option<&str>,
+    webm_hint: bool,
+) -> Option<&'static str> {
     let tokens: Vec<&str> = format_name.split(',').map(|s| s.trim()).collect();
     let has = |t: &str| tokens.iter().any(|x| *x == t);
     if has("avi") {
@@ -95,8 +102,7 @@ fn normalize_container(format_name: &str, major_brand: Option<&str>) -> Option<&
         return Some("mpegts");
     }
     if has("matroska") || has("webm") {
-        // webm 通常带有 Mimetype=video/webm 标签
-        return Some("webm");
+        return if webm_hint { Some("webm") } else { Some("mkv") };
     }
     if has("mov") || has("mp4") {
         // QuickTime 文件的 major_brand 为 "qt "
@@ -127,12 +133,26 @@ pub fn parse_probe(json: &serde_json::Value) -> ProbeInfo {
             .get("format_name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let major_brand = format
-            .get("tags")
+        let tags = format.get("tags");
+        let major_brand = tags
             .and_then(|t| t.get("major_brand"))
             .and_then(|v| v.as_str());
+        // Matroska 系容器：Mimetype=video/webm 标签区分 WebM 与 MKV
+        //（Matroska 标签键名大小写不定，做不区分大小写匹配）
+        let webm_hint = tags
+            .and_then(|t| t.as_object())
+            .map(|t| {
+                t.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("mimetype")
+                        && v
+                            .as_str()
+                            .map(|s| s.to_ascii_lowercase().contains("webm"))
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
         if let Some(name) = info.raw_format_name.as_deref() {
-            info.container = normalize_container(name, major_brand).map(|s| s.to_string());
+            info.container = normalize_container(name, major_brand, webm_hint).map(|s| s.to_string());
         }
         if let Some(d) = format.get("duration").and_then(|v| v.as_str()) {
             if let Ok(secs) = d.parse::<f64>() {
@@ -379,15 +399,55 @@ mod tests {
     #[test]
     fn mov_brand_detection() {
         assert_eq!(
-            normalize_container("mov,mp4,m4a,3gp,3g2,mj2", Some("qt ")),
+            normalize_container("mov,mp4,m4a,3gp,3g2,mj2", Some("qt "), false),
             Some("mov")
         );
         assert_eq!(
-            normalize_container("mov,mp4,m4a,3gp,3g2,mj2", Some("isom")),
+            normalize_container("mov,mp4,m4a,3gp,3g2,mj2", Some("isom"), false),
             Some("mp4")
         );
-        assert_eq!(normalize_container("avi", None), Some("avi"));
-        assert_eq!(normalize_container("mpegts", None), Some("mpegts"));
-        assert_eq!(normalize_container("matroska,webm", None), Some("webm"));
+        assert_eq!(normalize_container("avi", None, false), Some("avi"));
+        assert_eq!(normalize_container("mpegts", None, false), Some("mpegts"));
+        // MKV 与 WebM 共享 "matroska,webm"：无 Mimetype 标签按 MKV，带标签按 WebM
+        assert_eq!(normalize_container("matroska,webm", None, false), Some("mkv"));
+        assert_eq!(normalize_container("matroska,webm", None, true), Some("webm"));
+    }
+
+    /// 回归：mkv + h264 + yuv420p + ac3 为白名单特例组合，
+    /// 此前 MKV 被误归为 webm 导致误报「不在兼容性白名单」
+    #[test]
+    fn parse_probe_mkv_h264_ac3_supported() {
+        let json: serde_json::Value = serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "duration": "5507.04",
+                "tags": { "encoder": "libebml v1.2.3 + libmatroska v1.3.0" }
+            },
+            "streams": [
+                { "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+                  "width": 1024, "height": 576, "bits_per_raw_sample": "0" },
+                { "codec_type": "audio", "codec_name": "ac3", "sample_rate": "48000", "channels": 6 }
+            ]
+        });
+        let info = parse_probe(&json);
+        assert_eq!(info.container.as_deref(), Some("mkv"));
+        let r = evaluate(&info);
+        assert!(r.supported, "reason: {:?}", r.reason);
+    }
+
+    #[test]
+    fn parse_probe_webm_mimetype_detected() {
+        let json: serde_json::Value = serde_json::json!({
+            "format": {
+                "format_name": "matroska,webm",
+                "tags": { "mimetype": "video/webm" }
+            },
+            "streams": [
+                { "codec_type": "video", "codec_name": "vp9", "pix_fmt": "yuv420p" },
+                { "codec_type": "audio", "codec_name": "opus", "sample_rate": "48000", "channels": 2 }
+            ]
+        });
+        let info = parse_probe(&json);
+        assert_eq!(info.container.as_deref(), Some("webm"));
     }
 }

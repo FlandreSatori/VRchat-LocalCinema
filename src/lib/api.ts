@@ -254,12 +254,136 @@ export interface ConvertTask {
   /** 下载任务：已接收字节 / 总字节 */
   received?: number | null
   total?: number | null
+  /** FFmpeg 实测倍速、帧率与剩余秒数；未知时为 null */
+  speed?: number | null
+  fps?: number | null
+  remainingSeconds?: number | null
 }
-export function transcodeMedia(id: string, overwrite?: boolean): Promise<ConvertTask> {
-  return invoke('transcode_media', { id, overwrite })
+/** 一条媒体流（供「转码设置」对话框展示音轨 / 字幕轨选择） */
+export interface MediaStreamInfo {
+  /** ffprobe 报告流的绝对索引 */
+  index: number
+  kind: 'video' | 'audio' | 'subtitle'
+  codec: string
+  profile?: string | null
+  language?: string | null
+  title?: string | null
+  isDefault: boolean
+  width?: number | null
+  height?: number | null
+  pixFmt?: string | null
+  channels?: number | null
+  channelLayout?: string | null
+  sampleRate?: number | null
+  /** 是否可直接直拷进 MP4（视频 / 音频轨用；字幕轨恒为 false） */
+  copyable: boolean
+  /** 是否为文本字幕（可烧录 / 内嵌 / 外挂）；图形字幕为 false */
+  textSubtitle: boolean
+  /** 是否为图形（位图）字幕：只能用 overlay 方式烧录，不可内嵌或外挂 */
+  graphicSubtitle: boolean
+}
+/** 获取媒体的完整流清单（需先下载/指定 ffprobe 组件） */
+export function getMediaStreams(id: string): Promise<MediaStreamInfo[]> {
+  return invoke('get_media_streams', { id })
+}
+
+/** 转码配置：字段缺省时按「自动」处理（与后端 TranscodeOptions 一一对应） */
+export interface TranscodeOptions {
+  /** 视频流绝对索引；null = 第一路视频 */
+  videoStream?: number | null
+  /** 音频流绝对索引；null = 第一路音频 */
+  audioStream?: number | null
+  /** 是否保留音频（默认保留） */
+  includeAudio?: boolean | null
+  /** 字幕流绝对索引；烧录 / 内嵌时生效，null = 自动选第一条文本字幕 */
+  subtitleStream?: number | null
+  /** 字幕处理：burn（烧录）/ embed（内嵌）/ external（外挂文件）/ drop（丢弃） */
+  subtitleMode?: 'burn' | 'embed' | 'external' | 'drop' | null
+  /** 选中的字幕流是否为图形（位图）字幕：图形字幕只能用 overlay 方式烧录 */
+  subtitleGraphic?: boolean | null
+  /** 视频处理：copy / h264 / h265 / av1 */
+  videoMode?: 'copy' | 'h264' | 'h265' | 'av1' | null
+  /** 目标分辨率高度：original / 2160 / 1440 / 1080 / 720 / 480 */
+  resolution?: string | null
+  /** 质量 CRF（0-51，越小越清晰） */
+  crf?: number | null
+  /** 编码预设：ultrafast … veryslow */
+  preset?: string | null
+  /** 视频像素格式：auto / yuv420p / yuv420p10le */
+  pixFmt?: string | null
+  /** 音频处理：copy / aac */
+  audioMode?: 'copy' | 'aac' | null
+  /** AAC 码率 */
+  audioBitrate?: string | null
+  /** 音频声道数（降混）；null 或 0 = 保持原样 */
+  audioChannels?: number | null
+  /** 音频采样率 */
+  audioSampleRate?: number | null
+  /** MP4 faststart（默认开启） */
+  faststart?: boolean | null
+}
+export interface TranscodeSourceProfile {
+  videoStream: number
+  duration: number | null
+  width: number | null
+  height: number | null
+  fps: number | null
+  totalFrames: number | null
+  videoCodec: string
+  bitrate: number | null
+  pixFmt: string | null
+  fileSize: number
+}
+export interface EstimateSource {
+  profile: TranscodeSourceProfile
+  streams: MediaStreamInfo[]
+  effectiveOptions: TranscodeOptions
+}
+export interface ProbeEstimate {
+  fps: number | null
+  samples: number[]
+  method: 'frame-difference'
+  reason: string | null
+  effectiveOptions: TranscodeOptions
+}
+export function loadEstimateSource(id: string, options?: TranscodeOptions, requestId?: string): Promise<EstimateSource> {
+  return invoke('load_estimate_source', { id, options, requestId })
+}
+export function probeTranscodeEstimate(id: string, requestId: string, options: TranscodeOptions): Promise<ProbeEstimate> {
+  return invoke('probe_transcode_estimate', { id, requestId, options })
+}
+export function cancelTranscodeEstimate(requestId: string): Promise<void> {
+  return invoke('cancel_transcode_estimate', { requestId })
+}
+
+export function transcodeMedia(
+  id: string,
+  overwrite?: boolean,
+  options?: TranscodeOptions
+): Promise<ConvertTask> {
+  return invoke('transcode_media', { id, overwrite, options })
 }
 export function transcodeOutputExists(id: string, kind?: 'transcode' | 'segment'): Promise<boolean> {
   return invoke('transcode_output_exists', { id, kind })
+}
+/** Dolby 解码器安装页（微软商店「Dolby Digital Plus decoder for PC OEMs」） */
+export const DOLBY_DECODER_URL = 'https://apps.microsoft.com/detail/9nvjqjbdkn97'
+/** 检查本机是否缺少指定音频编码的系统解码器（codec: 'ac3' | 'eac3'）；检测失败按不缺处理 */
+export function systemAudioDecoderMissing(codec: 'ac3' | 'eac3'): Promise<boolean> {
+  return invoke('system_audio_decoder_missing', { codec })
+}
+/** 带进程级缓存的解码器缺失检测（安装解码器后约 30 秒内自动刷新） */
+const decoderMissingCache = new Map<string, boolean>()
+export async function audioDecoderMissingCached(codec: 'ac3' | 'eac3'): Promise<boolean> {
+  const cached = decoderMissingCache.get(codec)
+  if (cached !== undefined) return cached
+  const missing = await systemAudioDecoderMissing(codec)
+  decoderMissingCache.set(codec, missing)
+  if (missing) {
+    // 缺失时短缓存（15s），安装后尽快刷新为可用
+    setTimeout(() => decoderMissingCache.delete(codec), 15_000)
+  }
+  return missing
 }
 /** 样本生成完成事件：ok 为 true 时 path 为样本文件路径 */
 export interface SampleDoneEvent {
@@ -282,8 +406,8 @@ export function onSampleDone(
 export function revealPath(path: string): Promise<void> {
   return invoke('reveal_path', { path })
 }
-export function segmentTranscode(id: string, firstMs: number, overwrite?: boolean): Promise<ConvertTask> {
-  return invoke('segment_transcode', { id, firstMs, overwrite })
+export function segmentTranscode(id: string, firstMs: number, overwrite?: boolean, options?: TranscodeOptions): Promise<ConvertTask> {
+  return invoke('segment_transcode', { id, firstMs, overwrite, options })
 }
 export function listSegments(id: string): Promise<MediaItem[]> {
   return invoke('list_segments', { id })
