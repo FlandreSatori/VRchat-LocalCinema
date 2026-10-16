@@ -647,6 +647,21 @@ pub async fn get_app_paths(state: State<'_, AppState>) -> AppResult<AppPaths> {
 }
 
 #[tauri::command]
+pub async fn is_first_launch(state: State<'_, AppState>) -> AppResult<bool> {
+    // 检查免责声明标记文件是否存在
+    let marker_file = state.paths.data_dir.join(".disclaimer_accepted");
+    Ok(!marker_file.exists())
+}
+
+#[tauri::command]
+pub async fn mark_disclaimer_accepted(state: State<'_, AppState>) -> AppResult<()> {
+    // 创建免责声明标记文件
+    let marker_file = state.paths.data_dir.join(".disclaimer_accepted");
+    std::fs::write(marker_file, "")?;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn open_data_dir(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let dir = state.paths.data_dir.clone();
     app.opener()

@@ -520,6 +520,12 @@ export function getRecentLogs(limit: number): Promise<LogEntry[]> {
 export function getAppPaths(): Promise<AppPaths> {
   return invoke('get_app_paths')
 }
+export function isFirstLaunch(): Promise<boolean> {
+  return invoke('is_first_launch')
+}
+export function markDisclaimerAccepted(): Promise<void> {
+  return invoke('mark_disclaimer_accepted')
+}
 export function openDataDir(): Promise<void> {
   return invoke('open_data_dir')
 }

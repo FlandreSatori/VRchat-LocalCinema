@@ -4,11 +4,14 @@ import { Github } from 'lucide-vue-next'
 import brandIcon from '../../watching_video.png'
 import Card from '../components/ui/Card.vue'
 import Badge from '../components/ui/Badge.vue'
+import Button from '../components/ui/Button.vue'
+import DisclaimerDialog from '../components/DisclaimerDialog.vue'
 import { getAppPaths, openUrl, type AppPaths } from '../lib/api'
 import { APP_NAME, APP_VERSION, APP_DESCRIPTION } from '../lib/appinfo'
 import { toast, errMsg } from '../lib/toast'
 
 const appPaths = ref<AppPaths | null>(null)
+const showDisclaimer = ref(false)
 
 const links = [
   {
@@ -110,10 +113,17 @@ onMounted(async () => {
     </Card>
 
     <Card class="p-5">
-      <h2 class="font-medium">声明</h2>
-      <p class="mt-2 text-sm leading-relaxed text-muted-foreground">
-        本软件仅用于本地媒体分享，请在可信网络环境中使用，勿用于分享未授权内容。
+      <div class="flex items-center justify-between">
+        <h2 class="font-medium">免责声明</h2>
+        <Button variant="outline" size="sm" @click="showDisclaimer = true">
+          查看详情
+        </Button>
+      </div>
+      <p class="mt-3 text-sm leading-relaxed text-muted-foreground">
+        本软件为独立开源项目，仅用于本地媒体分享。请在可信网络环境中使用，勿用于分享未授权内容。使用本软件即表示您已阅读并同意完整的免责声明。
       </p>
     </Card>
   </div>
+
+  <DisclaimerDialog v-model:open="showDisclaimer" />
 </template>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo } from 'lucide-vue-next'
+import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -9,10 +9,12 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import brandIcon from '../watching_video.png'
 import Toaster from './components/Toaster.vue'
 import ConfirmHost from './components/ConfirmHost.vue'
+import DisclaimerDialog from './components/DisclaimerDialog.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
 import { initStore, serverStore, importMediaPaths } from './lib/store'
 import { toast, errMsg } from './lib/toast'
+import { isFirstLaunch, markDisclaimerAccepted } from './lib/api'
 
 const router = useRouter()
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -24,11 +26,14 @@ const navItems = [
   { to: '/server', label: 'HTTP 服务', icon: Server },
   { to: '/easytier', label: 'EasyTier 组网', icon: Network },
   { to: '/settings', label: '设置', icon: Settings },
+  { to: '/feedback', label: '反馈', icon: MessageSquare },
   { to: '/about', label: '关于', icon: Info },
 ]
 
 const dragActive = ref(false)
 const importing = ref(false)
+const showDisclaimer = ref(false)
+const isFirstLaunchFlag = ref(false)
 
 const statusDotClass = computed(() => {
   if (serverStore.error && !serverStore.running) return 'bg-red-500'
@@ -74,6 +79,16 @@ async function handleDrop(paths: string[]) {
   }
 }
 
+async function handleDisclaimerAgree() {
+  try {
+    await markDisclaimerAccepted()
+    isFirstLaunchFlag.value = false
+  } catch (e) {
+    console.error('标记免责声明失败:', e)
+    toast.error(errMsg(e))
+  }
+}
+
 let unlistenDrag: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
 let disposed = false
@@ -100,6 +115,19 @@ onMounted(async () => {
       toast.error(errMsg(e))
     }
   }
+  
+  // 检查是否首次启动
+  try {
+    const firstLaunch = await isFirstLaunch()
+    if (firstLaunch) {
+      isFirstLaunchFlag.value = true
+      showDisclaimer.value = true
+    }
+  } catch (e) {
+    // 检查失败不阻止应用启动
+    console.error('检查首次启动状态失败:', e)
+  }
+  
   try {
     await initStore()
   } catch (e) {
@@ -207,6 +235,11 @@ onUnmounted(() => {
 
     <Toaster />
     <ConfirmHost />
+    <DisclaimerDialog
+      v-model:open="showDisclaimer"
+      :enforced="isFirstLaunchFlag"
+      @agree="handleDisclaimerAgree"
+    />
 
     <div
       v-if="dragActive"

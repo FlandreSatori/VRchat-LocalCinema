@@ -174,6 +174,8 @@ pub fn run() {
             commands::system_audio_decoder_missing,
             commands::get_recent_logs,
             commands::get_app_paths,
+            commands::is_first_launch,
+            commands::mark_disclaimer_accepted,
             commands::open_data_dir,
             commands::clear_thumbnail_cache,
             commands::get_convert_cache_info,

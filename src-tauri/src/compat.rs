@@ -421,7 +421,7 @@ mod tests {
             "format": {
                 "format_name": "matroska,webm",
                 "duration": "5507.04",
-                "tags": { "encoder": "libebml v1.2.3 + libmatroska v1.3.0" }
+                "tags": { "encoder": "libebml v1.2.3 + libmatroska v1.3.1" }
             },
             "streams": [
                 { "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
