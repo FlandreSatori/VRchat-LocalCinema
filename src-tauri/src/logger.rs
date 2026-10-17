@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::{self, File};
-use std::io::Write as _;
+use std::io::{Read, Seek, SeekFrom, Write as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -262,6 +262,160 @@ impl std::io::Write for FileWriter {
 impl Clone for FileWriter {
     fn clone(&self) -> Self {
         FileWriter(self.0.clone())
+    }
+}
+
+/// VRChat 客户端日志中的关键行：AVPro 打开流时的 API/解码路径，以及播放失败信息。
+/// 这些行只在 VRChat 侧产生，抓到这里后可在本应用日志内直接对比「能播/不能播」的差异。
+const VRC_LOG_KEYWORDS: [&str; 4] = [
+    "[AVProVideo]",
+    "Using playback path",
+    "Video Error",
+    "Loading failed",
+];
+
+/// VRChat 客户端日志目录（%USERPROFILE%\AppData\LocalLow\VRChat\VRChat）
+fn vrchat_log_dir() -> Option<PathBuf> {
+    let profile = std::env::var_os("USERPROFILE")?;
+    Some(PathBuf::from(profile).join("AppData/LocalLow/VRChat/VRChat"))
+}
+
+/// 目录下最新的 output_log*.txt（VRChat 每次启动新建一个带时间戳的文件）
+fn newest_vrchat_log(dir: &std::path::Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("output_log") || !name.ends_with(".txt") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+            best = Some((modified, entry.path()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// 后台跟踪 VRChat 客户端日志，把关键行同步写入本应用日志。
+/// 每 2 秒轮询一次；检测到 VRChat 新会话（新的 output_log 文件）时从头读取，
+/// 因此软件启动后也能看到本次 VRChat 会话已有的记录。
+pub fn spawn_vrchat_log_tailer() {
+    tauri::async_runtime::spawn(async move {
+        // 未安装 VRChat（无该目录）时静默空转，不影响其他功能
+        let Some(dir) = vrchat_log_dir() else {
+            return;
+        };
+        let mut current: Option<PathBuf> = None;
+        let mut offset: u64 = 0;
+        let mut pending = String::new();
+        loop {
+            if let Some(path) = newest_vrchat_log(&dir) {
+                if current.as_deref() != Some(path.as_path()) {
+                    tracing::info!("[VRChat] 开始跟踪客户端日志: {}", path.display());
+                    current = Some(path.clone());
+                    offset = 0;
+                    pending.clear();
+                }
+                read_new_vrchat_lines(&path, &mut offset, &mut pending);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// 增量读取日志文件新增内容，按行切分后筛选关键行写入应用日志
+fn read_new_vrchat_lines(path: &std::path::Path, offset: &mut u64, pending: &mut String) {
+    let Ok(mut file) = File::open(path) else {
+        return;
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < *offset {
+        // 文件被重建或截断
+        *offset = 0;
+        pending.clear();
+    }
+    if len == *offset || file.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return;
+    }
+    *offset += buf.len() as u64;
+    pending.push_str(&String::from_utf8_lossy(&buf));
+    // 只处理已完整结束的行，未结束的尾部留到下一次轮询
+    while let Some(idx) = pending.find('\n') {
+        let line = pending[..idx].trim_end_matches('\r').to_string();
+        pending.drain(..=idx);
+        if is_vrc_interesting(&line) {
+            tracing::info!("[VRChat] {}", line);
+        }
+    }
+}
+
+/// 是否为需要同步到应用日志的 VRChat 关键行
+fn is_vrc_interesting(line: &str) -> bool {
+    !line.trim().is_empty() && VRC_LOG_KEYWORDS.iter().any(|k| line.contains(k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_only_vrchat_media_lines() {
+        // 取自真实 output_log 的失败/成功行
+        assert!(is_vrc_interesting(
+            "2026.10.17 01:48:33 Debug -  [AVProVideo] Opening http://127.0.0.1:17001/x.mkv with API MediaFoundation"
+        ));
+        assert!(is_vrc_interesting("Using playback path: MF-MediaEngine-Hardware"));
+        assert!(is_vrc_interesting("Video Error: PlayerError"));
+        assert!(is_vrc_interesting(
+            "[AVProVideo] Error: Loading failed.  File not found, codec not supported"
+        ));
+        assert!(!is_vrc_interesting("2026.10.17 01:48:33 Debug -  [Behaviour] OnPlayerJoined x"));
+        assert!(!is_vrc_interesting("   "));
+    }
+
+    #[test]
+    fn newest_log_file_is_picked() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("output_log_2026-01-01_00-00-00.txt");
+        let newer = dir.path().join("output_log_2026-02-02_00-00-00.txt");
+        std::fs::write(&older, b"x").unwrap();
+        std::fs::write(&newer, b"x").unwrap();
+        std::fs::write(dir.path().join("other.txt"), b"x").unwrap();
+        File::options()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(newest_vrchat_log(dir.path()), Some(newer));
+    }
+
+    #[test]
+    fn incremental_read_keeps_partial_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output_log_2026-03-03_00-00-00.txt");
+        std::fs::write(&path, "noise\n[AVProVideo] Opening a\n未完").unwrap();
+        let mut offset = 0u64;
+        let mut pending = String::new();
+        read_new_vrchat_lines(&path, &mut offset, &mut pending);
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
+        // 只切出完整行，未结束的尾部保留
+        assert_eq!(pending, "未完");
+
+        // 追加后续内容后再读，只读取新增部分
+        let mut file = File::options().append(true).open(&path).unwrap();
+        file.write_all("整\n".as_bytes()).unwrap();
+        drop(file);
+        read_new_vrchat_lines(&path, &mut offset, &mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
     }
 }
 

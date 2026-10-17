@@ -366,8 +366,12 @@ export function transcodeMedia(
 export function transcodeOutputExists(id: string, kind?: 'transcode' | 'segment'): Promise<boolean> {
   return invoke('transcode_output_exists', { id, kind })
 }
-/** Dolby 解码器安装页（微软商店「Dolby Digital Plus decoder for PC OEMs」） */
-export const DOLBY_DECODER_URL = 'https://apps.microsoft.com/detail/9nvjqjbdkn97'
+/** 微软商店搜不到官方 `Microsoft.DolbyAudioExtensions`，只有 OEM 版（实测无效），
+ *  因此只能给用户第三方下载页面。链接来自第三方站点、安全性未知，请用户自行判断。 */
+export const DOLBY_DECODER_URL = 'https://www.free-codecs.com/download/dolby-audio-extensions.htm'
+/** 备选页面：ElevenForum 关于「Win11 24H2 不再自带 AC-3 编解码器」的讨论帖（同样为第三方） */
+export const DOLBY_DECODER_FORUM_URL =
+  'https://www.elevenforum.com/t/ac-3-dolby-digital-codec-no-longer-included-with-windows-11-version-24h2.25597/'
 /** 检查本机是否缺少指定音频编码的系统解码器（codec: 'ac3' | 'eac3'）；检测失败按不缺处理 */
 export function systemAudioDecoderMissing(codec: 'ac3' | 'eac3'): Promise<boolean> {
   return invoke('system_audio_decoder_missing', { codec })
@@ -392,7 +396,7 @@ export interface SampleDoneEvent {
   path: string | null
   error: string | null
 }
-/** 生成视频样本（截取前 10 秒，保存到源视频所在目录），完成后触发 sample-done 事件 */
+/** 生成视频样本（截取正中间 20 秒，保存到源视频所在目录），完成后触发 sample-done 事件 */
 export function generateSample(id: string): Promise<void> {
   return invoke('generate_sample', { id })
 }
@@ -529,6 +533,10 @@ export function markDisclaimerAccepted(): Promise<void> {
 export function openDataDir(): Promise<void> {
   return invoke('open_data_dir')
 }
+/** 打开任意数据目录（不存在时后端会先创建） */
+export function openDir(path: string): Promise<void> {
+  return invoke('open_dir', { path })
+}
 export function clearThumbnailCache(): Promise<number> {
   return invoke('clear_thumbnail_cache')
 }
@@ -623,6 +631,7 @@ export function downloadPeerMediaTask(params: {
   fileName: string
   fileSize: number
   title: string
+  hash?: string
 }): Promise<ConvertTask> {
   return invoke('download_peer_media_task', params)
 }

@@ -57,10 +57,11 @@ function handleAgree() {
 }
 
 function handleOpenChange(open: boolean) {
-  // 强制模式下不允许关闭
-  if (!props.enforced || !open) {
-    emit('update:open', open)
+  // 强制模式下禁止任何关闭尝试
+  if (props.enforced && !open) {
+    return
   }
+  emit('update:open', open)
 }
 
 import type { ComponentProps } from 'vue'

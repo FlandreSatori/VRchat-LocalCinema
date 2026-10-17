@@ -1,12 +1,12 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { Github } from 'lucide-vue-next'
 import brandIcon from '../../watching_video.png'
 import Card from '../components/ui/Card.vue'
 import Badge from '../components/ui/Badge.vue'
 import Button from '../components/ui/Button.vue'
 import DisclaimerDialog from '../components/DisclaimerDialog.vue'
-import { getAppPaths, openUrl, type AppPaths } from '../lib/api'
+import { getAppPaths, openUrl, openDir, type AppPaths } from '../lib/api'
 import { APP_NAME, APP_VERSION, APP_DESCRIPTION } from '../lib/appinfo'
 import { toast, errMsg } from '../lib/toast'
 
@@ -30,6 +30,46 @@ const links = [
 async function openLink(url: string) {
   try {
     await openUrl(url)
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+/// 数据路径展示：便携模式显示相对 exe 同级的 ./data 路径；
+/// 非便携模式把用户绝对路径前缀替换为环境变量占位符（不泄露具体用户名）
+function displayPath(full: string): string {
+  const norm = full.replace(/\\/g, '/')
+  if (appPaths.value?.portable) {
+    const lower = norm.toLowerCase()
+    const idx = lower.lastIndexOf('/data/')
+    if (idx >= 0) return '.' + norm.slice(idx)
+    if (lower.endsWith('/data')) return './data'
+    return norm
+  }
+  const m = /^(.*?)\/AppData\/(Roaming|LocalLow|Local)\//i.exec(norm)
+  if (m) {
+    const seg = m[2].toLowerCase()
+    const prefix =
+      seg === 'local' ? '%LOCALAPPDATA%' : seg === 'locallow' ? '%LOCALAPPDATA%/../LocalLow' : '%APPDATA%'
+    return `${prefix}/${norm.slice(m[0].length)}`
+  }
+  return norm
+}
+
+/// 各数据存储路径（「打开目录」一键定位）
+const pathRows = computed(() =>
+  appPaths.value
+    ? [
+        { label: '数据目录', path: appPaths.value.dataDir },
+        { label: '封面缓存', path: appPaths.value.thumbDir },
+        { label: '日志目录', path: appPaths.value.logDir },
+      ]
+    : []
+)
+
+async function doOpenDir(path: string) {
+  try {
+    await openDir(path)
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -92,17 +132,14 @@ onMounted(async () => {
     <Card class="p-5">
       <h2 class="font-medium">数据位置</h2>
       <div v-if="appPaths" class="mt-3 space-y-2 text-sm">
-        <div class="flex justify-between gap-4">
-          <span class="shrink-0 text-muted-foreground">数据目录</span>
-          <span class="break-all font-mono text-xs">{{ appPaths.dataDir }}</span>
-        </div>
-        <div class="flex justify-between gap-4">
-          <span class="shrink-0 text-muted-foreground">封面缓存</span>
-          <span class="break-all font-mono text-xs">{{ appPaths.thumbDir }}</span>
-        </div>
-        <div class="flex justify-between gap-4">
-          <span class="shrink-0 text-muted-foreground">日志目录</span>
-          <span class="break-all font-mono text-xs">{{ appPaths.logDir }}</span>
+        <div v-for="row in pathRows" :key="row.label" class="flex items-start justify-between gap-3">
+          <span class="shrink-0 pt-1 text-muted-foreground">{{ row.label }}</span>
+          <div class="flex min-w-0 items-center gap-2">
+            <span class="break-all pt-1 font-mono text-xs">{{ displayPath(row.path) }}</span>
+            <Button variant="outline" size="sm" class="shrink-0" @click="doOpenDir(row.path)">
+              打开目录
+            </Button>
+          </div>
         </div>
         <div class="flex justify-between gap-4">
           <span class="shrink-0 text-muted-foreground">便携模式</span>

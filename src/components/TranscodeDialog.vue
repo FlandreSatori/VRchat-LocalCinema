@@ -19,6 +19,8 @@ import { toast, errMsg } from '../lib/toast'
 const props = defineProps<{
   open: boolean
   item: MediaItem | null
+  /** 打开时默认套用的转码方式（如从「缺解码器」提示进入时预设为 'audio'） */
+  defaultStrategy?: 'smart' | 'audio' | 'full' | 'custom'
 }>()
 
 const emit = defineEmits<{
@@ -356,7 +358,7 @@ watch(
     streams.value = streamResult.value
     loadError.value = streamResult.error
     outputExists.value = exists
-    applyStrategy('smart')
+    applyStrategy(props.defaultStrategy ?? 'smart')
     loading.value = false
   },
   { immediate: true }
@@ -369,15 +371,11 @@ const planSummary = computed(() => {
   parts.push(videoMode.value === 'copy' && subtitleChoice.value.startsWith('burn') ? '视频 H.264（字幕烧录需重编码）' : v)
   if (audioStream.value === 'none') parts.push('无音频')
   else parts.push(audioMode.value === 'copy' ? '音频直拷' : `音频 AAC ${audioBitrate.value}`)
-  const [mode, index] = effectiveSubtitle.value.split(':')
+  const [mode, index] = subtitleChoice.value.split(':')
   parts.push(
     mode === 'burn'
       ? '字幕烧录进画面'
-      : mode === 'embed'
-        ? '字幕内嵌(mov_text)'
-        : mode === 'external'
-          ? '外挂字幕文件'
-          : '不带字幕'
+      : '不带字幕'
   )
   if (mode !== 'drop') parts.push(`字幕 #${index}`)
   return parts.join(' · ')

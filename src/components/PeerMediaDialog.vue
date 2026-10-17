@@ -115,9 +115,10 @@ async function download(item: MediaSummary) {
       fileName: item.fileName,
       fileSize: item.fileSize,
       title: item.title,
+      hash: item.hash ?? undefined,
     })
-    toast.success('已加入下载任务，可在「任务」页查看进度')
-  } catch (e) {
+    toast.success('已加入下载队列')
+  } catch (e: any) {
     toast.error(errMsg(e))
   }
 }

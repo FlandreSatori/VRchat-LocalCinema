@@ -36,7 +36,7 @@ impl EstimateState {
         if let Some((_, old)) = self
             .active
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .replace((id.into(), cancel.clone()))
         {
             old.store(true, Ordering::SeqCst);
@@ -205,8 +205,8 @@ struct ProcessResult {
     stdout: String,
     elapsed: f64,
 }
-/// ffprobe 读取流信息的超时；大文件/网络盘可能较慢，留出足够余量。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// ffprobe 读取流信息的超时；大文件/网络盘/机械盘可能较慢，留出足够余量。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 /// 抽取内嵌字幕的超时。
 const SUBTITLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 单次视频采样编码的超时；慢编码器（如 AV1）编码几十帧可能明显超过 3 秒。
@@ -245,17 +245,29 @@ async fn run(
             .await
             .map(|_| text)
     });
+    // 排空 stderr 的同时保留末尾几行，失败时拼进错误原因便于定位
+    //（如 "Encoder 'libaom-av1' not found"、"No such filter: 'subtitles'"）。
     let read_err = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
+        let mut tail: Vec<String> = Vec::new();
         loop {
             line.clear();
             match reader.read_line(&mut line).await {
                 // 到达流末尾或读取出错都终止排空，避免无谓占用。
                 Ok(0) | Err(_) => break,
-                Ok(_) => {}
+                Ok(_) => {
+                    let l = line.trim_end();
+                    if !l.is_empty() {
+                        tail.push(l.to_string());
+                        if tail.len() > 6 {
+                            tail.remove(0);
+                        }
+                    }
+                }
             }
         }
+        tail
     });
     let result = loop {
         if cancel.load(Ordering::SeqCst) {
@@ -269,7 +281,10 @@ async fn run(
                 break if status.success() {
                     Ok(())
                 } else {
-                    Err("FFmpeg/ffprobe 探测失败，回落经验估算".into())
+                    Err(format!(
+                        "FFmpeg/ffprobe 探测失败（退出码 {}），回落经验估算",
+                        status.code().map(|c| c.to_string()).unwrap_or_else(|| "未知".into())
+                    ))
                 }
             }
             Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
@@ -285,8 +300,25 @@ async fn run(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    let _ = read_err.await;
-    result?;
+    let stderr_tail = read_err.await.unwrap_or_default();
+    if let Err(e) = result {
+        // 取消是用户主动行为，不需要附加进程输出
+        if !e.contains("取消") && !stderr_tail.is_empty() {
+            let mut detail = stderr_tail.join(" | ");
+            if detail.len() > 300 {
+                // 只截到字符边界，避免多字节字符（如中文路径）切片 panic
+                let start = detail.len() - 300;
+                let boundary = detail
+                    .char_indices()
+                    .find(|(i, _)| *i >= start)
+                    .map(|(i, _)| i)
+                    .unwrap_or(detail.len());
+                detail = detail[boundary..].to_string();
+            }
+            return Err(format!("{e}（{detail}）"));
+        }
+        return Err(e);
+    }
     Ok(ProcessResult { stdout, elapsed })
 }
 
@@ -300,7 +332,7 @@ async fn load(
     let item = state
         .db
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(id)?
         .ok_or_else(|| AppError::Msg("媒体条目不存在".into()))?;
     let path = PathBuf::from(&item.file_path);
@@ -423,11 +455,15 @@ fn completed_frames(output: &str) -> u32 {
         .unwrap_or(0)
 }
 fn differential(a: &ProcessResult, b: &ProcessResult) -> Option<f64> {
+    // 采样点靠近片尾时第二次运行可能到不了 45 帧（短尾）；
+    // 只要差分帧数足够（>= 预期 40 帧的一半）就仍可作为有效样本。
+    let fa = completed_frames(&a.stdout);
+    let fb = completed_frames(&b.stdout);
     let dt = b.elapsed - a.elapsed;
-    if completed_frames(&a.stdout) != 5 || completed_frames(&b.stdout) != 45 || dt < 0.05 {
+    if fb.saturating_sub(fa) < 20 || dt < 0.05 {
         return None;
     }
-    let fps = 40.0 / dt;
+    let fps = (fb - fa) as f64 / dt;
     (fps.is_finite() && fps > 0.0).then_some(fps)
 }
 
@@ -471,7 +507,12 @@ pub async fn probe_transcode_estimate(
     };
     let temp = tempfile::tempdir().map_err(|e| AppError::Msg(e.to_string()))?;
     let input = path.to_string_lossy().to_string();
-    let subtitle = if options.burn_subtitles() {
+    // 图形（位图）字幕烧录走 overlay 直接从输入读取，无需也不应抽取
+    //（此前对 PGS 等位图字幕按文本抽取为 srt 必然失败，导致探测整体不可用）。
+    // 文本字幕抽取失败也不再放弃探测：烧录滤镜开销占比小，
+    // 退化为不烧录的样本仍可用于估算视频编码速度（在 ±10% 参考带内）。
+    let mut subtitle = None;
+    if options.burn_subtitles() && !options.subtitle_graphic() {
         let s = source
             .streams
             .iter()
@@ -496,13 +537,19 @@ pub async fn probe_transcode_estimate(
             },
             dest.to_string_lossy().to_string(),
         ];
-        if let Err(e) = run(&ffmpeg, &args, None, SUBTITLE_TIMEOUT, &cancel).await {
-            return Ok(fail(result, &format!("字幕抽取未完成：{e}")));
+        match run(&ffmpeg, &args, None, SUBTITLE_TIMEOUT, &cancel).await {
+            Ok(_) => subtitle = Some(dest),
+            Err(e) => {
+                if e.contains("取消") {
+                    return Ok(fail(result, &e));
+                }
+                tracing::warn!("字幕抽取失败，按不烧录字幕继续探测：{e}");
+            }
         }
-        Some(dest)
-    } else {
-        None
-    };
+    }
+    // 单个采样点失败（片尾短尾、局部坏帧、单次超时等）不再中止整个探测，
+    // 记录最后一次错误，继续尝试其余采样点。
+    let mut last_error: Option<String> = None;
     for position in sample_positions(duration) {
         let mut pair = Vec::new();
         for frames in [5, 45] {
@@ -517,19 +564,28 @@ pub async fn probe_transcode_estimate(
             .await
             {
                 Ok(sample) => pair.push(sample),
-                Err(e) => return Ok(fail(result, &e)),
+                Err(e) => {
+                    if e.contains("取消") {
+                        return Ok(fail(result, &e));
+                    }
+                    last_error = Some(e);
+                    break;
+                }
             }
         }
-        if let Some(fps) = differential(&pair[0], &pair[1]) {
-            result.samples.push(fps);
+        if pair.len() == 2 {
+            if let Some(fps) = differential(&pair[0], &pair[1]) {
+                result.samples.push(fps);
+            }
         }
     }
     let required = if duration < 15.0 { 1 } else { 2 };
     if result.samples.len() < required {
-        return Ok(fail(
-            result,
-            "有效差分样本不足（可能片长过短或编码器启动过慢），回落经验估算",
-        ));
+        let reason = match &last_error {
+            Some(e) => format!("有效差分样本不足，回落经验估算（{e}）"),
+            None => "有效差分样本不足（可能片长过短或编码器启动过慢），回落经验估算".to_string(),
+        };
+        return Ok(fail(result, &reason));
     }
     let lo = result.samples.iter().copied().fold(f64::INFINITY, f64::min);
     let hi = result.samples.iter().copied().fold(0.0, f64::max);
@@ -669,5 +725,48 @@ mod tests {
         assert_eq!(differential(&a, &b), None);
         assert_eq!(sample_positions(10.0), vec![3.0]);
         assert_eq!(sample_positions(100.0), vec![20.0, 50.0, 80.0]);
+    }
+    #[test]
+    fn differential_tolerates_short_tail_positions() {
+        // 片尾采样点第二次运行到不了 45 帧（如 EOF 提前），
+        // 只要差分帧数 >= 20 仍应产出有效样本
+        let a = ProcessResult {
+            stdout: "frame=5\n".into(),
+            elapsed: 0.4,
+        };
+        let b = ProcessResult {
+            stdout: "frame=30\n".into(),
+            elapsed: 1.4,
+        };
+        assert!((differential(&a, &b).unwrap() - 25.0).abs() < 0.001);
+        // 差分帧数不足 20 时仍拒绝，避免启动开销污染样本
+        let b2 = ProcessResult {
+            stdout: "frame=22\n".into(),
+            elapsed: 1.4,
+        };
+        assert_eq!(differential(&a, &b2), None);
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_process_error_includes_stderr_tail() {
+        let cancel = AtomicBool::new(false);
+        let args = vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "[Console]::Error.WriteLine('boom-detail'); exit 3".into(),
+        ];
+        let error = run(
+            Path::new("powershell.exe"),
+            &args,
+            None,
+            Duration::from_secs(10),
+            &cancel,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.contains("退出码 3"), "error: {error}");
+        assert!(error.contains("boom-detail"), "error: {error}");
     }
 }

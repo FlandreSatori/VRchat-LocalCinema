@@ -669,6 +669,18 @@ pub async fn open_data_dir(app: AppHandle, state: State<'_, AppState>) -> AppRes
         .map_err(|e| AppError::Msg(format!("打开配置目录失败: {}", e)))
 }
 
+/// 打开任意数据目录（不存在时先创建），供「关于」界面的各数据路径一键打开
+#[tauri::command]
+pub async fn open_dir(app: AppHandle, path: String) -> AppResult<()> {
+    let dir = PathBuf::from(&path);
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)?;
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().as_ref(), None::<&str>)
+        .map_err(|e| AppError::Msg(format!("打开目录失败: {}", e)))
+}
+
 #[tauri::command]
 pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> AppResult<u64> {
     let dir = thumb_dir_of(&state);
@@ -1490,20 +1502,24 @@ async fn run_download_task(
             // 完整性校验：对比文件大小与对端哈希，避免半截或损坏文件入库
             let size = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
             let mut verify_err: Option<String> = None;
-            if let Some(total) = task.total {
-                if size != total {
-                    verify_err = Some(format!(
-                        "文件大小校验失败（期望 {} 字节，实际 {} 字节）",
-                        total, size
-                    ));
+            // 重新从队列读取最新任务（获取会话中写入的 total）
+            let task_final = queue.list().into_iter().find(|t| t.id == task_id);
+            if let Some(ref t) = task_final {
+                if let Some(total) = t.total {
+                    if size != total {
+                        verify_err = Some(format!(
+                            "文件大小校验失败（期望 {} 字节，实际 {} 字节）",
+                            total, size
+                        ));
+                    }
                 }
-            }
-            if verify_err.is_none() {
-                if let Some(expected) = task.expected_hash.as_deref() {
-                    match hash_file(&dest).await {
-                        Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
-                        Some(_) => verify_err = Some("文件哈希校验失败".into()),
-                        None => tracing::warn!("下载文件哈希计算失败，跳过哈希校验"),
+                if verify_err.is_none() {
+                    if let Some(expected) = t.expected_hash.as_deref() {
+                        match hash_file(&dest).await {
+                            Some(actual) if actual.eq_ignore_ascii_case(expected) => {}
+                            Some(_) => verify_err = Some("文件哈希校验失败".into()),
+                            None => tracing::warn!("下载文件哈希计算失败，跳过哈希校验"),
+                        }
                     }
                 }
             }
@@ -1657,7 +1673,7 @@ fn pick_playlist_name(state: &AppState, id: &str, stem: &str) -> String {
     let taken = state
         .db
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .resolve_hls_playlist(&candidate)
         .ok()
         .flatten()
@@ -1686,6 +1702,19 @@ struct FfmpegProgress {
 fn progress_number(value: &str) -> Option<f64> {
     value.trim().trim_end_matches('x').parse::<f64>().ok()
         .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// 把 ffmpeg 的退出码渲染为可读文本：负值即 libavutil 错误码，附上符号名便于直接定位。
+fn describe_exit_code(code: Option<i32>) -> String {
+    match code {
+        Some(c) if c >= 0 => c.to_string(),
+        Some(-1163346256) => {
+            "-1163346256 (AVERROR_PATCHWELCOME：FFmpeg 内部该路径尚未实现)".to_string()
+        }
+        Some(-22) => "-22 (AVERROR(EINVAL)：参数或像素格式不被支持)".to_string(),
+        Some(c) => c.to_string(),
+        None => "未知（进程被异常终止）".to_string(),
+    }
 }
 
 /// 运行 ffmpeg 并按 progress 块解析遥测；ETA 由剩余媒体时长 / speed 计算。
@@ -1729,11 +1758,19 @@ async fn run_ffmpeg_with_progress(
 
     let err_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
+        // 只保留**尾部**（最近的报错），避免被开头的大段输入文件元数据/编码器 banner 占满后
+        // 把真正的报错行截掉（此前保留前 8000 字符，长素材下报错信息几乎必然丢失）。
+        const KEEP: usize = 32_000;
         let mut collected = String::new();
         while let Ok(Some(line)) = lines.next_line().await {
-            if collected.len() < 8000 {
-                collected.push_str(&line);
-                collected.push('\n');
+            collected.push_str(&line);
+            collected.push('\n');
+            if collected.len() > KEEP {
+                let cut = collected.len() - KEEP;
+                let cut = (cut..collected.len())
+                    .find(|i| collected.is_char_boundary(*i))
+                    .unwrap_or(collected.len());
+                collected.drain(..cut);
             }
         }
         collected
@@ -1792,14 +1829,14 @@ async fn run_ffmpeg_with_progress(
         .await
         .unwrap_or_else(|_| "无法获取错误详情".to_string());
     if !status.success() {
-        // 完整 stderr 写入应用日志（供远程排查导出），弹窗仅带末尾几行关键信息
+        // 完整 stderr（尾部）写入应用日志（供远程排查导出），任务卡片携带末尾若干行关键信息
         tracing::warn!("ffmpeg 失败（退出码 {:?}）args={:?} stderr:\n{}", status.code(), args, err_text);
         let non_empty: Vec<&str> = err_text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let tail: Vec<&str> = non_empty.iter().rev().take(3).rev().copied().collect();
-        let brief: String = tail.join(" | ").chars().take(500).collect();
+        let tail: Vec<&str> = non_empty.iter().rev().take(8).rev().copied().collect();
+        let brief: String = tail.join("\n").chars().take(2000).collect();
         return Err(AppError::Msg(format!(
-            "ffmpeg 退出码 {:?}: {}",
-            status.code(),
+            "ffmpeg 退出码 {}:\n{}",
+            describe_exit_code(status.code()),
             if brief.is_empty() { "未知错误".into() } else { brief }
         )));
     }
@@ -2042,15 +2079,27 @@ pub async fn transcode_output_exists(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "video".into());
     let dir = state.paths.data_dir.join("converted");
-    let names: Vec<String> = if kind.as_deref() == Some("segment") {
-        vec![
+    
+    if kind.as_deref() == Some("segment") {
+        let names = vec![
             format!("{} (分段1).mp4", stem),
             format!("{} (分段2).mp4", stem),
-        ]
-    } else {
-        vec![format!("{} (转码).mp4", stem)]
-    };
-    Ok(names.iter().any(|n| dir.join(n).exists()))
+        ];
+        return Ok(names.iter().any(|n| dir.join(n).exists()));
+    }
+    
+    // 常规转码：检查主产物及 Windows 重复文件命名（" (转码) (1).mp4"、" (转码) (2).mp4" …）
+    let base_name = format!("{} (转码).mp4", stem);
+    if dir.join(&base_name).exists() {
+        return Ok(true);
+    }
+    for i in 1..=99 {
+        let numbered = format!("{} (转码) ({}).mp4", stem, i);
+        if dir.join(&numbered).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 样本生成完成事件（前端据此提示并打开所在目录）
@@ -2062,7 +2111,7 @@ struct SampleDoneEvent {
     error: Option<String>,
 }
 
-/// 生成视频样本：调用 ffmpeg 截取前 10 秒转码保存到源视频所在目录，
+/// 生成视频样本：调用 ffmpeg 截取视频正中间的 20 秒转码保存到源视频所在目录，
 /// 完成后发送 sample-done 事件，由前端打开资源管理器定位文件
 #[tauri::command]
 pub async fn generate_sample(
@@ -2081,8 +2130,9 @@ pub async fn generate_sample(
 
     let media_id = id;
     let file_path = item.file_path.clone();
+    let duration_ms = item.duration_ms;
     tokio::spawn(async move {
-        let event = match run_sample_ffmpeg(&ffmpeg, &file_path).await {
+        let event = match run_sample_ffmpeg(&ffmpeg, &file_path, duration_ms).await {
             Ok(dest) => SampleDoneEvent {
                 media_id,
                 ok: true,
@@ -2101,12 +2151,17 @@ pub async fn generate_sample(
     Ok(())
 }
 
-/// 构建样本截取参数：流复制（-c copy）保持原编码与原封装格式，仅重封装前 10 秒，不重新转码。
+/// 构建样本截取参数：流复制（-c copy）保持原编码与原封装格式，仅重封装视频正中间的 20 秒，
+/// 不重新转码。`start_sec` 为起点（不传则从 0 开始）。
 /// 样本保留所有视频/音频/字幕轨，以便代表原文件的完整信息；
 /// 通过保留原封装格式（原扩展名）确保多轨兼容性（mkv 支持多轨，不会像强制 MP4 那样报 -22）。
-fn sample_args(input: &str, dest: &std::path::Path) -> Vec<String> {
-    vec![
-        "-y".into(),
+fn sample_args(input: &str, dest: &std::path::Path, start_sec: Option<f64>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-y".into()];
+    // -ss 放在 -i 之前：对 -c copy 而言是输入侧快速定位，输出从关键帧开始，不会产生损坏文件
+    if let Some(s) = start_sec {
+        args.extend(["-ss".into(), format!("{:.3}", s)]);
+    }
+    args.extend([
         "-i".into(),
         input.to_string(),
         "-map".into(),
@@ -2118,12 +2173,13 @@ fn sample_args(input: &str, dest: &std::path::Path) -> Vec<String> {
         "-c".into(),
         "copy".into(),
         "-t".into(),
-        "10".into(),
+        "20".into(),
         "-progress".into(),
         "pipe:1".into(),
         "-nostats".into(),
         dest.to_string_lossy().to_string(),
-    ]
+    ]);
+    args
 }
 
 /// 样本临时文件：与最终产物同名但保留原扩展名（`xxx (样本).mkv.part.mkv`）。
@@ -2142,9 +2198,14 @@ fn sample_part_path(dest: &std::path::Path) -> std::path::PathBuf {
     dest.with_file_name(format!("{}.part.{}", name, ext))
 }
 
-/// 截取视频前 10 秒生成样本文件：-c copy 流复制（保持原格式和原封装，速度极快），
-/// 命名为 `<原名> (样本).<原扩展名>`，保存到源视频所在目录
-async fn run_sample_ffmpeg(ffmpeg: &PathBuf, file_path: &str) -> AppResult<PathBuf> {
+/// 截取视频正中间的 20 秒生成样本文件：-c copy 流复制（保持原格式和原封装，速度极快），
+/// 命名为 `<原名> (样本).<原扩展名>`，保存到源视频所在目录；
+/// 起点取 `(总时长 - 20) / 2`，时长未知或不足 20 秒时从 0 开始
+async fn run_sample_ffmpeg(
+    ffmpeg: &PathBuf,
+    file_path: &str,
+    duration_ms: Option<u64>,
+) -> AppResult<PathBuf> {
     let src = std::path::Path::new(file_path);
     let dir = src.parent().unwrap_or(std::path::Path::new("."));
     let stem = src
@@ -2157,21 +2218,36 @@ async fn run_sample_ffmpeg(ffmpeg: &PathBuf, file_path: &str) -> AppResult<PathB
         .unwrap_or_else(|| "mp4".into());
     let dest = unique_dest(dir, &format!("{} (样本).{}", stem, ext));
     let part = sample_part_path(&dest);
-    let args = sample_args(file_path, &part);
-    let result = run_ffmpeg_with_progress(ffmpeg, &args, Some(10_000), None, None, |_| {}).await;
+    let start_sec = duration_ms
+        .map(|d| (d as f64 / 1000.0 - 20.0) / 2.0)
+        .filter(|s| *s > 0.0);
+    let args = sample_args(file_path, &part, start_sec);
+    let result = run_ffmpeg_with_progress(ffmpeg, &args, Some(20_000), None, None, |_| {}).await;
     if let Err(e) = result {
-        // 失败时清理临时产物，并移除预先原子占位的空目标文件
+        // 失败时清理临时产物与原子占位的空目标文件
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(&dest);
         return Err(e);
+    }
+    // 清理可能残留的 .part.<原扩展> 样本临时产物（如 .part.mkv）
+    if let Some(parent) = dest.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let dest_stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("{}.part.", dest_stem)) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
     }
     promote_part(&part, &dest)?;
     Ok(dest)
 }
 
 /// 检查本机是否缺少指定音频编码的系统解码器（codec: "ac3" | "eac3"）。
-/// VRChat/AVPro 用系统 Media Foundation 解码，原生 Windows 不带 Dolby 解码器；
-/// 检测失败一律按「不缺」处理，避免误报。
+/// VRChat/AVPro 用系统 Media Foundation 解码，Windows 11 24H2 起系统不带 Dolby
+/// 解码器；检测失败一律按「不缺」处理，避免误报引导用户安装。
 #[tauri::command]
 pub async fn system_audio_decoder_missing(codec: String) -> AppResult<bool> {
     Ok(!crate::system_codecs::audio_decoder_available(&codec))
@@ -2640,8 +2716,8 @@ async fn run_queued_segment_transcode(
         .unwrap_or_else(|| default_first_segment_ms(total))
         .min(total);
     if first_ms >= total {
-        // 视频过短不足以分段，按整段转码处理
-        return run_queued_transcode(app, state, task, cancel).await;
+        // 视频过短不足以分段，视为只有一个分段（不回落整段转码，保持分段命名契约）
+        tracing::info!("视频时长 {}ms 小于首段设定 {}ms，仅转单段", total, first_ms);
     }
 
     let dir = state.paths.data_dir.join("converted");
@@ -3158,7 +3234,7 @@ pub async fn create_folder(
     Ok(state
         .db
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .create_folder(&name, parent_id.as_deref())?)
 }
 

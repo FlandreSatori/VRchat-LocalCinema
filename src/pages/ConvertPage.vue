@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   ListVideo,
   Play,
@@ -11,7 +11,10 @@ import {
   Loader2,
   CheckCircle2,
   XCircle,
+  Copy,
+  Check,
 } from 'lucide-vue-next'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
 import { convertTaskStore, applyConvertTasks } from '../lib/store'
@@ -164,6 +167,23 @@ async function clearFinished() {
   }
 }
 
+/** 刚复制成功的任务 id（用于把按钮图标短暂切换为对勾） */
+const copiedId = ref<string | null>(null)
+
+async function copyError(t: ConvertTask) {
+  if (!t.error) return
+  try {
+    await writeText(t.error)
+    copiedId.value = t.id
+    toast.success('报错信息已复制到剪贴板')
+    setTimeout(() => {
+      if (copiedId.value === t.id) copiedId.value = null
+    }, 2000)
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
 onMounted(refresh)
 </script>
 
@@ -279,8 +299,21 @@ onMounted(refresh)
             :class="t.percent === null ? 'animate-pulse' : ''"
           />
         </div>
-        <div v-if="t.error" class="mt-2 truncate text-xs text-destructive" :title="t.error">
-          {{ t.error }}
+        <div v-if="t.error" class="mt-2 flex items-start gap-2">
+          <div class="min-w-0 max-h-16 flex-1 overflow-hidden whitespace-pre-wrap break-all text-xs text-destructive" :title="t.error">
+            {{ t.error }}
+          </div>
+          <Button
+            size="sm"
+            variant="ghost"
+            class="h-6 shrink-0 px-1.5 text-xs text-destructive hover:text-destructive"
+            title="复制报错信息"
+            @click="copyError(t)"
+          >
+            <Check v-if="copiedId === t.id" class="h-3.5 w-3.5" />
+            <Copy v-else class="h-3.5 w-3.5" />
+            复制
+          </Button>
         </div>
       </div>
     </div>

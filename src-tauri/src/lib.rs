@@ -42,13 +42,36 @@ pub fn run() {
             let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let paths = settings::resolve_paths(&exe);
             let _ = std::fs::create_dir_all(&paths.thumb_dir);
-            // 清理上次转码中断遗留的临时产物（*.part.mp4），避免残留半成品
+            // 清理上次转码/下载中断遗留的临时产物与占位空文件
             {
                 let converted = paths.data_dir.join("converted");
+                let downloads = paths.download_dir.clone();
+                
+                // converted 目录：.part.mp4 临时产物 + 0 字节占位空文件
                 if converted.is_dir() {
                     if let Ok(entries) = std::fs::read_dir(&converted) {
                         for e in entries.flatten() {
-                            if e.file_name().to_string_lossy().ends_with(".part.mp4") {
+                            let path = e.path();
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.ends_with(".part.mp4") {
+                                let _ = std::fs::remove_file(&path);
+                            } else if name.ends_with(".mp4") {
+                                // 删除 unique_dest 预占的 0 字节空文件
+                                if let Ok(meta) = e.metadata() {
+                                    if meta.len() == 0 {
+                                        let _ = std::fs::remove_file(&path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // 下载目录：.part 临时文件
+                if downloads.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&downloads) {
+                        for e in entries.flatten() {
+                            if e.file_name().to_string_lossy().ends_with(".part") {
                                 let _ = std::fs::remove_file(e.path());
                             }
                         }
@@ -61,6 +84,9 @@ pub fn run() {
                 paths.data_dir.display(),
                 paths.portable
             );
+
+            // 后台跟踪 VRChat 客户端日志，把 AVPro 解码路径/播放错误同步到本应用日志
+            logger::spawn_vrchat_log_tailer();
 
             let app_settings = settings::Settings::load(&paths.settings_file)
                 .unwrap_or_else(|e| {
@@ -177,6 +203,7 @@ pub fn run() {
             commands::is_first_launch,
             commands::mark_disclaimer_accepted,
             commands::open_data_dir,
+            commands::open_dir,
             commands::clear_thumbnail_cache,
             commands::get_convert_cache_info,
             commands::open_convert_dir,

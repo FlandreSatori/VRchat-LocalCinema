@@ -28,6 +28,7 @@ import Button from './ui/Button.vue'
 import Badge from './ui/Badge.vue'
 import MediaInfoDialog from './MediaInfoDialog.vue'
 import TranscodeDialog from './TranscodeDialog.vue'
+import DecoderMissingDialog from './DecoderMissingDialog.vue'
 import type { MenuEntry } from '../lib/menu'
 import {
   buildMediaUrl,
@@ -39,8 +40,6 @@ import {
   removeMedia,
   generateSample,
   audioDecoderMissingCached,
-  DOLBY_DECODER_URL,
-  openUrl,
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
@@ -73,6 +72,9 @@ const router = useRouter()
 const imgError = ref(false)
 const infoOpen = ref(false)
 const transcodeOpen = ref(false)
+/// 打开转码对话框时默认套用的方式（从「缺解码器」提示进入时预设为「仅转音频」）
+const transcodeStrategy = ref<'smart' | 'audio' | 'full' | 'custom'>('smart')
+const decoderOpen = ref(false)
 
 watch(
   () => [props.item.id, props.item.thumbnail],
@@ -101,7 +103,7 @@ const busy = computed(
 
 const unsupported = computed(() => props.item.compatStatus === 'unsupported')
 
-/// 本机缺少音频解码器（如 AC-3）：白名单兼容但 VRChat 仍可能无法播放，提示安装 Dolby 解码器
+/// 本机缺少音频解码器（如 AC-3）：白名单兼容但 VRChat 仍可能无法播放音轨，弹出提示引导安装或转码
 const decoderWarning = ref<string | null>(null)
 watch(
   () => [props.item.id, props.item.audioCodec, props.item.compatStatus] as const,
@@ -114,8 +116,8 @@ watch(
       if (await audioDecoderMissingCached(codec)) {
         decoderWarning.value =
           codec === 'ac3'
-            ? '本机缺少 AC-3 解码器，VRChat 将无法播放该视频的音轨。可安装 Dolby Digital Plus 解码器后重启 VRChat 解决。'
-            : '本机缺少 E-AC-3 (Dolby Digital Plus) 解码器，VRChat 将无法播放该视频的音轨。可安装 Dolby 解码器后重启 VRChat 解决。'
+            ? '本机缺少 AC-3 解码器，VRChat 将无法播放该视频的音轨。可转码为 AAC，或安装 Dolby 解码器后重启 VRChat 解决。'
+            : '本机缺少 E-AC-3 (Dolby Digital Plus) 解码器，VRChat 将无法播放该视频的音轨。可转码为 AAC，或安装 Dolby 解码器后重启 VRChat 解决。'
       }
     } catch {
       // 非 Tauri 环境忽略
@@ -123,15 +125,6 @@ watch(
   },
   { immediate: true }
 )
-
-/// 安装 Dolby 解码器（打开微软商店页面）
-async function openDecoderInstall() {
-  try {
-    await openUrl(DOLBY_DECODER_URL)
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
 
 /// 转码产物的「快捷方式」卡片：只允许复制链接 / 跳转源视频位置，不允许再次转码
 const isShortcut = computed(() => props.item.sourceMediaId !== null)
@@ -150,16 +143,25 @@ async function copyUrl(mode: UrlMode, label: string) {
 /// 延迟到下一帧再打开：先让右键菜单完全关闭，避免菜单收起的同一次点击事件
 /// 把刚弹出的对话框立即关掉（表现为对话框一闪而过、屏幕只剩灰色遮罩）。
 function doTranscode() {
+  transcodeStrategy.value = 'smart'
   setTimeout(() => {
     transcodeOpen.value = true
   }, 0)
 }
 
-/// 生成样本：截取视频前 10 秒保存到源视频所在目录，完成后自动打开资源管理器定位
+/// 从「缺解码器」提示进入转码：预设为「仅转音频」（视频直拷 + 音频 AAC）
+function doTranscodeAudio() {
+  transcodeStrategy.value = 'audio'
+  setTimeout(() => {
+    transcodeOpen.value = true
+  }, 0)
+}
+
+/// 生成样本：截取视频正中间的 20 秒保存到源视频所在目录，完成后自动打开资源管理器定位
 async function doSample() {
   try {
     await generateSample(props.item.id)
-    toast.info('正在生成样本（前 10 秒），完成后将打开所在目录')
+    toast.info('正在生成样本（中间 20 秒），完成后将打开所在目录')
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -276,17 +278,18 @@ const menuItems = computed<MenuEntry[]>(() => {
       icon: FileVideo,
       onSelect: doTranscode,
     },
+    // 本机缺少 AC-3/E-AC-3 解码器时提供引导（转码为 AAC / 安装解码器）
     ...(decoderWarning.value
       ? [
           {
             type: 'item' as const,
-            label: '安装 Dolby 解码器（AC-3/E-AC-3）…',
+            label: '缺少音频解码器，如何解决…',
             icon: TriangleAlert,
-            onSelect: openDecoderInstall,
+            onSelect: () => (decoderOpen.value = true),
           },
         ]
       : []),
-    { type: 'item', label: '生成样本（前 10 秒）', icon: Scissors, onSelect: doSample },
+    { type: 'item', label: '生成样本（中间 20 秒）', icon: Scissors, onSelect: doSample },
     { type: 'item', label: '刷新媒体信息', icon: RefreshCw, onSelect: doRefresh },
     { type: 'item', label: '更换封面', icon: ImageIcon, onSelect: changeThumbnail },
     { type: 'item', label: '重命名', icon: Pencil, onSelect: () => emit('rename', props.item) },
@@ -356,9 +359,10 @@ function navigateToConvert() {
         <Badge
           v-if="decoderWarning"
           variant="warning"
-          class="absolute right-2 cursor-help"
+          class="absolute right-2 cursor-pointer"
           :class="item.status === 'ok' && !unsupported ? 'top-2' : 'top-9'"
           :title="decoderWarning"
+          @click.stop="decoderOpen = true"
         >
           <TriangleAlert class="mr-1 h-3 w-3" />
           缺解码器
@@ -417,7 +421,16 @@ function navigateToConvert() {
       </div>
     </div>
     <MediaInfoDialog v-model:open="infoOpen" :item="props.item" />
+    <DecoderMissingDialog
+      v-model:open="decoderOpen"
+      :item="props.item"
+      @transcode="doTranscodeAudio"
+    />
   </ContextMenu>
   <!-- 转码对话框放在菜单触发器之外：避免与右键菜单的打开/关闭相互干扰 -->
-  <TranscodeDialog v-model:open="transcodeOpen" :item="props.item" />
+  <TranscodeDialog
+    v-model:open="transcodeOpen"
+    :item="props.item"
+    :default-strategy="transcodeStrategy"
+  />
 </template>

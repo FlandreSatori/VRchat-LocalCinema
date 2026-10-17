@@ -203,10 +203,22 @@ impl HttpServer {
     }
 }
 
-/// 诊断用中间件：记录对端发现的媒体库接口（/api/*）请求及其来源地址。
-/// 若对端打开「查看他人媒体库」时此处没有对应记录，说明请求根本没到达本机
-/// （多为监听地址为 127.0.0.1 或防火墙拦截）；若有记录，则问题在应用层。
-/// 只记录 /api/*，避免播放期间的 Range 请求刷屏。
+/// 需要完整记录的视频类请求路径：这些请求来自播放器（VRChat/AVPro、浏览器等），
+/// 记录后可与 VRChat 客户端日志（[AVProVideo] Opening / Using playback path）对照。
+/// 排除 /thumb/（封面）与 /（根路径探活），避免 UI 加载时刷屏。
+fn is_media_path(path: &str) -> bool {
+    path.starts_with("/media/")
+        || path.starts_with("/download/")
+        || path.starts_with("/hls/")
+        || (!path.starts_with("/api/") && !path.starts_with("/thumb/") && path.len() > 1)
+}
+
+/// 诊断用中间件：
+/// - 对端媒体库接口（/api/*）记录来源地址；
+/// - 视频类请求（/media/、/{文件名}、/download/、/hls/）完整记录
+///   「谁用什么播放器访问了什么视频」：客户端 IP、User-Agent、Range 原文，
+///   以及响应状态码 / Content-Range / Content-Length（实际发送字节数）。
+///   User-Agent 是判别播放路径的关键：Media Foundation 网络源是 NSPlayer/WMFSDK。
 async fn log_peer_request(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
@@ -217,7 +229,45 @@ async fn log_peer_request(
     if path.starts_with("/api/") {
         tracing::info!("收到对端媒体库请求: {} {} 来自 {}", method, path, addr);
     }
-    next.run(req).await
+    let media = is_media_path(&path);
+    if media {
+        let header_str = |name: header::HeaderName| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        tracing::info!(
+            "媒体请求: {} {} 来自 {} | UA={} | Range={}",
+            method,
+            path,
+            addr,
+            header_str(header::USER_AGENT),
+            header_str(header::RANGE)
+        );
+    }
+
+    let res = next.run(req).await;
+
+    if media {
+        let h = res.headers();
+        let get = |name: header::HeaderName| {
+            h.get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        tracing::info!(
+            "媒体响应: {} {} -> {} | Content-Range={} | Content-Length={}",
+            method,
+            path,
+            res.status().as_u16(),
+            get(header::CONTENT_RANGE),
+            get(header::CONTENT_LENGTH)
+        );
+    }
+    res
 }
 
 /// 返回对等节点的媒体清单（用于房间内互相浏览媒体库）
@@ -688,4 +738,23 @@ fn internal_error(msg: &str) -> Response<Body> {
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::from(msg.to_string()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_paths_are_logged_but_ui_noise_is_not() {
+        // 播放器直连的文件名（VRChat 播放器用的就是这种形式）
+        assert!(is_media_path("/Clerks.1994.%E7%96%AF%E7%8B%82.mkv"));
+        assert!(is_media_path("/media/abc/c1.mkv"));
+        assert!(is_media_path("/download/abc"));
+        assert!(is_media_path("/hls/abc/index.m3u8"));
+        // 封面、根路径探活、对端媒体库接口不记录（避免刷屏）
+        assert!(!is_media_path("/thumb/abc.jpg"));
+        assert!(!is_media_path("/"));
+        assert!(!is_media_path("/api/media"));
+        assert!(!is_media_path("/api/node"));
+    }
 }

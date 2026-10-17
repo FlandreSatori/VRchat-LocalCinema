@@ -1,64 +1,16 @@
 # VRchat-LocalCinema portable packaging script
-# Produces two archives in dist-portable:
-#   VRchat-LocalCinema-v<version>-base.zip  app only (components can be auto/manual downloaded in-app)
-#   VRchat-LocalCinema-v<version>-full.zip  app + bundled components (components\ffmpeg, components\easytier)
+# Produces in dist-portable:
+#   VRchat-LocalCinema-v<version>-base.zip   app only, zipped (components can be auto/manual downloaded in-app)
+#   VRchat-LocalCinema-v<version>-full\      app + workspace components\ copied as-is, NOT zipped
 # Usage:
-#   powershell -File scripts\package-portable.ps1                      # base only unless components\ is ready
-#   powershell -File scripts\package-portable.ps1 -DownloadComponents  # fetch latest components first, then build full
+#   powershell -File scripts\package-portable.ps1
 # Note: keep this file ASCII-only; Windows PowerShell 5.1 misparses non-BOM UTF-8.
 param(
-    [string]$Configuration = "release",
-    [switch]$DownloadComponents
+    [string]$Configuration = "release"
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-
-function Get-LatestAsset {
-    param(
-        [string]$ApiUrl,
-        [scriptblock]$Filter
-    )
-    $headers = @{ "User-Agent" = "VRchat-LocalCinema-packaging" }
-    $release = Invoke-RestMethod -Uri $ApiUrl -Headers $headers
-    foreach ($asset in $release.assets) {
-        if (& $Filter $asset.name) {
-            return @{ Name = $asset.name; Url = $asset.browser_download_url; Version = $release.tag_name }
-        }
-    }
-    throw "No suitable Windows asset found at $ApiUrl - please download manually into components\"
-}
-
-function Install-Component {
-    param(
-        [string]$ApiUrl,
-        [scriptblock]$Filter,
-        [string]$DestDir,
-        [string[]]$Required
-    )
-    New-Item -ItemType Directory -Force -Path $DestDir | Out-Null
-    $asset = Get-LatestAsset -ApiUrl $ApiUrl -Filter $Filter
-    Write-Host "==> Downloading $($asset.Name) ($($asset.Version))..."
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("vlc-comp-" + [Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    try {
-        $zipPath = Join-Path $tmp $asset.Name
-        Invoke-WebRequest -Uri $asset.Url -OutFile $zipPath -UseBasicParsing
-        $extractDir = Join-Path $tmp "x"
-        Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-        # Same as the in-app installer: keep only exe/dll, flattened into dest dir
-        Get-ChildItem -Path $extractDir -Recurse -File |
-            Where-Object { $_.Extension -in ".exe", ".dll" } |
-            ForEach-Object { Copy-Item $_.FullName (Join-Path $DestDir $_.Name) -Force }
-        foreach ($exe in $Required) {
-            if (-not (Test-Path (Join-Path $DestDir $exe))) {
-                throw "Component archive incomplete, missing $exe - download manually into $DestDir"
-            }
-        }
-    } finally {
-        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-    }
-}
 
 Push-Location $root
 try {
@@ -83,22 +35,10 @@ try {
     $exe = Join-Path $root "src-tauri\target\release\vrchat-localcinema.exe"
     if (-not (Test-Path $exe)) { throw "Build output not found: $exe" }
 
-    # ===== Bundled components (used by the full package) =====
+    # ===== Bundled components (copied from the workspace, never re-downloaded here) =====
     $componentsDir = Join-Path $root "components"
-    $ffmpegDir = Join-Path $componentsDir "ffmpeg"
-    $easytierDir = Join-Path $componentsDir "easytier"
-
-    if ($DownloadComponents) {
-        Install-Component -ApiUrl "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" `
-            -Filter { param($n) $n -match "win64-gpl" -and $n -notmatch "shared" -and $n.EndsWith(".zip") } `
-            -DestDir $ffmpegDir -Required @("ffmpeg.exe", "ffprobe.exe")
-        Install-Component -ApiUrl "https://api.github.com/repos/EasyTier/EasyTier/releases/latest" `
-            -Filter { param($n) $n -match "windows-x86_64" -and $n -notmatch "gui" -and $n.EndsWith(".zip") } `
-            -DestDir $easytierDir -Required @("easytier-core.exe", "easytier-cli.exe")
-    }
-
-    $hasFfmpeg = (Test-Path (Join-Path $ffmpegDir "ffmpeg.exe")) -and (Test-Path (Join-Path $ffmpegDir "ffprobe.exe"))
-    $hasEasytier = (Test-Path (Join-Path $easytierDir "easytier-core.exe")) -and (Test-Path (Join-Path $easytierDir "easytier-cli.exe"))
+    $hasFfmpeg = (Test-Path (Join-Path $componentsDir "ffmpeg\ffmpeg.exe")) -and (Test-Path (Join-Path $componentsDir "ffmpeg\ffprobe.exe"))
+    $hasEasytier = (Test-Path (Join-Path $componentsDir "easytier\easytier-core.exe")) -and (Test-Path (Join-Path $componentsDir "easytier\easytier-cli.exe"))
     $fullReady = $hasFfmpeg -and $hasEasytier
 
     # ===== Staging and packaging =====
@@ -108,7 +48,8 @@ try {
     function New-Package {
         param(
             [string]$Name,
-            [switch]$WithComponents
+            [switch]$WithComponents,
+            [switch]$SkipZip
         )
         $stage = Join-Path $outRoot $Name
         if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
@@ -123,6 +64,11 @@ try {
             Copy-Item -Recurse -Force $componentsDir (Join-Path $stage "components")
         }
 
+        if ($SkipZip) {
+            Write-Host "==> Done (folder only, not zipped): $stage"
+            return
+        }
+
         $zip = Join-Path $outRoot "$Name.zip"
         # Compress the staging dir itself: portable.dat is always included and the zip
         # extracts into a named top-level folder.
@@ -130,14 +76,15 @@ try {
         Write-Host "==> Done: $zip"
     }
 
-    # App version drives the package file names (single source: src-tauri\tauri.conf.json)
-    $appVersion = (Get-Content (Join-Path $root "src-tauri\tauri.conf.json") -Raw | ConvertFrom-Json).version
+    # App version drives the package file names (single source: package.json)
+    $appVersion = (Get-Content (Join-Path $root "package.json") -Raw | ConvertFrom-Json).version
 
     New-Package -Name "VRchat-LocalCinema-v$appVersion-base"
     if ($fullReady) {
-        New-Package -Name "VRchat-LocalCinema-v$appVersion-full" -WithComponents
+        # Full package is staged as a plain folder only (no zip): components\ is copied as-is.
+        New-Package -Name "VRchat-LocalCinema-v$appVersion-full" -WithComponents -SkipZip
     } else {
-        Write-Warning "Components incomplete - full package skipped. Run scripts\package-portable.ps1 -DownloadComponents to fetch them."
+        Write-Warning "components\ incomplete (need ffmpeg\ffmpeg.exe+ffprobe.exe and easytier\easytier-core.exe+easytier-cli.exe) - full folder skipped."
     }
 } finally {
     Pop-Location

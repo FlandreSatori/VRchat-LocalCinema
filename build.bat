@@ -2,11 +2,10 @@
 REM ============================================================
 REM  VRchat-LocalCinema - build from source and package portable
 REM  Produces dist-portable\VRchat-LocalCinema-v<version>-base.zip
-REM          dist-portable\VRchat-LocalCinema-v<version>-full.zip (needs components\)
+REM          dist-portable\VRchat-LocalCinema-v<version>-full\  (app + components\, folder only, NOT zipped)
 REM
 REM  Usage:
-REM    build.bat                      build base (and full if components ready)
-REM    build.bat -DownloadComponents  also fetch latest ffmpeg/easytier first
+REM    build.bat
 REM
 REM  Keep this file ASCII-only: cmd.exe misparses non-ASCII without chcp.
 REM ============================================================
@@ -20,8 +19,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo ==^> Step 1/2: building frontend + Rust app + portable zips via scripts\package-portable.ps1 ...
-powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package-portable.ps1" %*
+echo ==^> Step 1/2: building frontend + Rust app + portable output via scripts\package-portable.ps1 ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\package-portable.ps1"
 set EC=%ERRORLEVEL%
 if not "%EC%"=="0" (
     echo.
@@ -37,10 +36,10 @@ if exist "dist-portable\VRchat-LocalCinema-v*-base.zip" (
 ) else (
     echo [WARN] base zip not found
 )
-if exist "dist-portable\VRchat-LocalCinema-v*-full.zip" (
-    echo [OK] dist-portable\VRchat-LocalCinema-v*-full.zip
+if exist "dist-portable\VRchat-LocalCinema-v*-full" (
+    echo [OK] dist-portable\VRchat-LocalCinema-v*-full\
 ) else (
-    echo [WARN] full zip not found - run: build.bat -DownloadComponents
+    echo [WARN] full folder not found - put ffmpeg/easytier binaries into components\ first
 )
 
 echo.

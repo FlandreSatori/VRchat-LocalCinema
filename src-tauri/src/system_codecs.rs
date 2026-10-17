@@ -1,10 +1,13 @@
 //! 系统音频解码器检测（仅 Windows）。
 //!
-//! VRChat（AVPro）通过 Windows Media Foundation 解码音频。原生 Windows 不自带
-//! AC-3 / E-AC-3 解码器（需安装 Dolby 解码器包），因此「白名单兼容」的文件仍可能
-//! 因本机缺少解码器而无法在 VRChat 播放。本模块用 MFTEnumEx 枚举系统音频解码器，
-//! 与 AVPro 的枚举路径一致；Store 安装的解码器是打包型 MFT，只出现在该 API 中
-//!（注册表里查不到），故必须走 API 而非注册表。
+//! VRChat（AVPro）通过 Windows Media Foundation 解码音频。Windows 11 24H2 起系统
+//! 不再自带 AC-3 / E-AC-3 解码器（需单独安装 Dolby 解码器包），因此「白名单兼容」
+//! 的文件仍可能因本机缺少解码器而无法在 VRChat 播放。本模块用 MFTEnumEx 枚举
+//! 「能把 AC-3/E-AC-3 解码成 PCM」的系统音频解码器，与 AVPro 的枚举路径一致。
+//!
+//! 注意：Store/Appx 安装的解码器属于打包型 MFT，**不会**出现在
+//! `HKLM\SOFTWARE\Classes\MediaFoundation\Transforms` 注册表路径下，因此只能走
+//! MFTEnumEx 这条 API，不能查注册表。
 
 #[cfg(windows)]
 use std::collections::HashMap;
@@ -28,9 +31,10 @@ pub fn audio_decoder_available(_codec: &str) -> bool {
 #[cfg(windows)]
 pub fn audio_decoder_available(codec: &str) -> bool {
     use windows::Win32::Media::MediaFoundation::{
-        MFShutdown, MFStartup, MFTEnumEx, IMFActivate, MFMediaType_Audio, MFSTARTUP_LITE,
-        MF_VERSION, MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_ASYNCMFT, MFT_ENUM_FLAG_LOCALMFT,
-        MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_REGISTER_TYPE_INFO,
+        MFAudioFormat_PCM, MFShutdown, MFStartup, MFTEnumEx, IMFActivate, MFMediaType_Audio,
+        MFSTARTUP_LITE, MF_VERSION, MFT_CATEGORY_AUDIO_DECODER, MFT_ENUM_FLAG_ASYNCMFT,
+        MFT_ENUM_FLAG_LOCALMFT, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+        MFT_REGISTER_TYPE_INFO,
     };
     use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
@@ -56,31 +60,38 @@ pub fn audio_decoder_available(codec: &str) -> bool {
 
     let result = unsafe {
         // MTA 初始化可能因线程已有模式而失败，忽略即可
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if MFStartup(MF_VERSION, MFSTARTUP_LITE).is_err() {
+        let co_init_result = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let need_uninit = co_init_result.is_ok();
+        
+        let detected = if MFStartup(MF_VERSION, MFSTARTUP_LITE).is_err() {
+            // MF 启动失败按「有解码器」处理（保守值）
             true
         } else {
-            let info = MFT_REGISTER_TYPE_INFO {
+            let in_info = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Audio,
                 guidSubtype: subtype,
             };
+            // 必须同时限定输出为 PCM，否则会把 IEC-61937 直通器（那是「打包器」，
+            // 不是解码器，如 A7E6022F-…）也算进来，造成「有解码器」的假阳性——
+            // 这正是早期版本报 ac3 available = true 却仍无法播放的原因。
+            let out_info = MFT_REGISTER_TYPE_INFO {
+                guidMajorType: MFMediaType_Audio,
+                guidSubtype: MFAudioFormat_PCM,
+            };
             let mut count = 0u32;
             let mut activates: *mut Option<IMFActivate> = std::ptr::null_mut();
-            let ok = MFTEnumEx(
+            let enum_result = MFTEnumEx(
                 MFT_CATEGORY_AUDIO_DECODER,
-                // 同时枚举同步与异步 MFT：Store 安装的 Dolby 解码器可能注册为异步 MFT，
-                // 只查同步 MFT 会漏报为「缺少解码器」。
+                // 一并枚举同步/异步 MFT，避免漏掉注册为异步的解码器。
                 MFT_ENUM_FLAG_SYNCMFT
                     | MFT_ENUM_FLAG_ASYNCMFT
                     | MFT_ENUM_FLAG_LOCALMFT
                     | MFT_ENUM_FLAG_SORTANDFILTER,
-                Some(&info),
-                None,
+                Some(&in_info),
+                Some(&out_info),
                 &mut activates,
                 &mut count,
-            )
-            .is_ok()
-                && count > 0;
+            );
             if !activates.is_null() {
                 // 数组由 CoTaskMemAlloc 分配，Rust 不会对其运行析构：
                 // 必须逐个取出 IMFActivate 并释放（Drop → Release），否则泄漏 COM 引用
@@ -93,8 +104,14 @@ pub fn audio_decoder_available(codec: &str) -> bool {
                 CoTaskMemFree(Some(activates.cast()));
             }
             let _ = MFShutdown();
-            ok
+            // 枚举失败按「有解码器」处理（保守值，避免误报引导用户安装）
+            enum_result.is_err() || count > 0
+        };
+        
+        if need_uninit {
+            windows::Win32::System::Com::CoUninitialize();
         }
+        detected
     };
 
     if let Ok(mut map) = cache.lock() {
