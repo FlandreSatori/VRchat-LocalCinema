@@ -19,6 +19,7 @@ import {
   Scissors,
   Check,
   TriangleAlert,
+  ExternalLink,
 } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { open } from '@tauri-apps/plugin-dialog'
@@ -40,6 +41,7 @@ import {
   removeMedia,
   generateSample,
   audioDecoderMissingCached,
+  openUrl,
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
@@ -128,6 +130,19 @@ watch(
 
 /// 转码产物的「快捷方式」卡片：只允许复制链接 / 跳转源视频位置，不允许再次转码
 const isShortcut = computed(() => props.item.sourceMediaId !== null)
+
+/// 在线（B 站）条目：无本机文件，只提供本机代理播放链接
+const isOnline = computed(() => props.item.sourceKind === 'online')
+
+/// 在浏览器中打开在线视频的原页面
+async function openSource() {
+  if (!props.item.sourceUrl) return
+  try {
+    await openUrl(props.item.sourceUrl)
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
 
 async function copyUrl(mode: UrlMode, label: string) {
   try {
@@ -233,6 +248,18 @@ async function doRemove() {
 }
 
 const menuItems = computed<MenuEntry[]>(() => {
+  // 在线（B 站）条目：只有本机代理链接，不能本地播放/转码；可直接打开 B 站原页面
+  if (isOnline.value) {
+    return [
+      { type: 'item', label: '复制本机 URL', icon: Copy, onSelect: () => copyUrl('localhost', '本机 URL') },
+      { type: 'separator' },
+      { type: 'item', label: '在浏览器打开 B 站页面', icon: ExternalLink, onSelect: openSource },
+      { type: 'item', label: '查看视频信息', icon: Info, onSelect: () => (infoOpen.value = true) },
+      { type: 'item', label: '更换封面', icon: ImageIcon, onSelect: changeThumbnail },
+      { type: 'separator' },
+      { type: 'item', label: '从媒体库移除', icon: Trash2, danger: true, onSelect: doRemove },
+    ]
+  }
   // 转码产物的「快捷方式」卡片：仅复制链接 / 查看信息 / 跳转源位置，不得再次转码
   if (isShortcut.value) {
     return [
@@ -357,6 +384,15 @@ function navigateToConvert() {
           转码产物
         </Badge>
         <Badge
+          v-if="isOnline"
+          variant="secondary"
+          class="absolute top-2 cursor-help"
+          :class="selectable ? 'left-10' : 'left-2'"
+          title="在线视频：由本软件在你的电脑上转发 B 站官方 CDN 流，免登录上限 720P"
+        >
+          在线 · 720P
+        </Badge>
+        <Badge
           v-if="decoderWarning"
           variant="warning"
           class="absolute right-2 cursor-pointer"
@@ -394,6 +430,13 @@ function navigateToConvert() {
           <span>·</span>
           <span class="uppercase">{{ item.format }}</span>
         </div>
+        <div
+          v-if="isOnline"
+          class="mt-0.5 line-clamp-2 break-all text-xs text-muted-foreground"
+          title="B 站免登录在线播放上限 720P；需要 1080P 及以上清晰度时，请用 JJdown（唧唧）下载视频后，用「导入视频」导入成本地视频"
+        >
+          最高 720P；1080P+ 请用 JJdown 下载后导入
+        </div>
         <div v-if="unsupported && !isShortcut" class="mt-0.5 line-clamp-2 break-all text-xs text-destructive" :title="item.compatReason ?? ''">
           {{ item.compatReason ?? '不支持该视频格式或编码组合' }}
         </div>
@@ -401,6 +444,20 @@ function navigateToConvert() {
           <Button size="sm" variant="outline" :disabled="busy" class="h-7 flex-1 px-2 text-xs" title="打开转码设置：可选全部转码或分段转码、音轨与字幕" @click="doTranscode">
             <FileVideo class="h-3 w-3" />
             转码为…
+          </Button>
+        </div>
+        <div v-else-if="isOnline" class="mt-2 flex gap-1.5">
+          <Button
+            size="sm"
+            class="h-7 flex-1 px-2 text-xs"
+            title="复制本机播放链接（在 VRChat 中播放，免登录上限 720P）"
+            @click="emit('copy-link', item)"
+          >
+            <Link class="h-3 w-3" />
+            复制播放链接
+          </Button>
+          <Button size="sm" variant="outline" class="h-7 px-2" title="在浏览器打开 B 站页面" @click="openSource">
+            <ExternalLink class="h-3 w-3" />
           </Button>
         </div>
         <div v-else-if="isShortcut" class="mt-2 flex gap-1.5">

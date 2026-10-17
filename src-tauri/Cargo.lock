@@ -839,6 +839,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "dbus"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4409,6 +4422,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "561cd99484561bc39c954768e7b41a66cebbe1ac3d9d081c34361f740c489e2c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
+]
+
+[[package]]
 name = "tauri-runtime"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5050,11 +5079,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vrchat-localcinema"
-version = "1.3.3"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "axum",
  "blake3",
+ "dashmap",
  "futures-util",
  "hex",
  "http-range-header",
@@ -5072,6 +5102,7 @@ dependencies = [
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

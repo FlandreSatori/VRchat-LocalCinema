@@ -178,7 +178,10 @@ const audioOptions = computed<SelectOption[]>(() => {
 const subtitleOptions = computed<SelectOption[]>(() => [
   { value: 'drop', label: '不烧录字幕' },
   ...subtitleStreams.value.filter(s => s.textSubtitle || s.graphicSubtitle).map(s => ({
-    value: `burn:${s.index}`, label: `烧录 · #${s.index} ${describeStream(s)}`,
+    value: `burn:${s.index}`,
+    label: s.sidecarPath
+      ? `烧录 · 外挂字幕「${s.title ?? '同目录字幕'}」${s.language ? ` · ${s.language}` : ''}`
+      : `烧录 · #${s.index} ${describeStream(s)}`,
   })),
 ])
 
@@ -372,12 +375,13 @@ const planSummary = computed(() => {
   if (audioStream.value === 'none') parts.push('无音频')
   else parts.push(audioMode.value === 'copy' ? '音频直拷' : `音频 AAC ${audioBitrate.value}`)
   const [mode, index] = subtitleChoice.value.split(':')
+  const chosenSub = mode === 'burn' ? subtitleStreams.value.find(s => String(s.index) === index) : undefined
   parts.push(
     mode === 'burn'
       ? '字幕烧录进画面'
       : '不带字幕'
   )
-  if (mode !== 'drop') parts.push(`字幕 #${index}`)
+  if (mode !== 'drop') parts.push(chosenSub?.sidecarPath ? `字幕「${chosenSub.title ?? '外挂字幕'}」` : `字幕 #${index}`)
   return parts.join(' · ')
 })
 

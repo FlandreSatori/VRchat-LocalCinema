@@ -1,3 +1,4 @@
+pub mod bilibili;
 pub mod commands;
 pub mod compat;
 pub mod components;
@@ -31,6 +32,15 @@ use settings::CloseBehavior;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 阶段 3.2：单实例保护，防僵尸进程
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tracing::info!("尝试启动第二个实例");
+            // 显示已有实例的主窗口
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -187,6 +197,7 @@ pub fn run() {
             commands::restart_server,
             commands::list_media,
             commands::import_files,
+            commands::import_online_video,
             commands::refresh_media,
             commands::remove_media,
             commands::set_custom_thumbnail,

@@ -17,6 +17,7 @@ import {
   FolderInput,
   FileVideo,
   Check,
+  Link,
 } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Button from '../components/ui/Button.vue'
@@ -41,6 +42,7 @@ import {
   importMediaPaths,
   removeMediaItem,
   loadFolders,
+  upsertMedia,
 } from '../lib/store'
 import {
   createFolder,
@@ -55,6 +57,7 @@ import {
   revealPath,
   getEasytierStatus,
   getRoomInfo,
+  importOnlineVideo,
 } from '../lib/api'
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
@@ -210,6 +213,36 @@ async function importViaDialog() {
     }
   } catch (e) {
     toast.error(errMsg(e))
+  }
+}
+
+// ---------- 在线视频导入（B 站） ----------
+
+const onlineDialog = reactive({ open: false, url: '' })
+const onlineImporting = ref(false)
+
+function openOnlineDialog() {
+  onlineDialog.url = ''
+  onlineDialog.open = true
+}
+
+async function submitOnlineImport() {
+  const url = onlineDialog.url.trim()
+  if (!url) {
+    toast.error('请粘贴 B 站视频链接')
+    return
+  }
+  if (onlineImporting.value) return
+  onlineImporting.value = true
+  try {
+    const item = await importOnlineVideo(url)
+    upsertMedia(item)
+    toast.success(`已导入在线视频「${item.title}」`)
+    onlineDialog.open = false
+  } catch (e) {
+    toast.error(errMsg(e))
+  } finally {
+    onlineImporting.value = false
   }
 }
 
@@ -441,14 +474,14 @@ async function submitBatchMove() {
 const batchTranscodeOpen = ref(false)
 const batchTranscodeCount = ref(0)
 
-/// 可转码的选中条目：跳过转码产物卡片与已在队列中的条目
+/// 可转码的选中条目：跳过转码产物卡片、在线视频与已在队列中的条目
 function transcodeCandidates(): string[] {
   return [...selectedIds.value].filter((id) => {
     const item = mediaStore.items.find((m) => m.id === id)
     const busy = convertTaskStore.tasks.some(
       (t) => t.mediaId === id && (t.state === 'queued' || t.state === 'running')
     )
-    return !!item && item.sourceMediaId === null && !busy
+    return !!item && item.sourceMediaId === null && item.sourceKind !== 'online' && !busy
   })
 }
 
@@ -638,6 +671,10 @@ onUnmounted(() => {
         <Button variant="outline" :disabled="importing" @click="openCreateFolder">
           <FolderPlus class="h-4 w-4" />
           新建文件夹
+        </Button>
+        <Button variant="outline" @click="openOnlineDialog">
+          <Link class="h-4 w-4" />
+          导入B站视频
         </Button>
         <Button :disabled="importing" @click="importViaDialog">
           <Loader2 v-if="importing" class="h-4 w-4 animate-spin" />
@@ -952,6 +989,37 @@ onUnmounted(() => {
         <div class="flex justify-end gap-2">
           <Button type="button" variant="outline" @click="batchMoveOpen = false">取消</Button>
           <Button type="submit">移动</Button>
+        </div>
+      </form>
+    </Dialog>
+
+    <!-- 导入 B 站在线视频 -->
+    <Dialog
+      :open="onlineDialog.open"
+      title="导入B站视频"
+      description="粘贴 B 站视频链接，直接生成可在线播放（免登录上限 720P）的媒体卡片"
+      @update:open="onlineDialog.open = $event"
+    >
+      <form class="space-y-4" @submit.prevent="submitOnlineImport">
+        <div class="space-y-1.5">
+          <label class="text-sm font-medium">B 站视频链接</label>
+          <Input
+            v-model="onlineDialog.url"
+            placeholder="https://www.bilibili.com/video/BV..."
+            autofocus
+            :disabled="onlineImporting"
+          />
+        </div>
+        <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          在线播放最高 720P（B 站免登录限制），播放链路为「本软件本机代理 B 站官方 CDN」。
+          需要 1080P 及以上清晰度时，请用 JJdown（唧唧）下载视频，再用「导入视频」导入，即可获得本地媒体卡片与完整画质。
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button type="button" variant="outline" :disabled="onlineImporting" @click="onlineDialog.open = false">取消</Button>
+          <Button type="submit" :disabled="onlineImporting">
+            <Loader2 v-if="onlineImporting" class="h-4 w-4 animate-spin" />
+            导入
+          </Button>
         </div>
       </form>
     </Dialog>

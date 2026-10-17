@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
@@ -35,6 +36,19 @@ struct MediaState {
     hls_dir: PathBuf,
     /// 是否允许对等节点查看本机媒体库（关闭时 /api/media 返回空清单）
     allow_peer_view: Arc<std::sync::atomic::AtomicBool>,
+    /// 在线视频（B 站）直链缓存：媒体 id → 官方 CDN 直链与其过期时间
+    online_links: Arc<Mutex<HashMap<String, CachedLink>>>,
+    /// 已校验路径缓存：文件名 → (规范化路径, 校验时间)，TTL 60s
+    /// 用于避免每次 Range 请求重复执行 safe_registered_file + File::open
+    validated_paths: Arc<dashmap::DashMap<String, (PathBuf, Instant)>>,
+}
+
+/// 在线视频的官方 CDN 直链缓存条目
+#[derive(Clone)]
+struct CachedLink {
+    url: String,
+    /// Unix 秒，直链失效时间（来自 URL 的 `deadline` 参数）
+    expires_at: i64,
 }
 
 #[derive(Clone)]
@@ -63,6 +77,8 @@ impl HttpServer {
                 thumb_dir: thumb_dir.to_path_buf(),
                 hls_dir: hls_dir.to_path_buf(),
                 allow_peer_view,
+                online_links: Arc::new(Mutex::new(HashMap::new())),
+                validated_paths: Arc::new(dashmap::DashMap::new()),
             },
             tx: Arc::new(RwLock::new(None)),
         }
@@ -115,6 +131,7 @@ impl HttpServer {
             .route("/api/node", get(api_node))
             .route("/download/{id}", get(serve_download))
             .route("/hls/{id}/{*file}", get(serve_hls))
+            .route("/online/{id}", get(serve_online))
             .route("/", get(|| async { "VRchat-LocalCinema" }))
             .route("/{file_name}", get(serve_media_basename))
             .layer(ConcurrencyLimitLayer::new(64))
@@ -362,6 +379,39 @@ async fn serve_download(
     resp
 }
 
+/// 阶段 2A：已校验路径缓存的有效期
+const VALIDATED_PATH_TTL: Duration = Duration::from_secs(60);
+/// 缓存条目上限：超出时顺手清理过期项，避免长期运行无限增长
+const VALIDATED_PATH_MAX: usize = 512;
+
+/// 读取「已校验路径缓存」：命中且未过期时返回路径，过期条目立即清除。
+///
+/// 先克隆出路径再释放 DashMap 分片读锁，避免把读锁带过 `serve_file` 的 await。
+fn cached_valid_path(state: &MediaState, key: &str) -> Option<PathBuf> {
+    let entry = state.validated_paths.get(key)?;
+    let path = entry.value().0.clone();
+    let validated_at = entry.value().1;
+    drop(entry);
+    if validated_at.elapsed() < VALIDATED_PATH_TTL {
+        Some(path)
+    } else {
+        state.validated_paths.remove(key);
+        None
+    }
+}
+
+/// 写入「已校验路径缓存」；条目数超上限时清理过期项。
+fn cache_valid_path(state: &MediaState, key: &str, path: &Path) {
+    state
+        .validated_paths
+        .insert(key.to_string(), (path.to_path_buf(), Instant::now()));
+    if state.validated_paths.len() > VALIDATED_PATH_MAX {
+        state
+            .validated_paths
+            .retain(|_, (_, at)| at.elapsed() < VALIDATED_PATH_TTL);
+    }
+}
+
 async fn serve_media_basename(
     State(state): State<MediaState>,
     AxumPath(file_name): AxumPath<String>,
@@ -371,6 +421,12 @@ async fn serve_media_basename(
     if !crate::url_builder::valid_basename(&file_name) {
         return not_found();
     }
+
+    // 阶段 2A：已校验路径缓存优先，命中即跳过全部校验与库查询
+    if let Some(cached_path) = cached_valid_path(&state, &file_name) {
+        return serve_file(&cached_path, &method, &headers).await;
+    }
+
     enum Target {
         Media(PathBuf),
         Hls { id: String, path: PathBuf },
@@ -388,8 +444,12 @@ async fn serve_media_basename(
                             id: hls_item.id.clone(),
                             path: state.hls_dir.join(&hls_item.id).join("index.m3u8"),
                         },
-                        Ok(None) => return not_found(),
+                        Ok(None) => {
+                            tracing::warn!("404: HLS 播放列表库查询未命中 file_name={}", file_name);
+                            return not_found();
+                        }
                         Err(e) => {
+                            tracing::error!("HLS 播放列表查询出错（返回 409）file_name={} err={}", file_name, e);
                             return Response::builder()
                                 .status(StatusCode::CONFLICT)
                                 .body(Body::from(e.to_string()))
@@ -397,10 +457,12 @@ async fn serve_media_basename(
                         }
                     }
                 } else {
+                    tracing::warn!("404: 库查询未命中 file_name={}", file_name);
                     return not_found();
                 }
             }
             Err(e) => {
+                tracing::error!("库查询出错（返回 409）file_name={} err={}", file_name, e);
                 return Response::builder()
                     .status(StatusCode::CONFLICT)
                     .body(Body::from(e.to_string()))
@@ -444,9 +506,13 @@ async fn serve_media_basename(
             resp
         }
         Target::Media(path) => {
+            // 走完整校验路径，成功后写入缓存
             if !crate::media_library::safe_registered_file(&path) {
+                tracing::warn!("404: safe_registered_file 返回 false, path={:?}", path);
                 return not_found();
             }
+            // 校验通过，写入缓存（后续 Range 请求将跳过校验）
+            cache_valid_path(&state, &file_name, &path);
             serve_file(&path, &method, &headers).await
         }
     }
@@ -458,6 +524,12 @@ async fn serve_media(
     method: Method,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // 阶段 2A：与 /{文件名} 路由共用同一份「已校验路径缓存」。
+    // 键以 "/media/" 前缀区分（文件名不可能含 '/'，故不会与 basename 键冲突）。
+    let cache_key = format!("/media/{}", id);
+    if let Some(cached_path) = cached_valid_path(&state, &cache_key) {
+        return serve_file(&cached_path, &method, &headers).await.into_response();
+    }
     let item = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         match db.get(&id) {
@@ -469,6 +541,7 @@ async fn serve_media(
     if !crate::media_library::safe_registered_file(&path) {
         return not_found().into_response();
     }
+    cache_valid_path(&state, &cache_key, &path);
     serve_file(&path, &method, &headers).await.into_response()
 }
 
@@ -553,6 +626,155 @@ async fn serve_hls(
     resp.into_response()
 }
 
+/// 在线视频（B 站）反向代理：/online/{id}
+///
+/// 把本软件媒体库中的「在线条目」映射为可被 VRChat 直接播放的本机链接。
+/// 实际字节来自 B 站官方 CDN（`upos-*.bilivideo.com`），本路由只做：
+/// 1. 从库中取该条目的 bvid/cid，解析（或复用缓存）官方单文件 MP4 直链；
+/// 2. 原样转发请求（含 Range）到 CDN 并流式回传，因此可 seek；
+/// 3. 直链过期（含 `deadline` 签名，约 2 小时）时自动重新解析；CDN 返回 403/410 时重试一次。
+///
+/// 仅在环回地址（127.0.0.1）使用，绝不生成局域网链接。
+async fn serve_online(
+    State(state): State<MediaState>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !is_safe_id(&id) {
+        return not_found();
+    }
+    // 1. 取在线条目的 bvid / cid
+    let key = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        match db.get(&id) {
+            Ok(Some(item)) if item.source_kind == "online" => item.file_path,
+            _ => return not_found(),
+        }
+    };
+    let Some((bvid, cid)) = crate::bilibili::parse_online_key(&key) else {
+        return not_found();
+    };
+
+    // 2. 取直链（缓存命中且未临近过期时直接复用）
+    let now = crate::bilibili::now_secs();
+    let cached = {
+        let cache = state.online_links.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .get(&id)
+            .filter(|e| e.expires_at - 60 > now)
+            .map(|e| e.url.clone())
+    };
+    let url = match cached {
+        Some(u) => u,
+        None => match resolve_and_cache(&state, &id, &bvid, cid).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("在线视频 {} 解析直链失败: {}", id, e);
+                return bad_gateway(&e);
+            }
+        },
+    };
+
+    // 3. 转发到 CDN；直链失效（403/410）时重解析并重试一次
+    let resp = forward_to_cdn(&url, &method, &headers).await;
+    if matches!(
+        resp.status(),
+        StatusCode::FORBIDDEN | StatusCode::GONE | StatusCode::UNAUTHORIZED
+    ) {
+        tracing::warn!(
+            "在线视频 {} 直链返回 {}，重新解析后重试",
+            id,
+            resp.status()
+        );
+        {
+            let mut cache = state.online_links.lock().unwrap_or_else(|e| e.into_inner());
+            cache.remove(&id);
+        }
+        if let Ok(fresh) = resolve_and_cache(&state, &id, &bvid, cid).await {
+            return forward_to_cdn(&fresh, &method, &headers).await;
+        }
+    }
+    resp
+}
+
+/// 解析官方直链并写入缓存
+async fn resolve_and_cache(
+    state: &MediaState,
+    id: &str,
+    bvid: &str,
+    cid: i64,
+) -> Result<String, String> {
+    let link = crate::bilibili::resolve_play_url(bvid, cid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut cache = state.online_links.lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        id.to_string(),
+        CachedLink {
+            url: link.url.clone(),
+            expires_at: link.expires_at,
+        },
+    );
+    Ok(link.url)
+}
+
+/// 原样转发请求到 B 站官方 CDN（注入浏览器 UA 与 Referer，透传 Range），流式回传正文。
+async fn forward_to_cdn(url: &str, method: &Method, req_headers: &HeaderMap) -> Response<Body> {
+    let mut rb = crate::bilibili::stream_client()
+        .request(reqwest::Method::GET, url)
+        .header(reqwest::header::REFERER, "https://www.bilibili.com/");
+    if let Some(range) = req_headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        rb = rb.header(reqwest::header::RANGE, range.to_string());
+    }
+    let upstream = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => return bad_gateway(&format!("访问 B 站 CDN 失败: {}", e)),
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+    {
+        let out_headers = builder.headers_mut().unwrap();
+        // 只透传与播放/寻址相关的响应头，避免把 CDN 的连接类头直接带回去
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::CONTENT_RANGE,
+            header::ACCEPT_RANGES,
+            header::LAST_MODIFIED,
+            header::ETAG,
+        ] {
+            if let Some(v) = upstream.headers().get(&name) {
+                out_headers.insert(name, v.clone());
+            }
+        }
+    }
+    let body = if *method == Method::HEAD {
+        Body::empty()
+    } else {
+        Body::from_stream(upstream.bytes_stream())
+    };
+    builder
+        .body(body)
+        .unwrap_or_else(|_| internal_error("构建在线播放响应失败"))
+}
+
+/// 媒体 id 形如 UUID（36 位十六进制 + 连字符）
+fn is_safe_id(id: &str) -> bool {
+    id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+fn bad_gateway(msg: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from(msg.to_string()))
+        .unwrap()
+}
+
 fn sanitize_thumb_path(base: &Path, input: &str) -> Option<PathBuf> {
     let decoded = percent_decode(input);
     let cleaned = decoded.replace('\\', "/");
@@ -614,11 +836,17 @@ fn percent_decode(s: &str) -> String {
 async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Response<Body> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        Err(_) => return not_found(),
+        Err(e) => {
+            tracing::warn!("404: File::open 失败, path={:?} err={}", path, e);
+            return not_found();
+        }
     };
     let meta = match file.metadata().await {
         Ok(m) => m,
-        Err(_) => return not_found(),
+        Err(e) => {
+            tracing::warn!("404: metadata 失败, path={:?} err={}", path, e);
+            return not_found();
+        }
     };
     let total_len = meta.len();
     if total_len == 0 {
@@ -652,7 +880,8 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                     let body_stream = match file.seek(std::io::SeekFrom::Start(start)).await {
                         Ok(_) => {
                             let limited = file.take(length);
-                            let stream = ReaderStream::new(limited);
+                            // 阶段 3.1：加大读缓冲到 256KB，覆盖 MF 4-16 次 Range 步进
+                            let stream = ReaderStream::with_capacity(limited, 256 * 1024);
                             Body::from_stream(stream)
                         }
                         Err(_) => {
@@ -712,7 +941,8 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
             .unwrap();
     }
 
-    let stream = ReaderStream::new(file);
+    // 阶段 3.1：加大读缓冲到 256KB
+    let stream = ReaderStream::with_capacity(file, 256 * 1024);
     Response::builder()
         .status(StatusCode::OK)
         .header(

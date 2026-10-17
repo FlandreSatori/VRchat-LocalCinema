@@ -309,6 +309,59 @@ async fn test_duplicate_names_resolve_case_sensitively() {
 }
 
 #[test]
+fn test_online_media_url_is_localhost_only_and_excluded_from_peers() {
+    let dir = PathBufWrap(std::env::temp_dir().join(format!("vlc-online-{}", uuid::Uuid::new_v4())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let db = Db::open(&dir.0.join("library.db")).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let key = app_lib::bilibili::online_key("BV1tFjz6eEtp", 39240534069);
+    assert_eq!(
+        app_lib::bilibili::parse_online_key(&key),
+        Some(("BV1tFjz6eEtp".to_string(), 39240534069))
+    );
+
+    let (item, created) = db
+        .register_online(
+            &id,
+            "在线测试",
+            "在线测试.mp4",
+            &key,
+            1234,
+            Some(2_210_000),
+            None,
+            "https://www.bilibili.com/video/BV1tFjz6eEtp/",
+        )
+        .unwrap();
+    assert!(created);
+    assert_eq!(item.source_kind, "online");
+    assert_eq!(item.status, app_lib::media_library::MediaStatus::Ok);
+    assert_eq!(item.source_url.as_deref(), Some("https://www.bilibili.com/video/BV1tFjz6eEtp/"));
+
+    // 同一视频重复导入 → 复用既有条目，不重复登记
+    let (again, created2) = db
+        .register_online(&id, "在线测试", "在线测试.mp4", &key, 1234, None, None, "u")
+        .unwrap();
+    assert!(!created2);
+    assert_eq!(again.id, item.id);
+
+    // 本机模式：回环地址的代理链接
+    let input = UrlInput { mode: UrlMode::Localhost, port: 17001, lan_ip: None };
+    assert_eq!(
+        build_media_url(&item, &input).unwrap(),
+        format!("http://127.0.0.1:17001/online/{}", item.id)
+    );
+    // 局域网模式：仍然只生成本机链接（绝不暴露给同房间其他机器）
+    let input_lan = UrlInput { mode: UrlMode::Lan, port: 17001, lan_ip: Some("192.168.1.10".into()) };
+    let lan_url = build_media_url(&item, &input_lan).unwrap();
+    assert!(lan_url.starts_with("http://127.0.0.1:17001/online/"), "{}", lan_url);
+    assert!(!lan_url.contains("192.168.1.10"));
+
+    // 在线条目不参与对等节点媒体清单，但仍出现在本地媒体库列表中
+    assert!(db.list_summaries().unwrap().is_empty());
+    assert_eq!(db.list().unwrap().len(), 1);
+}
+
+#[test]
 fn test_settings_persistence() {
     let dir = std::env::temp_dir().join(format!("vlc-test-set-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();

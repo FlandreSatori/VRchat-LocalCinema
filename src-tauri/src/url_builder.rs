@@ -51,6 +51,11 @@ pub struct UrlInput {
 }
 
 pub fn build_media_url(item: &MediaItem, input: &UrlInput) -> Result<String, String> {
+    // 在线流媒体条目：字节由本软件经 HTTP 代理转发，只允许本机回环地址，
+    // 绝不生成局域网链接（避免把「用户自己电脑上的 B 站会话」暴露给同房间其他机器）。
+    if item.source_kind == "online" {
+        return Ok(format!("http://127.0.0.1:{}/online/{}", input.port, item.id));
+    }
     if !valid_basename(&item.file_name) {
         return Err("文件名不能映射为播放 URL".to_string());
     }

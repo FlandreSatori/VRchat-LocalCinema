@@ -48,7 +48,8 @@ pub enum CloseBehavior {
 
 impl Default for CloseBehavior {
     fn default() -> Self {
-        CloseBehavior::Exit
+        // 阶段 3.3：默认最小化到托盘，避免误关闭导致服务停止
+        CloseBehavior::Tray
     }
 }
 
@@ -190,7 +191,7 @@ impl Default for Settings {
             default_player_args: String::new(),
             thumb_dir: String::new(),
             autostart: false,
-            close_behavior: CloseBehavior::Exit,
+            close_behavior: CloseBehavior::Tray,
             ffmpeg_path: String::new(),
             ffprobe_path: String::new(),
             easytier_core_path: String::new(),

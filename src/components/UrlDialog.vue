@@ -75,6 +75,9 @@ const segmentTask = computed(() =>
 
 const sourceId = computed(() => props.item?.sourceMediaId ?? props.item?.id ?? null)
 
+/// 在线（B 站）条目：只提供本机播放链接，且没有分段概念
+const isOnline = computed(() => props.item?.sourceKind === 'online')
+
 onUnmounted(() => {
   unlisten?.()
 })
@@ -91,6 +94,13 @@ watch(
     segmentHint.value = ''
     if (!isOpen || !props.item) return
     format.value = props.initialFormat ?? 'whole'
+    // 在线视频只有本机链接、没有分段：直接按本机模式生成
+    if (isOnline.value) {
+      mode.value = 'localhost'
+      format.value = 'whole'
+      await rebuild()
+      return
+    }
     try {
       const settings = await loadSettings()
       if (ticket !== rebuildGeneration) return
@@ -191,7 +201,12 @@ async function openInBrowser() {
 <template>
   <Dialog :open="open" @update:open="emit('update:open', $event)" title="复制播放链接" :description="item?.title">
     <div class="space-y-4">
-      <div>
+      <div v-if="isOnline" class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+        在线视频由本软件在你的电脑上转发 B 站官方 CDN 流，因此只生成 127.0.0.1 本机链接（不提供局域网链接）。
+        免登录画质上限 720P；如需 1080P 及以上，请用 JJdown（唧唧）下载后通过「导入视频」导入为本地视频。
+      </div>
+
+      <div v-if="!isOnline">
         <Label class="mb-2 block">地址模式</Label>
         <div class="grid grid-cols-2 gap-2">
           <button
@@ -215,7 +230,7 @@ async function openInBrowser() {
         <p class="mt-2 text-xs text-muted-foreground">{{ modeHint }}</p>
       </div>
 
-      <div>
+      <div v-if="!isOnline">
         <Label class="mb-2 block">链接格式</Label>
         <div class="grid grid-cols-2 gap-2">
           <button

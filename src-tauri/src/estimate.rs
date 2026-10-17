@@ -372,9 +372,14 @@ async fn load(
         cache.insert(key, json.clone());
         json
     };
-    Ok((source(&json, metadata.len(), options)?, path))
+    let mut src = source(&json, metadata.len(), options)?;
+    // 外挂字幕存放在文件系统而非容器内，需在 ffprobe 结果之外单独扫描；
+    // 追加后重算有效配置，使「选外挂字幕烧录」与选内嵌字幕轨走同一条估算路径。
+    src.streams
+        .extend(transcode::parse_sidecar_subtitles(&path));
+    src.effective_options = effective_options(options, &src.streams);
+    Ok((src, path))
 }
-
 #[tauri::command]
 pub async fn load_estimate_source(
     state: State<'_, AppState>,
@@ -521,29 +526,38 @@ pub async fn probe_transcode_estimate(
         let dest = temp
             .path()
             .join(format!("sub.{}", transcode::subtitle_ext(&s.codec)));
-        let args = vec![
-            "-v".into(),
-            "error".into(),
-            "-y".into(),
-            "-i".into(),
-            input.clone(),
-            "-map".into(),
-            format!("0:{}", s.index),
-            "-c:s".into(),
-            if matches!(s.codec.as_str(), "ass" | "ssa") {
-                "ass".into()
+        // 外挂字幕直接复制（无容器流可抽），内嵌字幕轨才需要 ffmpeg -map 抽取
+        if let Some(sidecar) = s.sidecar_path.as_deref() {
+            if std::fs::copy(sidecar, &dest).is_ok() {
+                subtitle = Some(dest);
             } else {
-                "srt".into()
-            },
-            dest.to_string_lossy().to_string(),
-        ];
-        match run(&ffmpeg, &args, None, SUBTITLE_TIMEOUT, &cancel).await {
-            Ok(_) => subtitle = Some(dest),
-            Err(e) => {
-                if e.contains("取消") {
-                    return Ok(fail(result, &e));
+                tracing::warn!("外挂字幕复制失败，按不烧录字幕继续探测");
+            }
+        } else {
+            let args = vec![
+                "-v".into(),
+                "error".into(),
+                "-y".into(),
+                "-i".into(),
+                input.clone(),
+                "-map".into(),
+                format!("0:{}", s.index),
+                "-c:s".into(),
+                if matches!(s.codec.as_str(), "ass" | "ssa") {
+                    "ass".into()
+                } else {
+                    "srt".into()
+                },
+                dest.to_string_lossy().to_string(),
+            ];
+            match run(&ffmpeg, &args, None, SUBTITLE_TIMEOUT, &cancel).await {
+                Ok(_) => subtitle = Some(dest),
+                Err(e) => {
+                    if e.contains("取消") {
+                        return Ok(fail(result, &e));
+                    }
+                    tracing::warn!("字幕抽取失败，按不烧录字幕继续探测：{e}");
                 }
-                tracing::warn!("字幕抽取失败，按不烧录字幕继续探测：{e}");
             }
         }
     }

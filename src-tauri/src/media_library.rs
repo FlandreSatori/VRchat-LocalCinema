@@ -119,6 +119,10 @@ pub struct MediaItem {
     pub source_media_id: Option<String>,
     /// 分段转码的段序号（1 = 第一段，2 = 第二段；非分段产物为 None）
     pub segment_index: Option<i64>,
+    /// 在线流媒体的原始页面链接（B 站等）；本机文件为 None
+    pub source_url: Option<String>,
+    /// 媒体来源：local（本机文件）/ online（在线流媒体）
+    pub source_kind: String,
     pub status: MediaStatus,
     pub added_at: i64,
     pub updated_at: i64,
@@ -202,6 +206,8 @@ impl Db {
             "ALTER TABLE media ADD COLUMN folder_id TEXT",
             "ALTER TABLE media ADD COLUMN source_media_id TEXT",
             "ALTER TABLE media ADD COLUMN segment_index INTEGER",
+            "ALTER TABLE media ADD COLUMN source_url TEXT",
+            "ALTER TABLE media ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'local'",
         ] {
             let _ = conn.execute(col, []);
         }
@@ -290,6 +296,47 @@ impl Db {
         Ok((item, true))
     }
 
+    /// 登记一个在线流媒体条目（B 站等）。`online_key` 为唯一伪路径（如 `online://BV...`），
+    /// 已存在则返回既有条目。在线条目无本机文件，播放走 HTTP 服务的 `/online/{id}` 代理。
+    pub fn register_online(
+        &self,
+        id: &str,
+        title: &str,
+        file_name: &str,
+        online_key: &str,
+        file_size: u64,
+        duration_ms: Option<u64>,
+        thumbnail: Option<String>,
+        source_url: &str,
+    ) -> AppResult<(MediaItem, bool)> {
+        if !crate::url_builder::valid_basename(file_name) {
+            return Err(AppError::Msg("标题不能映射为播放 URL".into()));
+        }
+        if let Some(existing) = self.get_by_path(online_key)? {
+            return Ok((existing, false));
+        }
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO media (id, title, file_name, file_path, file_size, duration_ms, format, thumbnail, status, source_url, source_kind, added_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'mp4', ?7, 'ok', ?8, 'online', ?9, ?9)",
+            params![
+                id,
+                title,
+                file_name,
+                online_key,
+                file_size as i64,
+                duration_ms.map(|v| v as i64),
+                thumbnail,
+                source_url,
+                now
+            ],
+        )?;
+        let item = self
+            .get(id)?
+            .ok_or_else(|| AppError::Msg("写入在线媒体条目后读取失败".into()))?;
+        Ok((item, true))
+    }
+
     fn row_to_item(row: &rusqlite::Row) -> rusqlite::Result<MediaItem> {
         let status: String = row.get("status")?;
         Ok(MediaItem {
@@ -322,13 +369,17 @@ impl Db {
             folder_id: row.get("folder_id")?,
             source_media_id: row.get("source_media_id")?,
             segment_index: row.get::<_, Option<i64>>("segment_index")?,
+            source_url: row.get("source_url")?,
+            source_kind: row
+                .get::<_, Option<String>>("source_kind")?
+                .unwrap_or_else(|| "local".to_string()),
             status: MediaStatus::from_str(&status),
             added_at: row.get("added_at")?,
             updated_at: row.get("updated_at")?,
         })
     }
 
-    const SELECT: &'static str = "SELECT id, title, file_name, file_path, file_size, duration_ms, format, thumbnail, hash, container, video_codec, pix_fmt, bit_depth, width, height, audio_codec, audio_sample_rate, audio_channels, compat_status, compat_reason, compat_resolved, hls_playlist, folder_id, source_media_id, segment_index, status, added_at, updated_at FROM media";
+    const SELECT: &'static str = "SELECT id, title, file_name, file_path, file_size, duration_ms, format, thumbnail, hash, container, video_codec, pix_fmt, bit_depth, width, height, audio_codec, audio_sample_rate, audio_channels, compat_status, compat_reason, compat_resolved, hls_playlist, folder_id, source_media_id, segment_index, source_url, source_kind, status, added_at, updated_at FROM media";
 
     pub fn get(&self, id: &str) -> AppResult<Option<MediaItem>> {
         let mut stmt = self
@@ -776,10 +827,10 @@ impl Db {
             .ok_or_else(|| AppError::Msg("更新媒体条目后读取失败".into()))?)
     }
 
-    /// 返回可供对等节点比对的媒体摘要（文件仍存在的条目）
+    /// 返回可供对等节点比对的媒体摘要（文件仍存在的本机条目；在线流媒体不参与对等共享）
     pub fn list_summaries(&self) -> AppResult<Vec<MediaSummary>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{} WHERE status != 'missing' ORDER BY added_at DESC",
+            "{} WHERE status != 'missing' AND source_kind != 'online' ORDER BY added_at DESC",
             Self::SELECT
         ))?;
         let rows = stmt.query_map([], Self::row_to_item)?;

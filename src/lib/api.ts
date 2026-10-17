@@ -78,6 +78,10 @@ export interface MediaItem {
   sourceMediaId: string | null
   /** 分段转码的段序号（1/2；非分段产物为 null） */
   segmentIndex: number | null
+  /** 在线媒体（B 站等）的原始页面链接；本机媒体为 null */
+  sourceUrl: string | null
+  /** 媒体来源：local（本机文件）/ online（在线流媒体） */
+  sourceKind: 'local' | 'online'
   status: MediaStatus
   addedAt: number
   updatedAt: number
@@ -216,6 +220,10 @@ export interface ImportResult {
 export function importFiles(paths: string[]): Promise<ImportResult> {
   return invoke('import_files', { paths })
 }
+/** 通过 B 站链接导入在线视频（免登录上限 720P），生成本机代理播放链接 */
+export function importOnlineVideo(url: string): Promise<MediaItem> {
+  return invoke('import_online_video', { url })
+}
 export function refreshMedia(id: string): Promise<MediaItem> {
   return invoke('refresh_media', { id })
 }
@@ -281,6 +289,8 @@ export interface MediaStreamInfo {
   textSubtitle: boolean
   /** 是否为图形（位图）字幕：只能用 overlay 方式烧录，不可内嵌或外挂 */
   graphicSubtitle: boolean
+  /** 外挂（同目录同名）字幕文件的绝对路径；仅外挂字幕条目有值，内嵌字幕轨为 null */
+  sidecarPath?: string | null
 }
 /** 获取媒体的完整流清单（需先下载/指定 ffprobe 组件） */
 export function getMediaStreams(id: string): Promise<MediaStreamInfo[]> {

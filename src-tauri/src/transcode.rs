@@ -19,6 +19,17 @@ pub const TEXT_SUBTITLE_CODECS: &[&str] = &[
 pub const GRAPHIC_SUBTITLE_CODECS: &[&str] = &[
     "hdmv_pgs_subtitle", "dvd_subtitle", "dvdsub", "pgssub", "dvb_subtitle",
 ];
+/// 外挂（同目录同名）字幕文件扩展名 → ffprobe 风格编码名
+pub const SIDECAR_SUBTITLE_EXTS: &[(&str, &str)] = &[
+    ("srt", "subrip"),
+    ("ass", "ass"),
+    ("ssa", "ssa"),
+    ("vtt", "webvtt"),
+];
+/// 外挂字幕在流清单里使用的合成索引基数。
+/// 真实流索引由 ffprobe 报告，绝不可能达到这个量级；前端与后端凭
+/// `index >= SIDECAR_INDEX_BASE` 即可区分「旁边的字幕文件」与内嵌字幕轨。
+pub const SIDECAR_INDEX_BASE: usize = 10_000;
 
 /// 转码配置（字段缺省时按「自动」处理）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,6 +148,8 @@ pub struct StreamInfo {
     pub text_subtitle: bool,
     /// 是否为图形字幕（只能烧录，不能内嵌或外挂）
     pub graphic_subtitle: bool,
+    /// 外挂（同目录同名）字幕文件的绝对路径；仅外挂字幕条目有值，内嵌字幕轨为 None
+    pub sidecar_path: Option<String>,
 }
 
 impl StreamInfo {
@@ -240,6 +253,76 @@ pub fn parse_streams(json: &serde_json::Value) -> Vec<StreamInfo> {
             copyable,
             text_subtitle,
             graphic_subtitle,
+            sidecar_path: None,
+        });
+    }
+    out
+}
+
+/// 扫描视频同目录下的外挂字幕文件。
+///
+/// 匹配规则：扩展名为 `.srt` / `.ass` / `.ssa` / `.vtt`，且文件名（去扩展名后）与视频同名，
+/// 或形如「影片名.语言标签」（如 `影片.zh-CN.srt`、`影片.eng.ass`，大小写不敏感）。
+/// 返回的条目使用 [`SIDECAR_INDEX_BASE`] 起的合成索引，`sidecar_path` 记录字幕文件绝对路径，
+/// 从而与内嵌字幕轨一样出现在「转码设置」对话框并可选来烧录。
+pub fn parse_sidecar_subtitles(video: &Path) -> Vec<StreamInfo> {
+    let Some(dir) = video.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = video
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    let mut out = Vec::new();
+    for p in files {
+        let Some(ext) = p.extension().map(|e| e.to_string_lossy().to_lowercase()) else {
+            continue;
+        };
+        let Some((_, codec)) = SIDECAR_SUBTITLE_EXTS.iter().find(|(e, _)| *e == ext) else {
+            continue;
+        };
+        let Some(sub_stem) = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()) else {
+            continue;
+        };
+        let suffix = sub_stem.strip_prefix(&format!("{}.", stem));
+        // 同名，或「影片名.语言」形式
+        if sub_stem != stem && suffix.is_none() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push(StreamInfo {
+            index: SIDECAR_INDEX_BASE + out.len(),
+            kind: "subtitle".into(),
+            codec: (*codec).to_string(),
+            profile: None,
+            language: suffix.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            title: Some(name),
+            is_default: false,
+            width: None,
+            height: None,
+            pix_fmt: None,
+            channels: None,
+            channel_layout: None,
+            sample_rate: None,
+            copyable: false,
+            text_subtitle: true,
+            graphic_subtitle: false,
+            sidecar_path: Some(p.to_string_lossy().to_string()),
         });
     }
     out
@@ -541,5 +624,34 @@ mod tests {
         assert_eq!(s[1].describe(), "DTS DTS-HD MA 6ch 48kHz");
         assert_eq!(first_text_subtitle(&s), Some(2));
         assert_eq!(default_audio_stream(&s), Some(1));
+    }
+
+    #[test]
+    fn sidecar_subtitles_matched_by_name_and_language_suffix() {
+        let dir = std::env::temp_dir().join(format!("vlc-sidecar-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("Movie (2020).mkv");
+        std::fs::write(&video, b"x").unwrap();
+        std::fs::write(dir.join("Movie (2020).zh-CN.srt"), b"1").unwrap();
+        std::fs::write(dir.join("Movie (2020).ass"), b"2").unwrap();
+        std::fs::write(dir.join("Movie (2020).txt"), b"3").unwrap(); // 非字幕扩展名
+        std::fs::write(dir.join("Other.srt"), b"4").unwrap(); // 不同名
+        std::fs::write(dir.join("Movie (2020).sub"), b"5").unwrap(); // VobSub 不支持
+
+        let subs = parse_sidecar_subtitles(&video);
+        let names: Vec<String> = subs
+            .iter()
+            .filter_map(|s| s.sidecar_path.as_deref())
+            .map(|p| std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(subs.len(), 2, "只应识别同名的 srt/ass：{:?}", names);
+        assert!(names.contains(&"Movie (2020).ass".to_string()));
+        assert!(names.contains(&"Movie (2020).zh-CN.srt".to_string()));
+        assert!(subs.iter().all(|s| s.kind == "subtitle" && s.text_subtitle));
+        assert!(subs.iter().all(|s| s.index >= SIDECAR_INDEX_BASE));
+        assert!(subs
+            .iter()
+            .any(|s| s.language.as_deref() == Some("zh-cn")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

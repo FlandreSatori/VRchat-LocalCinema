@@ -17,6 +17,11 @@ const emit = defineEmits<{
 const rows = computed(() => {
   const it = props.item
   if (!it) return []
+  // 在线（B 站）条目没有本机文件，展示来源页面而非内部占位路径
+  const sourceRow =
+    it.sourceKind === 'online'
+      ? { label: '视频来源', value: it.sourceUrl ?? 'B 站在线视频' }
+      : { label: '文件路径', value: it.filePath }
   return [
     { label: '文件名', value: it.fileName },
     { label: '容器格式', value: it.container ? it.container.toUpperCase() : '未知' },
@@ -38,7 +43,7 @@ const rows = computed(() => {
     },
     { label: '时长', value: formatDuration(it.durationMs) },
     { label: '文件大小', value: formatSize(it.fileSize) },
-    { label: '文件路径', value: it.filePath },
+    sourceRow,
   ]
 })
 

@@ -177,8 +177,11 @@ pub async fn restart_server(app: AppHandle, state: State<'_, AppState>) -> AppRe
 pub async fn list_media(state: State<'_, AppState>) -> AppResult<Vec<MediaItem>> {
     let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
     let mut items = db.list()?;
-    // 轻量级状态检查：仅 stat 文件存在性
+    // 轻量级状态检查：仅 stat 文件存在性（在线流媒体条目不落盘，跳过）
     for item in items.iter_mut() {
+        if item.source_kind == "online" {
+            continue;
+        }
         let exists = std::path::Path::new(&item.file_path).is_file();
         if !exists && item.status != MediaStatus::Missing {
             item.status = MediaStatus::Missing;
@@ -429,6 +432,107 @@ pub async fn import_files(
     Ok(result)
 }
 
+/// 把在线视频标题整理为合法的媒体库文件名主体（去掉 Windows 非法字符、限长）
+fn sanitize_online_title(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut s = cleaned.trim().trim_matches(|c| c == '.' || c == ' ').to_string();
+    while s.contains("  ") {
+        s = s.replace("  ", " ");
+    }
+    if s.is_empty() {
+        s = "在线视频".to_string();
+    }
+    s.chars().take(80).collect()
+}
+
+/// 通过 B 站链接导入在线视频：解析官方单文件 MP4 直链并生成与本地视频一致的媒体卡片。
+///
+/// - 免登录上限 720P；更高清晰度需用户自行用 JJdown 下载后导入成本地视频。
+/// - 在线条目播放走 HTTP 服务的 `/online/{id}` 代理，只生成 127.0.0.1 链接。
+#[tauri::command]
+pub async fn import_online_video(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+) -> AppResult<MediaItem> {
+    let bvid = crate::bilibili::parse_bvid(&url).ok_or_else(|| {
+        AppError::Msg("未能识别 BV 号，请粘贴 B 站视频链接（形如 https://www.bilibili.com/video/BV...）".to_string())
+    })?;
+    let info = crate::bilibili::fetch_video_info(&bvid).await?;
+    // 先解析一次直链以校验可播放，并取得文件大小与时长
+    let link = crate::bilibili::resolve_play_url(&info.bvid, info.cid).await?;
+    let key = crate::bilibili::online_key(&info.bvid, info.cid);
+    // 同一视频（同一分 P）重复导入时直接复用既有条目
+    {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = db.get_by_path(&key)? {
+            return Ok(existing);
+        }
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    // 封面下载失败不影响导入（卡片回退为占位图）
+    let mut thumb_name: Option<String> = None;
+    if !info.cover_url.trim().is_empty() {
+        let name = format!("{}.jpg", id);
+        let out = thumb_dir_of(&state).join(&name);
+        match crate::bilibili::fetch_cover_to(&info.cover_url, &out).await {
+            Ok(()) => thumb_name = Some(name),
+            Err(e) => tracing::warn!("下载在线视频封面失败: {}", e),
+        }
+    }
+
+    let stem = sanitize_online_title(&info.title);
+    let file_name = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let mut candidate = format!("{}.mp4", stem);
+        let mut n = 1;
+        while !db.find_by_name(&candidate)?.is_empty() {
+            n += 1;
+            candidate = format!("{}-{}.mp4", stem, n);
+        }
+        candidate
+    };
+
+    let item = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        let (item, created) = db.register_online(
+            &id,
+            &info.title,
+            &file_name,
+            &key,
+            link.size,
+            Some(info.duration_ms),
+            thumb_name,
+            &url,
+        )?;
+        if !created {
+            // 并发下已被其它请求登记：删除本次下载、未被引用的封面文件
+            let _ = std::fs::remove_file(thumb_dir_of(&state).join(format!("{}.jpg", id)));
+            return Ok(item);
+        }
+        item
+    };
+    let _ = app.emit("media-updated", &item);
+    tracing::info!(
+        "已导入在线视频: {} ({}) 质量={} 大小={}",
+        item.title,
+        key,
+        link.quality,
+        link.size
+    );
+    Ok(item)
+}
+
 async fn refresh_media_internal(
     app: &AppHandle,
     state: &State<'_, AppState>,
@@ -438,6 +542,10 @@ async fn refresh_media_internal(
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.get(id)?.ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
+    if item.source_kind == "online" {
+        // 在线条目无本机文件，无需重新探测（直链在播放时按需刷新）
+        return Ok(item);
+    }
     let path = PathBuf::from(&item.file_path);
     if !path.is_file() {
         let updated = {
@@ -623,6 +731,11 @@ fn get_item_checked(state: &State<'_, AppState>, id: &str) -> AppResult<MediaIte
     let item = db
         .get(id)?
         .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?;
+    if item.source_kind == "online" {
+        return Err(AppError::Msg(
+            "在线视频没有本机文件；请复制播放链接供 VRChat 播放，或用 JJdown 下载后导入成本地视频".to_string(),
+        ));
+    }
     if !std::path::Path::new(&item.file_path).is_file() {
         return Err(AppError::Msg("文件已丢失或无法访问".to_string()));
     }
@@ -1949,6 +2062,28 @@ fn sanitize_options(
     (out, sub)
 }
 
+/// 把外挂字幕复制到转码临时目录并改成安全文件名。
+///
+/// 外挂字幕由用户命名（可能含空格、逗号、括号等），直接传给 `subtitles` 滤镜会被
+/// ffmpeg 的选项切分逻辑误解析（见 `transcode::subtitle_filter_value`），因此统一
+/// 复制成程序生成的 `sub-<uuid>-side.<ext>` 再使用；该临时文件由 [`SubtitleFile`] 负责清理。
+fn stage_sidecar_subtitle(path: &Path, codec: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join("vrchat-localcinema");
+    std::fs::create_dir_all(&dir).ok()?;
+    let dest = dir.join(format!(
+        "sub-{}-side.{}",
+        uuid::Uuid::new_v4(),
+        crate::transcode::subtitle_ext(codec)
+    ));
+    match std::fs::copy(path, &dest) {
+        Ok(_) => Some(dest),
+        Err(e) => {
+            tracing::warn!("复制外挂字幕失败: {}", e);
+            None
+        }
+    }
+}
+
 /// 把指定字幕流抽取为独立临时文件（烧录用）。返回临时文件路径；
 /// 失败时返回 None（调用方退化为不烧录字幕）。
 async fn extract_subtitle_file(
@@ -2027,7 +2162,8 @@ fn promote_part(part: &std::path::Path, dest: &std::path::Path) -> AppResult<()>
     }
 }
 
-/// 查询该视频的全部媒体流（视频 / 音频 / 字幕），供「转码设置」对话框展示与选择
+/// 查询该视频的全部媒体流（视频 / 音频 / 字幕），供「转码设置」对话框展示与选择。
+/// 除 ffprobe 报告的内嵌流外，还包含同目录下的外挂字幕文件（见 `transcode::parse_sidecar_subtitles`）。
 #[tauri::command]
 pub async fn get_media_streams(
     state: State<'_, AppState>,
@@ -2039,7 +2175,11 @@ pub async fn get_media_streams(
     let ffprobe =
         ffprobe.ok_or_else(|| AppError::Msg("未检测到 ffprobe，请先在设置中指定 FFmpeg 组件".into()))?;
     let json = thumbnail::probe_media_json(&ffprobe, std::path::Path::new(&item.file_path)).await?;
-    Ok(crate::transcode::parse_streams(&json))
+    let mut streams = crate::transcode::parse_streams(&json);
+    streams.extend(crate::transcode::parse_sidecar_subtitles(std::path::Path::new(
+        &item.file_path,
+    )));
+    Ok(streams)
 }
 
 /// 加入转码队列（按任务序列执行），可在「转码任务」页查看进度、开始或取消；
@@ -2532,10 +2672,17 @@ async fn prepare_transcode_options(
     {
         let (ffprobe, _) = components::ffprobe_binary(&settings, &state.paths);
         match ffprobe {
-            Some(p) => thumbnail::probe_media_json(&p, std::path::Path::new(&item.file_path))
-                .await
-                .map(|j| crate::transcode::parse_streams(&j))
-                .unwrap_or_default(),
+            Some(p) => {
+                let mut streams = thumbnail::probe_media_json(&p, std::path::Path::new(&item.file_path))
+                    .await
+                    .map(|j| crate::transcode::parse_streams(&j))
+                    .unwrap_or_default();
+                // 外挂字幕与内嵌字幕一样参与选择与烧录，必须一起交给 sanitize_options 解析索引
+                streams.extend(crate::transcode::parse_sidecar_subtitles(
+                    std::path::Path::new(&item.file_path),
+                ));
+                streams
+            }
             None => Vec::new(),
         }
     } else {
@@ -2543,15 +2690,17 @@ async fn prepare_transcode_options(
     };
     let (options, subtitle_stream) = sanitize_options(requested, &streams);
 
-    // 烧录 / 外挂模式：先把字幕抽成独立临时文件（文本烧录交给 subtitles 滤镜，外挂则复制到产物旁）。
-    // 图形字幕烧录走 overlay 滤镜，不抽取为文本文件。
+    // 烧录 / 外挂模式：先把字幕备成独立临时文件（文本烧录交给 subtitles 滤镜，外挂则复制到产物旁）。
+    // 图形字幕烧录走 overlay 滤镜，不备为文本文件；外挂字幕文件直接复制（无需从容器抽取）。
     let mut subtitle_file: Option<std::path::PathBuf> = None;
     let needs_text_extract =
         options.external_subtitles() || (options.burn_subtitles() && !options.subtitle_graphic());
     if needs_text_extract {
         if let Some(s) = &subtitle_stream {
-            subtitle_file =
-                extract_subtitle_file(ffmpeg, &item.file_path, s.index, &s.codec, cancel).await;
+            subtitle_file = match s.sidecar_path.as_deref() {
+                Some(p) => stage_sidecar_subtitle(std::path::Path::new(p), &s.codec),
+                None => extract_subtitle_file(ffmpeg, &item.file_path, s.index, &s.codec, cancel).await,
+            };
         }
     }
     (options, SubtitleFile(subtitle_file))
