@@ -802,6 +802,30 @@ pub async fn mark_disclaimer_accepted(state: State<'_, AppState>) -> AppResult<(
     Ok(())
 }
 
+/// 判断可执行文件是否位于系统临时目录（常见于直接在压缩包预览里双击运行、
+/// 或解压工具「在临时目录中打开」）。此时解压往往不完整，且数据目录会随临时目录被清理。
+fn running_in_temp_dir(exe: &Path) -> bool {
+    let (Ok(exe), Ok(temp)) = (exe.canonicalize(), std::env::temp_dir().canonicalize()) else {
+        return false;
+    };
+    exe.starts_with(temp)
+}
+
+#[tauri::command]
+pub async fn is_running_in_temp_dir() -> AppResult<bool> {
+    Ok(running_in_temp_dir(&std::env::current_exe()?))
+}
+
+/// 退出应用（与托盘菜单「退出」一致：先停掉后台服务再退出）
+#[tauri::command]
+pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    state.server.stop();
+    state.easytier.stop_detached();
+    state.tunnel.stop_detached();
+    app.exit(0);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn open_data_dir(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     let dir = state.paths.data_dir.clone();

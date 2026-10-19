@@ -81,6 +81,14 @@ fn default_disable_power_throttling() -> bool {
     true
 }
 
+fn default_streaming_720p_bitrate_mbps() -> f64 {
+    3.0
+}
+
+fn default_streaming_1080p_bitrate_mbps() -> f64 {
+    6.0
+}
+
 /// EasyTier 组网配置，对应 easytier-core 的命令行参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -190,6 +198,12 @@ pub struct Settings {
     /// 禁用电源节流（Windows EcoQoS 豁免）：开启后避免媒体流传输被系统降速，默认开启
     #[serde(default = "default_disable_power_throttling")]
     pub disable_power_throttling: bool,
+    /// 一键压制 720p 峰值码率（Mbps，范围 1-100，保留两位小数）
+    #[serde(default = "default_streaming_720p_bitrate_mbps", rename = "streaming720pBitrateMbps")]
+    pub streaming_720p_bitrate_mbps: f64,
+    /// 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数）
+    #[serde(default = "default_streaming_1080p_bitrate_mbps", rename = "streaming1080pBitrateMbps")]
+    pub streaming_1080p_bitrate_mbps: f64,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,
 }
@@ -217,6 +231,8 @@ impl Default for Settings {
             download_dir: String::new(),
             stream_buffer_kb: default_stream_buffer_kb(),
             disable_power_throttling: default_disable_power_throttling(),
+            streaming_720p_bitrate_mbps: default_streaming_720p_bitrate_mbps(),
+            streaming_1080p_bitrate_mbps: default_streaming_1080p_bitrate_mbps(),
             easytier: EasytierConfig::default(),
         }
     }

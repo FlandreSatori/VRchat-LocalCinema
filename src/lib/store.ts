@@ -7,6 +7,7 @@ import {
   onTunnelStatusChanged,
   listMedia,
   importFiles,
+  transcodeStreamingCopy,
   onMediaUpdated,
   onServerStatusChanged,
   onConvertProgress,
@@ -32,6 +33,15 @@ export const mediaStore = reactive<{ items: MediaItem[]; loaded: boolean }>({
   items: [],
   loaded: false,
 })
+
+/// 大文件阈值（≥2GB）
+export const LARGE_FILE_BYTES = 2_147_483_648
+export function isLargeMedia(item: MediaItem): boolean {
+  return (item.fileSize ?? 0) >= LARGE_FILE_BYTES
+}
+
+/// ≥2GB 大文件列表（增量维护：仅在媒体增改时同步，避免整库反复过滤）
+export const largeMediaItems = ref<MediaItem[]>([])
 
 export const folderStore = reactive<{ folders: Folder[]; loaded: boolean }>({
   folders: [],
@@ -88,21 +98,50 @@ export function applyServerStatus(s: ServerStatus) {
   serverStore.error = s.error
 }
 
+/// 增量同步大文件列表（命中则加入/更新，否则移除）
+function syncLargeItem(item: MediaItem) {
+  const arr = largeMediaItems.value
+  const idx = arr.findIndex((m) => m.id === item.id)
+  if (isLargeMedia(item)) {
+    if (idx >= 0) arr[idx] = item
+    else arr.push(item)
+  } else if (idx >= 0) {
+    arr.splice(idx, 1)
+  }
+}
+
+function dropLargeItem(id: string) {
+  const arr = largeMediaItems.value
+  const idx = arr.findIndex((m) => m.id === id)
+  if (idx >= 0) arr.splice(idx, 1)
+}
+
 export function upsertMedia(item: MediaItem) {
   const idx = mediaStore.items.findIndex((m) => m.id === item.id)
   if (idx >= 0) mediaStore.items[idx] = item
   else mediaStore.items.unshift(item)
+  syncLargeItem(item)
 }
 
 export function removeMediaItem(id: string) {
   const idx = mediaStore.items.findIndex((m) => m.id === id)
   if (idx >= 0) mediaStore.items.splice(idx, 1)
+  dropLargeItem(id)
 }
 
-/// 导入成功后的 FastStart 提示状态：batch 每批导入自增（App.vue 据此触发提示，
-/// 避免连续两批同类型导入时因标志位没变化而漏提示）；含 ≥2GB 大文件的批次用弹窗，
-/// 其余批次用 toast
-export const faststartHintState = reactive({ batch: 0, hasLargeFile: false, dialogOpen: false })
+/// 导入成功后的压制提示状态
+export const faststartHintState = reactive({ batch: 0, largeItems: [] as MediaItem[], dialogOpen: false })
+
+/// 一键压制为流媒体 MP4（默认 SVT-AV1）：不主动提升分辨率与码率——
+/// 仅在源高于 1080p 时降采样到 1080p，否则保持原始分辨率；
+/// 码率以设置为上限（按源分辨率选 720/1080 档），实际由 CRF 决定。
+export async function transcodeStreamingItem(item: MediaItem): Promise<ConvertTask> {
+  const settings = await loadSettings()
+  const h = item.height ?? 0
+  const resolution: 'original' | '1080' = h > 1080 ? '1080' : 'original'
+  const mbps = h > 0 && h <= 720 ? settings.streaming720pBitrateMbps : settings.streaming1080pBitrateMbps
+  return transcodeStreamingCopy(item.id, resolution, mbps)
+}
 
 export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {
   const result = await importFiles(paths)
@@ -112,10 +151,9 @@ export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {
   if (result.skipped.length) {
     await message(`已导入 ${result.items.length} 个视频，跳过 ${result.skipped.length} 个文件：\n${result.skipped.map(issue => `${issue.path}：${issue.reason}`).join('\n')}`, { title: '导入结果', kind: 'warning' })
   }
-  // 导入成功后触发 FastStart 提示（App.vue 渲染；一批只提示一次）
+  // 导入成功后触发压制提示（App.vue 渲染；一批只提示一次）
   if (result.items.length > 0) {
-    faststartHintState.hasLargeFile = result.items.some(it => (it.fileSize ?? 0) >= 2 * 1024 * 1024 * 1024)
-    faststartHintState.dialogOpen = faststartHintState.hasLargeFile
+    faststartHintState.largeItems = result.items.filter(isLargeMedia)
     faststartHintState.batch++
   }
   return result.items
@@ -145,6 +183,7 @@ export async function initStore() {
     const [status, media, settings] = await Promise.all([getServerStatus(), listMedia(), getSettings()])
     applyServerStatus(status)
     mediaStore.items = media
+    largeMediaItems.value = media.filter(isLargeMedia)
     settingsCache.value = settings
     folderStore.folders = await listFolders()
     folderStore.loaded = true

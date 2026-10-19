@@ -40,7 +40,7 @@ import {
   type UrlMode,
 } from '../lib/api'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { settingsCache, mediaStore } from '../lib/store'
+import { settingsCache, mediaStore, largeMediaItems } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
 import { formatSize } from '../lib/format'
@@ -64,6 +64,8 @@ const form = reactive<Settings>({
   downloadDir: '',
   streamBufferKb: 256,
   disablePowerThrottling: true,
+  streaming720pBitrateMbps: 3,
+  streaming1080pBitrateMbps: 6,
   easytier: {
     protocols: ['tcp', 'ws'],
     peerUrl: '',
@@ -189,6 +191,7 @@ watch(() => form.listenMode, (mode, prev) => {
   form.defaultUrlMode = mode === 'lan' ? 'lan' : 'localhost'
   if (mode === 'lan' && prev !== 'lan') {
     toast.info('已切换到局域网模式')
+    if (largeMediaItems.value.length) toast.warning(`媒体库有 ${largeMediaItems.value.length} 个 2 GB 以上视频；开放局域网分享前建议压制为流媒体 MP4`)
   }
 })
 
@@ -225,6 +228,16 @@ function setCloseBehavior(v: string) {
 }
 function setStreamBuffer(v: string) {
   form.streamBufferKb = Number(v)
+}
+
+/// 一键压制码率：限制为 1-100 Mbps，保留两位小数
+function clampBitrate(v: number): number {
+  if (!Number.isFinite(v)) return 1
+  return Math.min(100, Math.max(1, Math.round(v * 100) / 100))
+}
+function setBitrate(key: 'streaming720pBitrateMbps' | 'streaming1080pBitrateMbps', raw: string) {
+  if (raw.trim() === '') return
+  form[key] = clampBitrate(Number(raw))
 }
 
 async function pickExe(title: string): Promise<string | null> {
@@ -299,6 +312,8 @@ async function save() {
     toast.error('端口必须在 1-65535 之间')
     return
   }
+  form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
+  form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
   saving.value = true
   try {
     await saveSettings({ ...form })
@@ -322,6 +337,8 @@ async function reset() {
   try {
     const s = await resetSettings()
     Object.assign(form, s)
+    form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
+    form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
     settingsCache.value = { ...s }
     toast.success('已恢复默认设置')
   } catch (e) {
@@ -407,6 +424,8 @@ onMounted(async () => {
     Object.assign(form, s)
     // 兼容历史配置：KCP 与 QUIC 代理互斥，同时开启时保留 KCP
     if (form.easytier.kcpProxy && form.easytier.quicProxy) form.easytier.quicProxy = false
+    form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
+    form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
     appPaths.value = paths
     players.value = detected
     await refreshComponents()
@@ -731,6 +750,37 @@ onUnmounted(() => {
           <p class="mt-0.5 text-xs text-muted-foreground">影响播放供数的高级参数，不推荐修改；仅在排查播放卡顿时按开发者建议调整</p>
         </div>
         <Select :model-value="String(form.streamBufferKb)" :options="streamBufferOptions" class="w-40" @update:model-value="setStreamBuffer" />
+      </div>
+    </Card>
+
+    <Card class="space-y-4 p-5">
+      <h2 class="font-medium">一键压制</h2>
+      <div class="space-y-1.5">
+        <Label>720P 码率（Mbps）</Label>
+        <Input
+          type="number"
+          :min="1"
+          :max="100"
+          :step="0.01"
+          :model-value="String(form.streaming720pBitrateMbps)"
+          class="w-32"
+          @update:model-value="setBitrate('streaming720pBitrateMbps', $event)"
+        />
+        <p class="text-xs text-muted-foreground">720p 及以下源文件的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 3）</p>
+      </div>
+      <Separator />
+      <div class="space-y-1.5">
+        <Label>1080P+ 码率（Mbps）</Label>
+        <Input
+          type="number"
+          :min="1"
+          :max="100"
+          :step="0.01"
+          :model-value="String(form.streaming1080pBitrateMbps)"
+          class="w-32"
+          @update:model-value="setBitrate('streaming1080pBitrateMbps', $event)"
+        />
+        <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 6）</p>
       </div>
     </Card>
 

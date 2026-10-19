@@ -50,7 +50,7 @@ import {
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
 import { formatSize, formatDuration } from '../lib/format'
-import { serverStore, convertStore, convertTaskStore } from '../lib/store'
+import { serverStore, convertStore, convertTaskStore, transcodeStreamingItem } from '../lib/store'
 
 const props = withDefaults(
   defineProps<{
@@ -174,59 +174,11 @@ function doTranscodeAudio() {
   }, 0)
 }
 
-/// FastStart 能力分级：
-/// - unsupported：非 MP4/MOV 容器。faststart（moov 前置）只对 MP4 系封装器有意义，
-///   MKV/WebM/TS/AVI 本身即可顺序流式播放，无需也无法用这种方式处理
-/// - copy：MP4 系容器且视频、音频编码都在可直拷白名单内，重封装完全不重编码
-/// - reencode：MP4 系容器但含不可直拷编码（如 DTS/TrueHD 音频、ProRes/VC-1 视频），
-///   重封装时这些流必须转成 H.264/AAC
-type FaststartLevel = 'copy' | 'reencode' | 'unsupported'
-
-/// 与后端 transcode.rs 的 COPYABLE_VIDEO / COPYABLE_AUDIO 白名单保持一致
-const FASTSTART_COPYABLE_VIDEO = ['h264', 'hevc', 'vp9', 'av1', 'mpeg4']
-const FASTSTART_COPYABLE_AUDIO = ['aac', 'mp3', 'ac3', 'eac3']
-
-/// 判定用导入时已探测入库的容器 / 编码（MediaItem.container / videoCodec / audioCodec），
-/// 不需要为每张卡片再拉起一次 ffprobe
-const faststartLevel = computed<FaststartLevel>(() => {
-  // 容器名优先（导入时归一化为 mp4/mov/mkv/…），旧数据缺失时回退扩展名
-  const container = props.item.container
-  const mp4Family = container
-    ? container === 'mp4' || container === 'mov'
-    : /\.(mp4|m4v|mov)$/i.test(props.item.fileName)
-  if (!mp4Family) return 'unsupported'
-  // 拿不到视频编码时不做「免重编码」的断言
-  const vcodec = props.item.videoCodec?.toLowerCase()
-  if (!vcodec || !FASTSTART_COPYABLE_VIDEO.includes(vcodec)) return 'reencode'
-  const acodec = props.item.audioCodec?.toLowerCase()
-  if (acodec && !FASTSTART_COPYABLE_AUDIO.includes(acodec)) return 'reencode'
-  return 'copy'
-})
-
-const faststartLabel = computed(() => {
-  if (faststartLevel.value === 'copy') return '转换为FastStart模式（免重编码）'
-  if (faststartLevel.value === 'reencode') return '转换为FastStart模式（重编码）'
-  return '转换为FastStart模式（不支持的格式）'
-})
-
-/// 快速转为 FastStart：可直拷的流原样重封装，不可直拷的流由后端自动转为 H.264/AAC；
-/// 产物在转换缓存目录（不覆盖原视频）并自动入库为新卡片
-async function doFaststart() {
-  if (faststartLevel.value === 'unsupported') return
-  const copied = faststartLevel.value === 'copy'
+/// 一键压制为流媒体 MP4：默认 SVT-AV1（不提升分辨率与码率），产物在转换缓存目录并自动入库为新卡片
+async function doStreamingTranscode() {
   try {
-    await transcodeMedia(props.item.id, false, {
-      videoMode: 'copy',
-      audioMode: 'copy',
-      includeAudio: true,
-      subtitleMode: 'drop',
-      faststart: true,
-    })
-    toast.info(
-      copied
-        ? '已加入转码队列：FastStart 重封装（免重编码），完成后请使用新卡片播放'
-        : '已加入转码队列：FastStart 转换（不兼容的流将重编码），完成后请使用新卡片播放'
-    )
+    await transcodeStreamingItem(props.item)
+    toast.info('已加入流媒体 MP4 压制队列，完成后请使用新卡片播放')
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -365,13 +317,12 @@ const menuItems = computed<MenuEntry[]>(() => {
       icon: FileVideo,
       onSelect: doTranscode,
     },
-    // 大文件播放卡顿时的一键修复：moov 前置重封装（非 MP4 系容器置灰不可点）
+    // 一键压制为流媒体 MP4：适合网络播放的 H.264/AAC 组合
     {
       type: 'item',
-      label: faststartLabel.value,
+      label: '一键压制为流媒体 MP4',
       icon: Zap,
-      disabled: faststartLevel.value === 'unsupported',
-      onSelect: doFaststart,
+      onSelect: doStreamingTranscode,
     },
     // 本机缺少 AC-3/E-AC-3 解码器时提供引导（转码为 AAC / 安装解码器）
     ...(decoderWarning.value

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare } from 'lucide-vue-next'
+import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare, TriangleAlert } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -14,9 +14,10 @@ import Dialog from './components/ui/Dialog.vue'
 import Button from './components/ui/Button.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
-import { initStore, serverStore, importMediaPaths, faststartHintState } from './lib/store'
+import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, transcodeStreamingItem } from './lib/store'
+import { formatSize } from './lib/format'
 import { toast, errMsg } from './lib/toast'
-import { isFirstLaunch, markDisclaimerAccepted } from './lib/api'
+import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, type MediaItem } from './lib/api'
 
 const router = useRouter()
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -36,6 +37,8 @@ const dragActive = ref(false)
 const importing = ref(false)
 const showDisclaimer = ref(false)
 const isFirstLaunchFlag = ref(false)
+/// 运行在系统临时目录（如直接在压缩包内运行）时的强制警告
+const tempDirWarning = ref(false)
 
 const statusDotClass = computed(() => {
   if (serverStore.error && !serverStore.running) return 'bg-red-500'
@@ -91,12 +94,43 @@ async function handleDisclaimerAgree() {
   }
 }
 
-// FastStart 提示：含 ≥2GB 大文件的批次用弹窗（在模板中按 dialogOpen 渲染），
-// 其余批次用 toast。以批次计数驱动，一批只提示一次
-const FASTSTART_HINT = '大文件播放卡顿时，可右键「转换为FastStart模式」修复索引位置（兼容编码可免重编码）'
+/// 临时目录警告对话框：强制模式，只能确认退出
+function onTempDirWarningUpdate(open: boolean) {
+  if (!open) return
+  tempDirWarning.value = open
+}
+
+async function quitFromTempWarning() {
+  try {
+    await quitApp()
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+// 导入含 ≥2GB 大文件的批次时提示可一键压制
+const compressingId = ref('')
+async function compressLargeItem(item: MediaItem) {
+  if (compressingId.value) return
+  compressingId.value = item.id
+  try {
+    await transcodeStreamingItem(item)
+    toast.info('已加入压制队列，完成后请使用新媒体卡片')
+  } catch (e) {
+    toast.error(errMsg(e))
+  } finally {
+    compressingId.value = ''
+  }
+}
+
 watch(() => faststartHintState.batch, () => {
-  if (faststartHintState.batch > 0 && !faststartHintState.hasLargeFile) toast.info(FASTSTART_HINT)
+  if (faststartHintState.batch === 0 || !faststartHintState.largeItems.length) return
+  faststartHintState.dialogOpen = true
 })
+
+function onImportDialogUpdate(open: boolean) {
+  faststartHintState.dialogOpen = open
+}
 
 let unlistenDrag: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
@@ -112,6 +146,17 @@ function onContextMenu(e: MouseEvent) {
 
 onMounted(async () => {
   document.addEventListener('contextmenu', onContextMenu)
+
+  // 运行在临时目录（如直接在压缩包里双击运行）时警告并退出：随包组件可能缺失、临时路径会被系统清理
+  try {
+    if (await isRunningInTempDir()) {
+      tempDirWarning.value = true
+      return
+    }
+  } catch {
+    // 非 Tauri 环境（如纯浏览器预览）下忽略
+  }
+
   if (appWindow) {
     try {
       await syncMaximized()
@@ -244,24 +289,55 @@ onUnmounted(() => {
 
     <Toaster />
     <ConfirmHost />
+
+    <!-- 运行在系统临时目录（如直接在压缩包内运行）时的强制警告：确认后退出 -->
+    <Dialog
+      :open="tempDirWarning"
+      title="检测到程序运行在临时目录"
+      description="请先把压缩包完整解压到磁盘上的固定目录，再运行本程序"
+      @update:open="onTempDirWarningUpdate"
+    >
+      <div class="space-y-4">
+        <div class="flex items-start gap-2 rounded-md border border-amber-600/40 bg-amber-600/10 px-3 py-2 text-xs leading-relaxed text-amber-600">
+          <TriangleAlert class="mt-0.5 h-4 w-4 shrink-0" />
+          <span>临时目录中的文件会被系统随时清理。在这里运行时，随包的组件（FFmpeg、EasyTier 等）可能没有被一起解压出来，转码、组网与公网隧道将无法使用；若启用了开机启动，也会指向这个会被清理的临时路径。</span>
+        </div>
+        <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+          请将压缩包完整解压到磁盘上的固定目录（例如 D:\VRchat-LocalCinema），确认目录中含有 components 文件夹后再运行本程序。
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button @click="quitFromTempWarning">退出软件</Button>
+        </div>
+      </div>
+    </Dialog>
+
     <DisclaimerDialog
       v-model:open="showDisclaimer"
       :enforced="isFirstLaunchFlag"
       @agree="handleDisclaimerAgree"
     />
 
-    <!-- FastStart 提示（含 ≥2GB 大文件的批次弹出，其余批次在 watch 中 toast）-->
+    <!-- 导入含 ≥2GB 大文件时的压制提示 -->
     <Dialog
       :open="faststartHintState.dialogOpen"
-      @update:open="(v) => (faststartHintState.dialogOpen = v)"
+      title="发现大文件"
+      :description="`检测到 ${faststartHintState.largeItems.length} 个 ≥2GB 的视频，可压制为适合网络播放的流媒体 MP4`"
+      @update:open="onImportDialogUpdate"
     >
-      <template #title>导入成功</template>
-      <template #default>
-        <p class="text-sm leading-relaxed text-muted-foreground">{{ FASTSTART_HINT }}</p>
-      </template>
-      <template #footer="{ close }">
-        <Button @click="close">知道了</Button>
-      </template>
+      <div class="space-y-4">
+        <div class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+          压制为 AV1 + AAC 的 MP4：保持原始分辨率（仅高于 1080P 时降到 1080P），原文件保留，压制结果作为新卡片加入媒体库。码率上限与画质可在「设置 · 一键压制」中调整。
+        </div>
+        <div class="max-h-56 space-y-2 overflow-y-auto rounded-md border border-border p-3">
+          <div v-for="item in faststartHintState.largeItems" :key="item.id" class="flex items-center justify-between gap-3">
+            <span class="min-w-0 truncate text-sm">{{ item.title }}<span class="text-muted-foreground"> · {{ formatSize(item.fileSize) }}</span></span>
+            <Button size="sm" :disabled="compressingId !== ''" @click="compressLargeItem(item)">一键压制</Button>
+          </div>
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="onImportDialogUpdate(false)">稍后处理</Button>
+        </div>
+      </div>
     </Dialog>
 
     <div

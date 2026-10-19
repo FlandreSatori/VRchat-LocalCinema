@@ -67,6 +67,12 @@ pub struct TranscodeOptions {
     pub audio_sample_rate: Option<u32>,
     /// MP4 faststart（默认开启）
     pub faststart: Option<bool>,
+    /// 视频峰值码率（如 6000k），用于平滑网络突发带宽
+    pub max_video_bitrate: Option<String>,
+    /// 视频码率缓冲区（如 12000k）
+    pub video_buffer_size: Option<String>,
+    /// 闭合 GOP 的目标最大帧数
+    pub keyframe_interval: Option<u32>,
 }
 
 impl TranscodeOptions {
@@ -369,6 +375,26 @@ pub fn subtitle_filter_cwd(sub: &Path) -> Option<std::path::PathBuf> {
     sub.parent().map(|p| p.to_path_buf())
 }
 
+/// 把 preset 参数转成 libsvtav1 的整数档位（-2..13，越大越快）。
+/// 既接受整数，也接受 x264/x265 风格的名称（近似映射到最接近的档位）。
+fn svtav1_preset(preset: &str) -> Option<i32> {
+    if let Ok(n) = preset.parse::<i32>() {
+        return Some(n.clamp(-2, 13));
+    }
+    Some(match preset {
+        "ultrafast" => 13,
+        "superfast" => 12,
+        "veryfast" => 11,
+        "faster" => 10,
+        "fast" => 9,
+        "medium" => 8,
+        "slow" => 6,
+        "slower" => 4,
+        "veryslow" => 2,
+        _ => return None,
+    })
+}
+
 /// 构建转码参数。
 ///
 /// `subtitle_file` 为烧录模式时预先抽出的字幕文件路径；`None` 表示不烧录。
@@ -439,7 +465,8 @@ pub fn build_args(
             args.extend(["-c:v".into(), "libx265".into()]);
         }
         "av1" => {
-            args.extend(["-c:v".into(), "libaom-av1".into(), "-cpu-used".into(), "6".into()]);
+            // libaom-av1 速度极慢，改用 SVT-AV1（同画质下快 1~2 个数量级）
+            args.extend(["-c:v".into(), "libsvtav1".into()]);
         }
         "copy" => {
             args.extend(["-c:v".into(), "copy".into()]);
@@ -449,8 +476,16 @@ pub fn build_args(
         }
     }
     if reencode {
-        let preset = o.preset.as_deref().unwrap_or("medium");
-        args.extend(["-preset".into(), preset.to_string()]);
+        // -keyint_min / -sc_threshold 是 x264 / x265 私有选项，AV1 编码器不支持
+        let x26x = matches!(vmode, "h264" | "h265" | "hevc");
+        if x26x {
+            let preset = o.preset.as_deref().unwrap_or("medium");
+            args.extend(["-preset".into(), preset.to_string()]);
+        } else if vmode == "av1" {
+            // libsvtav1 的 -preset 是整数档位（-2..13，越大越快），默认取偏快的档位
+            let preset = o.preset.as_deref().and_then(svtav1_preset).unwrap_or(8);
+            args.extend(["-preset".into(), preset.to_string()]);
+        }
         let crf = o.crf.unwrap_or(20).min(51);
         args.extend(["-crf".into(), crf.to_string()]);
         let pix = o.pix_fmt.as_deref().unwrap_or(if vmode == "h265" || vmode == "hevc" {
@@ -460,6 +495,18 @@ pub fn build_args(
         });
         if pix != "auto" {
             args.extend(["-pix_fmt".into(), pix.to_string()]);
+        }
+        if let Some(maxrate) = &o.max_video_bitrate {
+            args.extend(["-maxrate".into(), maxrate.clone()]);
+        }
+        if let Some(bufsize) = &o.video_buffer_size {
+            args.extend(["-bufsize".into(), bufsize.clone()]);
+        }
+        if let Some(gop) = o.keyframe_interval.filter(|g| *g > 0) {
+            args.extend(["-g".into(), gop.to_string()]);
+            if x26x {
+                args.extend(["-keyint_min".into(), gop.to_string(), "-sc_threshold".into(), "0".into()]);
+            }
         }
     }
 
@@ -547,6 +594,19 @@ mod tests {
         o.subtitle_mode = Some("burn".into());
         assert_eq!(o.effective_video_mode(), "h264");
         assert!(o.burn_subtitles());
+    }
+
+    #[test]
+    fn streaming_options_set_vbv_and_closed_gop() {
+        let mut o = base();
+        o.max_video_bitrate = Some("6000k".into());
+        o.video_buffer_size = Some("12000k".into());
+        o.keyframe_interval = Some(120);
+        let args = build_args("in.mkv", &PathBuf::from("out.mp4"), &o, None, None, None);
+        let joined = args.join(" ");
+        assert!(joined.contains("-maxrate 6000k"));
+        assert!(joined.contains("-bufsize 12000k"));
+        assert!(joined.contains("-g 120 -keyint_min 120 -sc_threshold 0"));
     }
 
     #[test]

@@ -249,6 +249,8 @@ pub fn run() {
             commands::get_app_paths,
             commands::is_first_launch,
             commands::mark_disclaimer_accepted,
+            commands::is_running_in_temp_dir,
+            commands::quit_app,
             commands::open_data_dir,
             commands::open_dir,
             commands::clear_thumbnail_cache,

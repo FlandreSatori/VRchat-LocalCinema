@@ -25,7 +25,8 @@ import {
   type ComponentDownloadProgress,
   type UnlistenFn,
 } from '../lib/api'
-import { serverStore, applyServerStatus, loadSettings, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
+import { serverStore, mediaStore, largeMediaItems, applyServerStatus, loadSettings, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
+import { confirmDialog } from '../lib/confirm'
 import { formatTime } from '../lib/format'
 import { toast, errMsg } from '../lib/toast'
 
@@ -127,6 +128,14 @@ async function loadCloudflared() {
 
 async function operateTunnel(kind: 'start' | 'stop') {
   if (tunnelOperating.value) return
+  if (kind === 'start') {
+    const count = largeMediaItems.value.length
+    if (count && !(await confirmDialog({
+      title: '启动公网隧道',
+      description: `媒体库中有 ${count} 个 2 GB 以上视频。公网播放受本机上传带宽影响，建议分享前压制为流媒体 MP4。仍要启动隧道吗？`,
+      confirmText: '仍然启动',
+    }))) return
+  }
   tunnelOperating.value = kind
   try {
     applyTunnelStatus(kind === 'start' ? await startTunnel() : await stopTunnel())

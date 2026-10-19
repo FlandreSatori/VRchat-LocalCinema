@@ -12,13 +12,18 @@ export const toasts = reactive<ToastItem[]>([])
 
 let nextId = 1
 
+/// 停留时长按字数计算：字越多看得越久（每字 130ms，最短 2s，最长 10s）
+function durationFor(message: string): number {
+  return Math.min(10_000, Math.max(2_000, message.length * 130))
+}
+
 function push(type: ToastType, message: string) {
   const id = nextId++
   toasts.push({ id, type, message })
   setTimeout(() => {
     const idx = toasts.findIndex((t) => t.id === id)
     if (idx !== -1) toasts.splice(idx, 1)
-  }, 3000)
+  }, durationFor(message))
 }
 
 export const toast = {

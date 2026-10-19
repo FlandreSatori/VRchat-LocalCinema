@@ -53,6 +53,10 @@ export interface Settings {
   streamBufferKb: number
   /** 禁用电源节流（Windows EcoQoS 豁免），默认开启 */
   disablePowerThrottling: boolean
+  /** 一键压制 720p 峰值码率（Mbps，范围 1-100，保留两位小数） */
+  streaming720pBitrateMbps: number
+  /** 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数） */
+  streaming1080pBitrateMbps: number
   easytier: EasytierConfig
 }
 
@@ -350,6 +354,12 @@ export interface TranscodeOptions {
   audioSampleRate?: number | null
   /** MP4 faststart（默认开启） */
   faststart?: boolean | null
+  /** 视频峰值码率（如 6000k） */
+  maxVideoBitrate?: string | null
+  /** 视频码率缓冲区（如 12000k） */
+  videoBufferSize?: string | null
+  /** 关键帧间隔（帧数） */
+  keyframeInterval?: number | null
 }
 export interface TranscodeSourceProfile {
   videoStream: number
@@ -391,6 +401,24 @@ export function transcodeMedia(
   options?: TranscodeOptions
 ): Promise<ConvertTask> {
   return invoke('transcode_media', { id, overwrite, options })
+}
+/** 一键压制为流媒体 MP4：默认 AV1（体积更小且可播放）。
+ *  不提升分辨率（仅在源高于 1080p 时降采样）、不强制音频采样率；
+ *  码率由 CRF 决定，设置为「不高于」的上限。 */
+export function transcodeStreamingCopy(
+  id: string,
+  resolution: 'original' | '1080',
+  maxrateMbps: number
+): Promise<ConvertTask> {
+  const kbps = Math.max(1, Math.round(maxrateMbps * 1000))
+  return invoke('transcode_media', {
+    id, overwrite: false, options: {
+      videoMode: 'av1', audioMode: 'aac', includeAudio: true, subtitleMode: 'drop',
+      resolution, crf: 28, preset: '10', pixFmt: 'yuv420p',
+      audioBitrate: '160k', audioChannels: 2, faststart: true,
+      maxVideoBitrate: `${kbps}k`, videoBufferSize: `${kbps * 2}k`,
+    } satisfies TranscodeOptions,
+  })
 }
 export function transcodeOutputExists(id: string, kind?: 'transcode' | 'segment'): Promise<boolean> {
   return invoke('transcode_output_exists', { id, kind })
@@ -558,6 +586,14 @@ export function isFirstLaunch(): Promise<boolean> {
 }
 export function markDisclaimerAccepted(): Promise<void> {
   return invoke('mark_disclaimer_accepted')
+}
+/** 程序是否运行在系统临时目录（如直接在压缩包内运行）：启动时需警告并退出 */
+export function isRunningInTempDir(): Promise<boolean> {
+  return invoke('is_running_in_temp_dir')
+}
+/** 退出应用（与托盘菜单「退出」一致） */
+export function quitApp(): Promise<void> {
+  return invoke('quit_app')
 }
 export function openDataDir(): Promise<void> {
   return invoke('open_data_dir')

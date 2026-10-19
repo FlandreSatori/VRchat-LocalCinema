@@ -15,7 +15,7 @@ import {
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
-import { loadSettings, convertTaskStore, tunnelStore } from '../lib/store'
+import { loadSettings, convertTaskStore, tunnelStore, transcodeStreamingItem } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 import { cn } from '../lib/utils'
 
@@ -43,6 +43,7 @@ const urlError = ref('')
 const segments = ref<SegmentEntry[]>([])
 const segmentHint = ref('')
 const copiedId = ref('')
+const shareWarningOpen = ref(false)
 /// 每次重建自增；开关弹窗、切换媒体/模式/格式时旧请求失效，迟到结果被丢弃
 let rebuildGeneration = 0
 
@@ -166,8 +167,26 @@ async function rebuild() {
   }
 }
 
-async function copy() {
+async function queueShareCompression() {
+  const item = props.item
+  if (!item) return
+  try {
+    await transcodeStreamingItem(item)
+    shareWarningOpen.value = false
+    toast.info('已加入压制队列；继续复制原视频链接')
+    await copyNow(true)
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+async function copyNow(skipShareWarning = false) {
   if (!url.value) return
+  const isLargeShared = (props.item?.fileSize ?? 0) >= 2 * 1024 * 1024 * 1024 && mode.value !== 'localhost'
+  if (isLargeShared && !skipShareWarning) {
+    shareWarningOpen.value = true
+    return
+  }
   try {
     const value = mode.value === 'tunnel' && props.item
       ? await buildTunnelUrl(props.item.id) : url.value
@@ -181,6 +200,15 @@ async function copy() {
   } catch (e) {
     toast.error(errMsg(e))
   }
+}
+
+async function copy() {
+  await copyNow()
+}
+
+async function copyOriginal() {
+  shareWarningOpen.value = false
+  await copyNow(true)
 }
 
 async function copySegment(seg: SegmentEntry) {
@@ -212,6 +240,17 @@ async function openInBrowser() {
 
 <template>
   <Dialog :open="open" @update:open="emit('update:open', $event)" title="复制播放链接" :description="item?.title">
+    <Dialog
+      :open="shareWarningOpen"
+      title="分享大文件链接"
+      description="该视频超过 2 GB。局域网/公网播放受本机上传带宽影响，建议先压制为流媒体 MP4。"
+      @update:open="shareWarningOpen = $event"
+    >
+      <div class="flex flex-wrap justify-end gap-2">
+        <Button variant="outline" @click="copyOriginal">仍复制原片链接</Button>
+        <Button @click="queueShareCompression">压制并继续复制</Button>
+      </div>
+    </Dialog>
     <div class="space-y-4">
       <div v-if="isOnline" class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
         在线视频由本软件在你的电脑上转发 B 站官方 CDN 流，因此只生成 127.0.0.1 本机链接（不提供局域网链接）。

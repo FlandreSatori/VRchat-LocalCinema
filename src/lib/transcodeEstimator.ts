@@ -24,12 +24,17 @@ export interface EstimatorWeights {
   audioRealtime: number
   copyBytesPerSecond: number
 }
-/** FPS 乘数；AV1 为实际 libaom-av1 cpu-used=6 的保守起点，不套用 SVT-AV1 或 x264 preset。 */
+/** FPS 乘数；AV1 由 SVT-AV1 编码，档位见 [`svtPresetFactor`]（不再按 libaom-av1 的 cpu-used 估算）。 */
 export const DEFAULT_ESTIMATOR_WEIGHTS: EstimatorWeights = {
   baseFps: 120,
-  codec: { h264: 1, h265: 0.32, hevc: 0.32, av1: 1 / 12 },
+  codec: { h264: 1, h265: 0.32, hevc: 0.32, av1: 0.35 },
   preset: { ultrafast: 3.2, superfast: 2.4, veryfast: 1.8, faster: 1.4, fast: 1.2, medium: 1, slow: 0.62, slower: 0.35, veryslow: 0.18 },
   tenBit: 0.75, burn: 0.85, audioRealtime: 80, copyBytesPerSecond: 300_000_000,
+}
+/** SVT-AV1 的 -preset 是整数档位（-2..13，越大越快），以档位 8 为基准；非数字（如 x264 风格名称）按基准值处理。 */
+function svtPresetFactor(preset: string | null | undefined): number {
+  const n = preset == null ? NaN : Number(preset)
+  return Number.isFinite(n) ? 2 ** ((n - 8) / 3) : 1
 }
 const positive = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0
 const videoMode = (o: TranscodeOptions) => o.subtitleMode === 'burn' && o.videoMode === 'copy' ? 'h264' : o.videoMode ?? 'h264'
@@ -70,7 +75,7 @@ export function estimateL1(source: EstimateSource, weights = DEFAULT_ESTIMATOR_W
     if (positive(targetHeight)) {
       const pixels = p.width * p.height * (targetHeight / p.height) ** 2
       const pixFmt = o.pixFmt === 'auto' ? p.pixFmt : o.pixFmt ?? (mode === 'h265' ? 'yuv420p10le' : 'yuv420p')
-      const preset = mode === 'av1' ? 1 : weights.preset[o.preset ?? 'medium'] ?? 1
+      const preset = mode === 'av1' ? svtPresetFactor(o.preset) : weights.preset[o.preset ?? 'medium'] ?? 1
       const crf = Math.max(0.75, Math.min(1.25, 1 + ((o.crf ?? 20) - 23) * 0.015))
       const decode = ({ h264: 1, hevc: 0.9, h265: 0.9, av1: 0.85, vp9: 0.85 } as Record<string, number>)[p.videoCodec.toLowerCase()] ?? 1
       const throughput = weights.baseFps * (2_073_600 / pixels) ** 0.85 * (weights.codec[mode] ?? 1) * preset
@@ -82,7 +87,7 @@ export function estimateL1(source: EstimateSource, weights = DEFAULT_ESTIMATOR_W
   if (!positive(seconds)) seconds = null
   const reason = seconds === null ? '源参数不足，无法估算耗时'
     : mode === 'copy' ? '直拷按 300 MB/s + AAC 时长 / 80 估算；跳过编码采样'
-      : `经验估算 ±35%（参考范围，非精度保证）${mode === 'av1' ? '；适配 libaom-av1 cpu-used=6，非 SVT-AV1' : ''}`
+      : `经验估算 ±35%（参考范围，非精度保证）${mode === 'av1' ? '；按 SVT-AV1 估算' : ''}`
   return { layer: 'L1', seconds, fps, duration, status: 'complete', confidence: seconds === null ? 'unavailable' : 'heuristic',
     reason, calibrationK: k, effectiveOptions: o }
 }
@@ -218,7 +223,7 @@ export function createTranscodeEstimator(config: EstimatorConfig = {}) {
             const audioSeconds = Math.max(0, baseline.seconds - source.profile.totalFrames / baseline.fps)
             finish({ ...baseline, layer: 'L2', seconds: source.profile.totalFrames / probe.fps + audioSeconds, fps: probe.fps,
               status: 'complete', confidence: 'sampled', calibrationK: nextK,
-              reason: `短样本参考 ±10%（${probe.samples.length} 个有效点），非整片精度保证；未覆盖全部内容与封装 I/O${videoMode(normalized.effectiveOptions) === 'av1' ? '；libaom-av1，非 SVT-AV1' : ''}` })
+              reason: `短样本参考 ±10%（${probe.samples.length} 个有效点），非整片精度保证；未覆盖全部内容与封装 I/O${videoMode(normalized.effectiveOptions) === 'av1' ? '；SVT-AV1' : ''}` })
           } catch (error) {
             if (!current()) return
             const fallback = source ? local(source) : { layer: 'L1' as const, seconds: null, fps: null, duration: null,
