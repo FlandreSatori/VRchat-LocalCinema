@@ -58,6 +58,36 @@ async fn wait_running(server: &HttpServer) -> u16 {
 }
 
 #[tokio::test]
+async fn test_port_change_while_old_video_stream_is_draining() {
+    let (server, item, _dir, id) = setup();
+    // 稀疏大文件使旧响应保持在途，无需实际写入整部视频。
+    std::fs::OpenOptions::new().write(true).open(&item.file_path).unwrap()
+        .set_len(64 * 1024 * 1024).unwrap();
+    server.start("127.0.0.1", 0).await.unwrap();
+    let first_port = server.status().port;
+    let client = reqwest::Client::new();
+    let response = client.get(format!("http://127.0.0.1:{}/media/{}", first_port, id))
+        .send().await.unwrap();
+    assert_eq!(response.status(), 200);
+
+    server.stop();
+    assert!(!server.status().running);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    server.start("127.0.0.1", 0).await.unwrap();
+    let second_port = server.status().port;
+    assert_ne!(first_port, second_port);
+
+    // 旧实例完成排空后，不得把新实例状态覆盖成 stopped。
+    drop(response);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(server.status().running);
+    assert_eq!(server.status().port, second_port);
+    assert_eq!(client.get(format!("http://127.0.0.1:{}/", second_port))
+        .send().await.unwrap().status(), 200);
+    server.stop();
+}
+
+#[tokio::test]
 async fn test_http_media_serving() {
     let (server, item, _dir, id) = setup();
     server.start("127.0.0.1", 0).await.expect("start failed");

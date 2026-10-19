@@ -15,6 +15,7 @@ pub mod settings;
 pub mod system_codecs;
 pub mod thumbnail;
 pub mod transcode;
+pub mod tunnel;
 pub mod url_builder;
 
 use std::sync::atomic::AtomicBool;
@@ -138,10 +139,12 @@ pub fn run() {
                 settings: RwLock::new(settings_fixed.clone()),
                 db,
                 server: server.clone(),
+                network_operation: tokio::sync::Mutex::new(()),
                 recent_logs,
                 allow_peer_view,
                 easytier_forced_lan: AtomicBool::new(false),
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
+                tunnel: tunnel::TunnelManager::new(),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
             };
@@ -153,12 +156,11 @@ pub fn run() {
 
             // 自动启动 HTTP 服务
             let handle = app.handle().clone();
-            let settings_for_start = settings_fixed.clone();
             tauri::async_runtime::spawn(async move {
-                let server = {
-                    let st = handle.state::<AppState>();
-                    st.server.clone()
-                };
+                let st = handle.state::<AppState>();
+                let _network = st.network_operation.lock().await;
+                let settings_for_start = st.current_settings();
+                let server = st.server.clone();
                 if let Err(e) = server
                     .start(&settings_for_start.bind_ip(), settings_for_start.port)
                     .await
@@ -184,6 +186,7 @@ pub fn run() {
                     // 退出前停止 HTTP 服务与组网进程（组网提权运行，退出时不阻塞等待）
                     state.server.stop();
                     state.easytier.stop_detached();
+                    state.tunnel.stop_detached();
                 }
             }
         })
@@ -223,6 +226,10 @@ pub fn run() {
             commands::get_components_status,
             commands::download_component,
             commands::open_component_page,
+            commands::get_tunnel_status,
+            commands::start_tunnel,
+            commands::stop_tunnel,
+            commands::build_tunnel_url,
             commands::get_easytier_status,
             commands::start_easytier,
             commands::stop_easytier,
@@ -283,6 +290,7 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let state = app.state::<AppState>();
                 state.server.stop();
                 state.easytier.stop_detached();
+                state.tunnel.stop_detached();
                 app.exit(0);
             }
             _ => {}

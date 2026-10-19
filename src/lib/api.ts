@@ -46,6 +46,8 @@ export interface Settings {
   ffprobePath: string
   easytierCorePath: string
   easytierCliPath: string
+  /** cloudflared 路径（Cloudflare 快速隧道），空表示自动检测 */
+  cloudflaredPath: string
   downloadDir: string
   easytier: EasytierConfig
 }
@@ -103,6 +105,17 @@ export interface ServerStatus {
   error: string | null
 }
 
+/** Cloudflare 快速隧道状态 */
+export interface TunnelStatus {
+  running: boolean
+  ready: boolean
+  /** 公网 HTTPS 地址（形如 https://xxx.trycloudflare.com）；启动初期为 null */
+  url: string | null
+  port: number | null
+  error: string | null
+  revision: number
+}
+
 export interface NetInterface {
   name: string
   ips: string[]
@@ -132,8 +145,10 @@ export interface AppPaths {
   portable: boolean
 }
 
+export type ComponentKindId = 'ffmpeg' | 'easytier' | 'cloudflared'
+
 export interface ComponentStatus {
-  kind: 'ffmpeg' | 'easytier'
+  kind: ComponentKindId
   label: string
   installed: boolean
   source: 'custom' | 'bundled' | 'downloaded' | 'system' | 'none'
@@ -585,16 +600,34 @@ export function onServerStatusChanged(callback: (status: ServerStatus) => void):
 export function getComponentsStatus(): Promise<ComponentStatus[]> {
   return invoke('get_components_status')
 }
-export function downloadComponent(kind: 'ffmpeg' | 'easytier'): Promise<ComponentStatus> {
+export function downloadComponent(kind: ComponentKindId): Promise<ComponentStatus> {
   return invoke('download_component', { kind })
 }
-export function openComponentPage(kind: 'ffmpeg' | 'easytier'): Promise<void> {
+export function openComponentPage(kind: ComponentKindId): Promise<void> {
   return invoke('open_component_page', { kind })
 }
 export function onComponentDownloadProgress(
   callback: (progress: ComponentDownloadProgress) => void
 ): Promise<UnlistenFn> {
   return listen<ComponentDownloadProgress>('component-download-progress', (e) => callback(e.payload))
+}
+
+// Cloudflare 快速隧道（无需组网即可公网分享）
+export function getTunnelStatus(): Promise<TunnelStatus> {
+  return invoke('get_tunnel_status')
+}
+export function startTunnel(): Promise<TunnelStatus> {
+  return invoke('start_tunnel')
+}
+export function stopTunnel(): Promise<TunnelStatus> {
+  return invoke('stop_tunnel')
+}
+/** 生成某条媒体的公网隧道播放链接（需隧道已启动） */
+export function buildTunnelUrl(id: string): Promise<string> {
+  return invoke('build_tunnel_url', { id })
+}
+export function onTunnelStatusChanged(callback: (status: TunnelStatus) => void): Promise<UnlistenFn> {
+  return listen<TunnelStatus>('tunnel-status-changed', (e) => callback(e.payload))
 }
 
 // EasyTier 组网

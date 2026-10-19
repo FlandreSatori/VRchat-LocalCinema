@@ -15,15 +15,20 @@ use crate::settings::{AppPaths, Settings};
 pub const FFMPEG_MANUAL_URL: &str = "https://ffmpeg.org/download.html";
 /// EasyTier 发布页（手动下载入口）
 pub const EASYTIER_MANUAL_URL: &str = "https://github.com/EasyTier/EasyTier/releases/";
+/// cloudflared 发布页（手动下载入口）
+pub const CLOUDFLARED_MANUAL_URL: &str = "https://github.com/cloudflare/cloudflared/releases/";
 
 const FFMPEG_RELEASE_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";
 const EASYTIER_RELEASE_API: &str = "https://api.github.com/repos/EasyTier/EasyTier/releases/latest";
+const CLOUDFLARED_RELEASE_API: &str =
+    "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ComponentKind {
     Ffmpeg,
     Easytier,
+    Cloudflared,
 }
 
 impl ComponentKind {
@@ -31,6 +36,7 @@ impl ComponentKind {
         match s {
             "ffmpeg" => Ok(Self::Ffmpeg),
             "easytier" => Ok(Self::Easytier),
+            "cloudflared" => Ok(Self::Cloudflared),
             other => Err(AppError::Msg(format!("未知组件: {}", other))),
         }
     }
@@ -39,6 +45,7 @@ impl ComponentKind {
         match self {
             Self::Ffmpeg => "ffmpeg",
             Self::Easytier => "easytier",
+            Self::Cloudflared => "cloudflared",
         }
     }
 
@@ -46,6 +53,7 @@ impl ComponentKind {
         match self {
             Self::Ffmpeg => "FFmpeg",
             Self::Easytier => "EasyTier",
+            Self::Cloudflared => "cloudflared",
         }
     }
 
@@ -53,6 +61,7 @@ impl ComponentKind {
         match self {
             Self::Ffmpeg => FFMPEG_MANUAL_URL,
             Self::Easytier => EASYTIER_MANUAL_URL,
+            Self::Cloudflared => CLOUDFLARED_MANUAL_URL,
         }
     }
 
@@ -61,6 +70,7 @@ impl ComponentKind {
         match self {
             Self::Ffmpeg => "ffmpeg",
             Self::Easytier => "easytier",
+            Self::Cloudflared => "cloudflared",
         }
     }
 
@@ -69,6 +79,7 @@ impl ComponentKind {
         match self {
             Self::Ffmpeg => &["ffmpeg", "ffprobe"],
             Self::Easytier => &["easytier-core", "easytier-cli"],
+            Self::Cloudflared => &["cloudflared"],
         }
     }
 }
@@ -213,6 +224,19 @@ pub fn easytier_cli_binary(
     )
 }
 
+/// cloudflared（Cloudflare 快速隧道）路径解析
+pub fn cloudflared_binary(
+    settings: &Settings,
+    paths: &AppPaths,
+) -> (Option<PathBuf>, ComponentSource) {
+    resolve_binary(
+        ComponentKind::Cloudflared,
+        "cloudflared",
+        &settings.cloudflared_path,
+        paths,
+    )
+}
+
 /// 组件整体状态，供前端展示
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +283,7 @@ fn primary_version_args(kind: ComponentKind) -> &'static [&'static str] {
     match kind {
         ComponentKind::Ffmpeg => &["-version"],
         ComponentKind::Easytier => &["--version"],
+        ComponentKind::Cloudflared => &["--version"],
     }
 }
 
@@ -271,6 +296,7 @@ pub fn status(kind: ComponentKind, settings: &Settings, paths: &AppPaths) -> Com
             (ComponentKind::Ffmpeg, "ffprobe") => settings.ffprobe_path.as_str(),
             (ComponentKind::Easytier, "easytier-core") => settings.easytier_core_path.as_str(),
             (ComponentKind::Easytier, "easytier-cli") => settings.easytier_cli_path.as_str(),
+            (ComponentKind::Cloudflared, "cloudflared") => settings.cloudflared_path.as_str(),
             _ => "",
         };
         let (path, source) = resolve_binary(kind, base, configured, paths);
@@ -328,6 +354,10 @@ fn arch_tag(kind: ComponentKind) -> &'static str {
         (ComponentKind::Easytier, "aarch64") => "aarch64",
         (ComponentKind::Easytier, "x86") => "i686",
         (ComponentKind::Easytier, _) => "x86_64",
+        // cloudflared 资产命名：cloudflared-windows-amd64.exe / -arm64.exe / -386.exe
+        (ComponentKind::Cloudflared, "aarch64") => "arm64",
+        (ComponentKind::Cloudflared, "x86") => "386",
+        (ComponentKind::Cloudflared, _) => "amd64",
     }
 }
 
@@ -346,11 +376,11 @@ fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String, 
             continue;
         }
         let n = name.to_ascii_lowercase();
-        if !n.ends_with(".zip") || !n.contains(arch) {
-            continue;
-        }
         let score = match kind {
             ComponentKind::Ffmpeg => {
+                if !n.ends_with(".zip") || !n.contains(arch) {
+                    continue;
+                }
                 // 排除 LGPL 共享版，优先静态 GPL 版
                 if n.contains("lgpl") || !n.contains("gpl") {
                     continue;
@@ -362,7 +392,17 @@ fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String, 
                 }
             }
             ComponentKind::Easytier => {
+                if !n.ends_with(".zip") || !n.contains(arch) {
+                    continue;
+                }
                 if !n.contains("windows") || n.contains("gui") || n.contains("-web") {
+                    continue;
+                }
+                20
+            }
+            ComponentKind::Cloudflared => {
+                // cloudflared 的 Windows 资产是单文件 exe，不是压缩包
+                if !n.ends_with(".exe") || !n.contains(arch) {
                     continue;
                 }
                 20
@@ -379,6 +419,7 @@ fn release_api(kind: ComponentKind) -> &'static str {
     match kind {
         ComponentKind::Ffmpeg => FFMPEG_RELEASE_API,
         ComponentKind::Easytier => EASYTIER_RELEASE_API,
+        ComponentKind::Cloudflared => CLOUDFLARED_RELEASE_API,
     }
 }
 
@@ -492,13 +533,25 @@ pub async fn download_and_install(
         }
     }
 
-    let zip_for_extract = zip_path.clone();
-    let dest_for_extract = dest_dir.clone();
-    let extracted =
-        tokio::task::spawn_blocking(move || extract_binaries(&zip_for_extract, &dest_for_extract))
-            .await
-            .map_err(|e| AppError::Msg(format!("解压任务失败: {}", e)))??;
-    let _ = std::fs::remove_file(&zip_path);
+    let is_single_exe = asset.name.to_ascii_lowercase().ends_with(".exe");
+    let extracted = if is_single_exe {
+        // 单文件可执行组件（如 cloudflared）：直接落盘为 <组件目录>/<主程序名>.exe
+        let dest = dest_dir.join(exe_name(kind.binaries()[0]));
+        if std::fs::rename(&zip_path, &dest).is_err() {
+            std::fs::copy(&zip_path, &dest)?;
+            let _ = std::fs::remove_file(&zip_path);
+        }
+        1
+    } else {
+        let zip_for_extract = zip_path.clone();
+        let dest_for_extract = dest_dir.clone();
+        let n =
+            tokio::task::spawn_blocking(move || extract_binaries(&zip_for_extract, &dest_for_extract))
+                .await
+                .map_err(|e| AppError::Msg(format!("解压任务失败: {}", e)))??;
+        let _ = std::fs::remove_file(&zip_path);
+        n
+    };
 
     // 校验必要文件是否齐全
     let mut missing = Vec::new();

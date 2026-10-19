@@ -19,6 +19,7 @@ use crate::media_library::{Db, MediaItem, MediaStatus, MediaSummary};
 use crate::network_interfaces::{self, NetInterface};
 use crate::settings::{AppPaths, CloseBehavior, ListenMode, Settings, UrlMode};
 use crate::thumbnail;
+use crate::tunnel::TunnelStatus;
 use crate::url_builder::{self, UrlInput};
 
 pub struct AppState {
@@ -26,6 +27,8 @@ pub struct AppState {
     pub settings: RwLock<Settings>,
     pub db: Arc<Mutex<Db>>,
     pub server: HttpServer,
+    /// HTTP 重配与隧道启停共用，避免端口切换时仍启动指向旧端口的隧道。
+    pub network_operation: tokio::sync::Mutex<()>,
     pub recent_logs: RecentLogs,
     /// 是否允许对等节点查看本机媒体库（与设置同步，供 HTTP 服务读取）
     pub allow_peer_view: Arc<AtomicBool>,
@@ -33,6 +36,8 @@ pub struct AppState {
     /// 组网停止时据此自动恢复为本地模式，用户手动设置的局域网模式不受影响
     pub easytier_forced_lan: AtomicBool,
     pub easytier: easytier::EasytierManager,
+    /// Cloudflare 快速隧道（无需组网即可公网分享）
+    pub tunnel: crate::tunnel::TunnelManager,
     /// 转码任务队列（按任务序列执行）
     pub convert_queue: crate::convert_queue::ConvertQueue,
     /// 正在进行的 HLS 转码任务（媒体 id）
@@ -69,6 +74,7 @@ pub async fn save_settings(
     state: State<'_, AppState>,
     mut settings: Settings,
 ) -> AppResult<()> {
+    let _network = state.network_operation.lock().await;
     if settings.port == 0 {
         return Err(AppError::Msg("端口必须在 1-65535 之间".to_string()));
     }
@@ -101,6 +107,12 @@ pub async fn save_settings(
         }
     }
 
+    // 端口改变会令现有隧道回源地址失效；关闭旧隧道，由用户手动重新开启。
+    if old.port != settings.port && state.tunnel.status().running {
+        state.tunnel.stop(&app).await?;
+        tracing::info!("HTTP 端口变化，已关闭公网隧道，请重新启动以生成新链接");
+    }
+
     {
         let mut guard = state.settings.write().unwrap_or_else(|e| e.into_inner());
         *guard = settings.clone();
@@ -128,6 +140,9 @@ pub async fn save_settings(
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         let result = server.start(&settings.bind_ip(), settings.port).await;
         AppState::emit_status(&app, &server);
+        if result.is_err() {
+            state.tunnel.stop(&app).await?;
+        }
         result?;
     }
     Ok(())
@@ -147,6 +162,7 @@ pub async fn get_server_status(state: State<'_, AppState>) -> AppResult<ServerSt
 
 #[tauri::command]
 pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> AppResult<ServerStatus> {
+    let _network = state.network_operation.lock().await;
     let settings = state.current_settings();
     let server = state.server.clone();
     let r = server.start(&settings.bind_ip(), settings.port).await;
@@ -156,6 +172,8 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> AppResu
 
 #[tauri::command]
 pub async fn stop_server(app: AppHandle, state: State<'_, AppState>) -> AppResult<ServerStatus> {
+    let _network = state.network_operation.lock().await;
+    state.tunnel.stop(&app).await?;
     state.server.stop();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     AppState::emit_status(&app, &state.server);
@@ -164,12 +182,17 @@ pub async fn stop_server(app: AppHandle, state: State<'_, AppState>) -> AppResul
 
 #[tauri::command]
 pub async fn restart_server(app: AppHandle, state: State<'_, AppState>) -> AppResult<ServerStatus> {
+    let _network = state.network_operation.lock().await;
     let settings = state.current_settings();
     let server = state.server.clone();
     server.stop();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    server.start(&settings.bind_ip(), settings.port).await?;
+    let result = server.start(&settings.bind_ip(), settings.port).await;
     AppState::emit_status(&app, &server);
+    if result.is_err() {
+        state.tunnel.stop(&app).await?;
+    }
+    result?;
     Ok(server.status())
 }
 
@@ -977,6 +1000,7 @@ pub async fn get_components_status(state: State<'_, AppState>) -> AppResult<Vec<
     Ok(vec![
         components::status(ComponentKind::Ffmpeg, &settings, &state.paths),
         components::status(ComponentKind::Easytier, &settings, &state.paths),
+        components::status(ComponentKind::Cloudflared, &settings, &state.paths),
     ])
 }
 
@@ -1019,6 +1043,62 @@ pub async fn open_component_page(app: AppHandle, kind: String) -> AppResult<()> 
         .map_err(|e| AppError::Msg(format!("打开下载页失败: {}", e)))
 }
 
+// ===== Cloudflare 快速隧道（无需组网即可公网分享） =====
+
+#[tauri::command]
+pub async fn get_tunnel_status(state: State<'_, AppState>) -> AppResult<TunnelStatus> {
+    Ok(state.tunnel.status())
+}
+
+#[tauri::command]
+pub async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> AppResult<TunnelStatus> {
+    let _network = state.network_operation.lock().await;
+    let settings = state.current_settings();
+    let (bin, _) = components::cloudflared_binary(&settings, &state.paths);
+    let bin = bin.ok_or_else(|| {
+        AppError::Msg("未检测到 cloudflared，请先在设置中下载或指定组件".to_string())
+    })?;
+    // 隧道转发的是本机媒体服务，确保 HTTP 服务在运行
+    if !state.server.status().running {
+        state.server.start(&settings.bind_ip(), settings.port).await?;
+        AppState::emit_status(&app, &state.server);
+    }
+    state.tunnel.start(&app, &bin, state.server.status().port).await
+}
+
+#[tauri::command]
+pub async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> AppResult<TunnelStatus> {
+    let _network = state.network_operation.lock().await;
+    state.tunnel.stop(&app).await
+}
+
+/// 生成某条媒体的公网隧道播放链接（需隧道已启动）
+#[tauri::command]
+pub async fn build_tunnel_url(state: State<'_, AppState>, id: String) -> AppResult<String> {
+    let _network = state.network_operation.lock().await;
+    let server = state.server.status();
+    if !server.running {
+        return Err(AppError::Msg("HTTP 服务未运行，请先启动公网隧道".to_string()));
+    }
+    let base = state.tunnel.status().playback_base(server.port)?;
+    let item = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        db.get(&id)?
+    }
+    .ok_or_else(|| AppError::Msg("媒体不存在".to_string()))?;
+    if item.source_kind == "online" {
+        return Err(AppError::Msg("在线视频不支持公网隧道链接".to_string()));
+    }
+    if !url_builder::valid_basename(&item.file_name) {
+        return Err(AppError::Msg("文件名不能映射为播放 URL".to_string()));
+    }
+    Ok(format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        url_builder::encode_segment(&item.file_name)
+    ))
+}
+
 // ===== EasyTier 组网 =====
 
 #[tauri::command]
@@ -1029,6 +1109,7 @@ pub async fn get_easytier_status(state: State<'_, AppState>) -> AppResult<Easyti
 
 #[tauri::command]
 pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
+    let _network = state.network_operation.lock().await;
     let mut settings = state.current_settings();
     // 组网媒体共享通过虚拟网段访问 HTTP 服务，仅本机（127.0.0.1）监听会导致
     // 成员之间（包括查看自己的媒体库）无法连接，启动组网时自动切换为局域网监听
@@ -1088,6 +1169,7 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
 
 #[tauri::command]
 pub async fn stop_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
+    let _network = state.network_operation.lock().await;
     state.easytier.stop().await;
     // 局域网监听是启动组网时自动切换的 → 停止组网后自动恢复为本地模式；
     // 若局域网模式是用户手动设置（forced_lan 未置位）则保持不变。

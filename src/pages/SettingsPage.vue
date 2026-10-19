@@ -30,6 +30,7 @@ import {
   onComponentDownloadProgress,
   type AppPaths,
   type CloseBehavior,
+  type ComponentKindId,
   type ComponentStatus,
   type ConvertCacheInfo,
   type ListenMode,
@@ -59,6 +60,7 @@ const form = reactive<Settings>({
   ffprobePath: '',
   easytierCorePath: '',
   easytierCliPath: '',
+  cloudflaredPath: '',
   downloadDir: '',
   easytier: {
     protocols: ['tcp', 'ws'],
@@ -85,7 +87,7 @@ const components = ref<ComponentStatus[]>([])
 const installing = ref<string | null>(null)
 const progressMap = reactive<Record<string, { downloaded: number; total: number | null }>>({})
 
-function componentOf(kind: 'ffmpeg' | 'easytier'): ComponentStatus | undefined {
+function componentOf(kind: ComponentKindId): ComponentStatus | undefined {
   return components.value.find((c) => c.kind === kind)
 }
 
@@ -120,7 +122,7 @@ async function refreshComponents() {
   }
 }
 
-async function installComponent(kind: 'ffmpeg' | 'easytier') {
+async function installComponent(kind: ComponentKindId) {
   if (installing.value) return
   installing.value = kind
   delete progressMap[kind]
@@ -138,7 +140,7 @@ async function installComponent(kind: 'ffmpeg' | 'easytier') {
   }
 }
 
-async function openManual(kind: 'ffmpeg' | 'easytier') {
+async function openManual(kind: ComponentKindId) {
   try {
     await openComponentPage(kind)
   } catch (e) {
@@ -260,6 +262,14 @@ async function browseEasytierCli() {
   try {
     const p = await pickExe('选择 easytier-cli 可执行文件')
     if (p) form.easytierCliPath = p
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+async function browseCloudflared() {
+  try {
+    const p = await pickExe('选择 cloudflared 可执行文件')
+    if (p) form.cloudflaredPath = p
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -565,10 +575,10 @@ onUnmounted(() => {
         </Button>
       </div>
 
-      <div v-for="kind in (['ffmpeg', 'easytier'] as const)" :key="kind" class="space-y-2 rounded-md border border-border p-3">
+      <div v-for="kind in (['ffmpeg', 'easytier', 'cloudflared'] as const)" :key="kind" class="space-y-2 rounded-md border border-border p-3">
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2">
-            <span class="text-sm font-medium">{{ componentOf(kind)?.label ?? (kind === 'ffmpeg' ? 'FFmpeg' : 'EasyTier') }}</span>
+            <span class="text-sm font-medium">{{ componentOf(kind)?.label ?? (kind === 'ffmpeg' ? 'FFmpeg' : kind === 'easytier' ? 'EasyTier' : 'cloudflared') }}</span>
             <Badge v-if="componentOf(kind)" :variant="sourceVariant(componentOf(kind)!)">
               {{ sourceText(componentOf(kind)!) }}
             </Badge>
@@ -647,6 +657,21 @@ onUnmounted(() => {
         </div>
       </div>
       <p class="text-xs text-muted-foreground">组网配置请前往「EasyTier 组网」页面。</p>
+    </Card>
+
+    <Card class="space-y-4 p-5">
+      <h2 class="font-medium">Cloudflare 隧道手动路径</h2>
+      <div class="space-y-1.5">
+        <Label>cloudflared 路径</Label>
+        <div class="flex gap-2">
+          <Input v-model="form.cloudflaredPath" placeholder="留空则依次检测内置目录和 PATH" class="flex-1" />
+          <Button variant="outline" @click="browseCloudflared">
+            <FolderOpen class="h-4 w-4" />
+            浏览…
+          </Button>
+        </div>
+        <p class="text-xs text-muted-foreground">用于「公网隧道」快速分享；隧道开关在「HTTP 服务」页面。</p>
+      </div>
     </Card>
 
     <Card class="space-y-4 p-5">
