@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -62,6 +62,7 @@ pub struct HttpServer {
     status: Arc<RwLock<ServerStatus>>,
     state: MediaState,
     tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<()>>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl HttpServer {
@@ -89,6 +90,7 @@ impl HttpServer {
                 stream_buf_kb,
             },
             tx: Arc::new(RwLock::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -151,15 +153,17 @@ impl HttpServer {
             let mut lock = self.tx.write().unwrap_or_else(|e| e.into_inner());
             *lock = Some(tx);
         }
-        {
+        let generation = {
             let mut s = self.status.write().unwrap_or_else(|e| e.into_inner());
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             *s = ServerStatus {
                 running: true,
                 bind_addr: actual_addr.clone(),
                 port: actual_port,
                 error: None,
             };
-        }
+            generation
+        };
         let scope = if bind_ip == "0.0.0.0" {
             "局域网(0.0.0.0)"
         } else {
@@ -187,6 +191,7 @@ impl HttpServer {
         );
 
         let status = self.status.clone();
+        let current_generation = self.generation.clone();
         tokio::spawn(async move {
             let serve = srv.with_graceful_shutdown(async move {
                 rx.recv().await;
@@ -194,18 +199,28 @@ impl HttpServer {
             if let Err(e) = serve.await {
                 tracing::error!("HTTP 服务错误: {}", e);
                 let mut s = status.write().unwrap_or_else(|e| e.into_inner());
-                s.running = false;
-                s.error = Some(e.to_string());
+                if current_generation.load(Ordering::SeqCst) == generation {
+                    s.running = false;
+                    s.error = Some(e.to_string());
+                }
             } else {
                 tracing::info!("HTTP 服务已停止");
                 let mut s = status.write().unwrap_or_else(|e| e.into_inner());
-                s.running = false;
+                if current_generation.load(Ordering::SeqCst) == generation {
+                    s.running = false;
+                }
             }
         });
         Ok(())
     }
 
     pub fn stop(&self) {
+        // 停止接受新连接不应等待旧视频流排空，也不能让旧任务覆盖新实例状态。
+        {
+            let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            status.running = false;
+        }
         let tx = self.tx.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some(t) = tx {
             let _ = t.try_send(());

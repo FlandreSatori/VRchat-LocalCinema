@@ -179,6 +179,9 @@ pub struct Settings {
     pub easytier_core_path: String,
     /// easytier-cli 路径，空表示自动检测（内置优先，其次系统 PATH）
     pub easytier_cli_path: String,
+    /// cloudflared 路径，空表示自动检测（内置优先，其次系统 PATH）
+    #[serde(default)]
+    pub cloudflared_path: String,
     /// 从对等节点下载的媒体存放目录，空表示 data_dir/downloads
     pub download_dir: String,
     /// 媒体流读缓冲（KB）：排查播放卡顿时按开发者建议调整，平时不推荐修改
@@ -210,6 +213,7 @@ impl Default for Settings {
             ffprobe_path: String::new(),
             easytier_core_path: String::new(),
             easytier_cli_path: String::new(),
+            cloudflared_path: String::new(),
             download_dir: String::new(),
             stream_buffer_kb: default_stream_buffer_kb(),
             disable_power_throttling: default_disable_power_throttling(),

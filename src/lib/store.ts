@@ -3,6 +3,8 @@ import { message } from '@tauri-apps/plugin-dialog'
 import {
   getServerStatus,
   getSettings,
+  getTunnelStatus,
+  onTunnelStatusChanged,
   listMedia,
   importFiles,
   onMediaUpdated,
@@ -15,6 +17,7 @@ import {
   type Folder,
   type ServerStatus,
   type Settings,
+  type TunnelStatus,
   type ConvertTask,
 } from './api'
 
@@ -36,6 +39,19 @@ export const folderStore = reactive<{ folders: Folder[]; loaded: boolean }>({
 })
 
 export const settingsCache = ref<Settings | null>(null)
+
+export const tunnelStore = reactive<TunnelStatus>({
+  running: false,
+  ready: false,
+  url: null,
+  port: null,
+  error: null,
+  revision: 0,
+})
+
+export function applyTunnelStatus(status: TunnelStatus) {
+  if (status.revision >= tunnelStore.revision) Object.assign(tunnelStore, status)
+}
 
 /// 转码 / 分段 / HLS 任务状态：id -> { kind, percent, status }
 export const convertStore = reactive<{
@@ -137,6 +153,9 @@ export async function initStore() {
   }
   onMediaUpdated(upsertMedia)
   onServerStatusChanged(applyServerStatus)
+  // 先订阅再拉取快照；revision 保证迟到的快照不会覆盖较新的事件。
+  await onTunnelStatusChanged(applyTunnelStatus)
+  getTunnelStatus().then(applyTunnelStatus).catch(() => {})
   listConvertTasks()
     .then(applyConvertTasks)
     .catch(() => {})

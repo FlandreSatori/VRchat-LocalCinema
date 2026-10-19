@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
-import { Copy, Check, ExternalLink, Laptop, Globe, Loader2 } from 'lucide-vue-next'
+import { computed, ref, watch } from 'vue'
+import { Copy, Check, ExternalLink, Laptop, Globe, Cloud, Loader2 } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import Dialog from './ui/Dialog.vue'
 import Button from './ui/Button.vue'
@@ -9,13 +9,13 @@ import Label from './ui/Label.vue'
 import Badge from './ui/Badge.vue'
 import {
   buildMediaUrl,
+  buildTunnelUrl,
   listSegments,
   openUrl,
   type MediaItem,
   type UrlMode,
-  type UnlistenFn,
 } from '../lib/api'
-import { loadSettings, convertTaskStore } from '../lib/store'
+import { loadSettings, convertTaskStore, tunnelStore } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 import { cn } from '../lib/utils'
 
@@ -36,20 +36,23 @@ interface SegmentEntry {
   url: string
 }
 
-const mode = ref<UrlMode>('localhost')
+const mode = ref<LinkMode>('localhost')
 const format = ref<'whole' | 'segment'>('whole')
 const url = ref('')
 const urlError = ref('')
 const segments = ref<SegmentEntry[]>([])
 const segmentHint = ref('')
 const copiedId = ref('')
-let unlisten: UnlistenFn | null = null
 /// 每次重建自增；开关弹窗、切换媒体/模式/格式时旧请求失效，迟到结果被丢弃
 let rebuildGeneration = 0
 
-const modeOptions: { value: UrlMode; label: string; icon: typeof Laptop }[] = [
+/// 链接地址模式：本地 / 局域网 / 公网隧道（Cloudflare 快速隧道）
+type LinkMode = UrlMode | 'tunnel'
+
+const modeOptions: { value: LinkMode; label: string; icon: typeof Laptop }[] = [
   { value: 'localhost', label: '本地模式', icon: Laptop },
   { value: 'lan', label: '局域网模式', icon: Globe },
+  { value: 'tunnel', label: '公网隧道', icon: Cloud },
 ]
 
 const formatOptions: { value: 'whole' | 'segment'; label: string }[] = [
@@ -63,6 +66,8 @@ const modeHint = computed(() => {
       return '127.0.0.1 指向运行播放器的电脑本身。仅当观众本机也运行了本服务时可用。'
     case 'lan':
       return '同一局域网内的设备可访问；EasyTier 组网运行时自动使用虚拟 IP，也可在设置中手动指定网卡。'
+    case 'tunnel':
+      return '通过 Cloudflare 快速隧道暴露为公网 HTTPS 地址，观众无需安装本程序或组网；需先在「HTTP 服务」页启动隧道。'
   }
 })
 
@@ -77,10 +82,6 @@ const sourceId = computed(() => props.item?.sourceMediaId ?? props.item?.id ?? n
 
 /// 在线（B 站）条目：只提供本机播放链接，且没有分段概念
 const isOnline = computed(() => props.item?.sourceKind === 'online')
-
-onUnmounted(() => {
-  unlisten?.()
-})
 
 watch(
   [() => props.open, () => props.item?.id],
@@ -117,6 +118,10 @@ watch([mode, format], () => {
   if (props.open) rebuild()
 })
 
+watch(() => tunnelStore.revision, () => {
+  if (props.open && mode.value === 'tunnel') rebuild()
+})
+
 async function rebuild() {
   const ticket = ++rebuildGeneration
   url.value = ''
@@ -125,9 +130,11 @@ async function rebuild() {
   segmentHint.value = ''
   const id = props.item?.id
   if (!id) return
+  const useTunnel = mode.value === 'tunnel'
+  const lanMode: UrlMode = mode.value === 'tunnel' ? 'localhost' : mode.value
   try {
     if (format.value === 'whole') {
-      const result = await buildMediaUrl(id, mode.value)
+      const result = useTunnel ? await buildTunnelUrl(id) : await buildMediaUrl(id, lanMode)
       if (ticket !== rebuildGeneration) return
       url.value = result
     } else {
@@ -139,7 +146,7 @@ async function rebuild() {
         list.map(async (seg, i) => ({
           id: seg.id,
           label: `第 ${i + 1} 段`,
-          url: await buildMediaUrl(seg.id, mode.value),
+          url: useTunnel ? await buildTunnelUrl(seg.id) : await buildMediaUrl(seg.id, lanMode),
         }))
       )
       if (ticket !== rebuildGeneration) return
@@ -162,7 +169,9 @@ async function rebuild() {
 async function copy() {
   if (!url.value) return
   try {
-    await writeText(url.value)
+    const value = mode.value === 'tunnel' && props.item
+      ? await buildTunnelUrl(props.item.id) : url.value
+    await writeText(value)
     copiedId.value = 'main'
     toast.success('已复制播放链接')
     // 复制后自动关闭弹窗返回主界面
@@ -176,7 +185,8 @@ async function copy() {
 
 async function copySegment(seg: SegmentEntry) {
   try {
-    await writeText(seg.url)
+    const value = mode.value === 'tunnel' ? await buildTunnelUrl(seg.id) : seg.url
+    await writeText(value)
     copiedId.value = seg.id
     toast.success(`已复制${seg.label}链接`)
     // 复制后自动关闭弹窗返回主界面
@@ -191,7 +201,9 @@ async function copySegment(seg: SegmentEntry) {
 async function openInBrowser() {
   if (!url.value) return
   try {
-    await openUrl(url.value)
+    const value = mode.value === 'tunnel' && props.item
+      ? await buildTunnelUrl(props.item.id) : url.value
+    await openUrl(value)
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -208,7 +220,7 @@ async function openInBrowser() {
 
       <div v-if="!isOnline">
         <Label class="mb-2 block">地址模式</Label>
-        <div class="grid grid-cols-2 gap-2">
+        <div class="grid grid-cols-3 gap-2">
           <button
             v-for="opt in modeOptions"
             :key="opt.value"
