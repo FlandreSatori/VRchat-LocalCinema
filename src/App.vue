@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
@@ -10,9 +10,11 @@ import brandIcon from '../watching_video.png'
 import Toaster from './components/Toaster.vue'
 import ConfirmHost from './components/ConfirmHost.vue'
 import DisclaimerDialog from './components/DisclaimerDialog.vue'
+import Dialog from './components/ui/Dialog.vue'
+import Button from './components/ui/Button.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
-import { initStore, serverStore, importMediaPaths } from './lib/store'
+import { initStore, serverStore, importMediaPaths, faststartHintState } from './lib/store'
 import { toast, errMsg } from './lib/toast'
 import { isFirstLaunch, markDisclaimerAccepted } from './lib/api'
 
@@ -88,6 +90,13 @@ async function handleDisclaimerAgree() {
     toast.error(errMsg(e))
   }
 }
+
+// FastStart 提示：含 ≥2GB 大文件的批次用弹窗（在模板中按 dialogOpen 渲染），
+// 其余批次用 toast。以批次计数驱动，一批只提示一次
+const FASTSTART_HINT = '大文件播放卡顿时，可右键「转换为FastStart模式」修复索引位置（兼容编码可免重编码）'
+watch(() => faststartHintState.batch, () => {
+  if (faststartHintState.batch > 0 && !faststartHintState.hasLargeFile) toast.info(FASTSTART_HINT)
+})
 
 let unlistenDrag: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
@@ -240,6 +249,20 @@ onUnmounted(() => {
       :enforced="isFirstLaunchFlag"
       @agree="handleDisclaimerAgree"
     />
+
+    <!-- FastStart 提示（含 ≥2GB 大文件的批次弹出，其余批次在 watch 中 toast）-->
+    <Dialog
+      :open="faststartHintState.dialogOpen"
+      @update:open="(v) => (faststartHintState.dialogOpen = v)"
+    >
+      <template #title>导入成功</template>
+      <template #default>
+        <p class="text-sm leading-relaxed text-muted-foreground">{{ FASTSTART_HINT }}</p>
+      </template>
+      <template #footer="{ close }">
+        <Button @click="close">知道了</Button>
+      </template>
+    </Dialog>
 
     <div
       v-if="dragActive"

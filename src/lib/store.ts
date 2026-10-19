@@ -83,6 +83,11 @@ export function removeMediaItem(id: string) {
   if (idx >= 0) mediaStore.items.splice(idx, 1)
 }
 
+/// 导入成功后的 FastStart 提示状态：batch 每批导入自增（App.vue 据此触发提示，
+/// 避免连续两批同类型导入时因标志位没变化而漏提示）；含 ≥2GB 大文件的批次用弹窗，
+/// 其余批次用 toast
+export const faststartHintState = reactive({ batch: 0, hasLargeFile: false, dialogOpen: false })
+
 export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {
   const result = await importFiles(paths)
   result.items.forEach(upsertMedia)
@@ -90,6 +95,12 @@ export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {
   await loadFolders(true)
   if (result.skipped.length) {
     await message(`已导入 ${result.items.length} 个视频，跳过 ${result.skipped.length} 个文件：\n${result.skipped.map(issue => `${issue.path}：${issue.reason}`).join('\n')}`, { title: '导入结果', kind: 'warning' })
+  }
+  // 导入成功后触发 FastStart 提示（App.vue 渲染；一批只提示一次）
+  if (result.items.length > 0) {
+    faststartHintState.hasLargeFile = result.items.some(it => (it.fileSize ?? 0) >= 2 * 1024 * 1024 * 1024)
+    faststartHintState.dialogOpen = faststartHintState.hasLargeFile
+    faststartHintState.batch++
   }
   return result.items
 }

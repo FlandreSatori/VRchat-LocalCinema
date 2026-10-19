@@ -73,6 +73,14 @@ fn default_easytier_listen_port() -> u16 {
     11010
 }
 
+fn default_stream_buffer_kb() -> u32 {
+    256
+}
+
+fn default_disable_power_throttling() -> bool {
+    true
+}
+
 /// EasyTier 组网配置，对应 easytier-core 的命令行参数
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -173,6 +181,12 @@ pub struct Settings {
     pub easytier_cli_path: String,
     /// 从对等节点下载的媒体存放目录，空表示 data_dir/downloads
     pub download_dir: String,
+    /// 媒体流读缓冲（KB）：排查播放卡顿时按开发者建议调整，平时不推荐修改
+    #[serde(default = "default_stream_buffer_kb")]
+    pub stream_buffer_kb: u32,
+    /// 禁用电源节流（Windows EcoQoS 豁免）：开启后避免媒体流传输被系统降速，默认开启
+    #[serde(default = "default_disable_power_throttling")]
+    pub disable_power_throttling: bool,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,
 }
@@ -197,6 +211,8 @@ impl Default for Settings {
             easytier_core_path: String::new(),
             easytier_cli_path: String::new(),
             download_dir: String::new(),
+            stream_buffer_kb: default_stream_buffer_kb(),
+            disable_power_throttling: default_disable_power_throttling(),
             easytier: EasytierConfig::default(),
         }
     }

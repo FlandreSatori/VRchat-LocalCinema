@@ -60,6 +60,8 @@ const form = reactive<Settings>({
   easytierCorePath: '',
   easytierCliPath: '',
   downloadDir: '',
+  streamBufferKb: 256,
+  disablePowerThrottling: true,
   easytier: {
     protocols: ['tcp', 'ws'],
     peerUrl: '',
@@ -164,6 +166,11 @@ const closeBehaviorOptions = [
   { value: 'exit', label: '退出程序' },
   { value: 'tray', label: '最小化到托盘' },
 ]
+const streamBufferOptions = [
+  { value: '8', label: '8 KB' },
+  { value: '64', label: '64 KB' },
+  { value: '256', label: '256 KB（默认）' },
+]
 
 const playerOptions = computed(() => {
   const opts = [
@@ -213,6 +220,9 @@ function setUrlMode(v: string) {
 }
 function setCloseBehavior(v: string) {
   form.closeBehavior = v as CloseBehavior
+}
+function setStreamBuffer(v: string) {
+  form.streamBufferKb = Number(v)
 }
 
 async function pickExe(title: string): Promise<string | null> {
@@ -680,6 +690,22 @@ onUnmounted(() => {
           <p class="mt-0.5 text-xs text-muted-foreground">点击窗口关闭按钮后的行为</p>
         </div>
         <Select :model-value="form.closeBehavior" :options="closeBehaviorOptions" class="w-40" @update:model-value="setCloseBehavior" />
+      </div>
+      <Separator />
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <Label>播放时禁用电源节流</Label>
+          <p class="mt-0.5 text-xs text-muted-foreground">申请 Windows 电源节流（EcoQoS）豁免，避免窗口收到托盘后媒体供数被系统降速；修改后需重启应用生效</p>
+        </div>
+        <Switch v-model:checked="form.disablePowerThrottling" />
+      </div>
+      <Separator />
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <Label>媒体流读缓冲</Label>
+          <p class="mt-0.5 text-xs text-muted-foreground">影响播放供数的高级参数，不推荐修改；仅在排查播放卡顿时按开发者建议调整</p>
+        </div>
+        <Select :model-value="String(form.streamBufferKb)" :options="streamBufferOptions" class="w-40" @update:model-value="setStreamBuffer" />
       </div>
     </Card>
 

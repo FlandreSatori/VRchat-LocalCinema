@@ -1,6 +1,6 @@
 [package]
 name = "vrchat-localcinema"
-version = "1.4.1"
+version = "1.4.2"
 description = "VRchat-LocalCinema - local media library with HTTP sharing"
 authors = ["you"]
 license = "MIT"
@@ -54,6 +54,6 @@ futures-util = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # 检测系统 Media Foundation 音频解码器（VRChat/AVPro 使用同一解码体系）
-windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_SystemInformation"] }
+windows = { version = "0.62", features = ["Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [dev-dependencies]

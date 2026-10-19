@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -29,6 +29,8 @@ pub struct AppState {
     pub recent_logs: RecentLogs,
     /// 是否允许对等节点查看本机媒体库（与设置同步，供 HTTP 服务读取）
     pub allow_peer_view: Arc<AtomicBool>,
+    /// 媒体流读缓冲（KB），与设置同步，供 HTTP 服务读取
+    pub stream_buf_kb: Arc<AtomicUsize>,
     /// 监听模式是否由「启动内置 EasyTier 组网」自动切换为局域网；
     /// 组网停止时据此自动恢复为本地模式，用户手动设置的局域网模式不受影响
     pub easytier_forced_lan: AtomicBool,
@@ -108,6 +110,9 @@ pub async fn save_settings(
     state
         .allow_peer_view
         .store(settings.allow_peer_view, Ordering::Relaxed);
+    state
+        .stream_buf_kb
+        .store(settings.stream_buffer_kb as usize, Ordering::Relaxed);
     settings.save(&state.paths.settings_file)?;
 
     if autostart_changed {

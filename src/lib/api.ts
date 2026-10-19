@@ -47,6 +47,10 @@ export interface Settings {
   easytierCorePath: string
   easytierCliPath: string
   downloadDir: string
+  /** 媒体流读缓冲（KB），默认 256，不推荐修改 */
+  streamBufferKb: number
+  /** 禁用电源节流（Windows EcoQoS 豁免），默认开启 */
+  disablePowerThrottling: boolean
   easytier: EasytierConfig
 }
 

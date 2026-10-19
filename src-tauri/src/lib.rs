@@ -17,7 +17,7 @@ pub mod thumbnail;
 pub mod transcode;
 pub mod url_builder;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -104,6 +104,36 @@ pub fn run() {
                     settings::Settings::default()
                 });
 
+            // 窗口收到托盘后进程会被 Windows 视为后台，可能触发电源节流（EcoQoS）降权，
+            // 导致 HTTP 供数断续（VR 播放时 CPU 被 VRChat 占满，降权进程更易被饿死）。
+            // 媒体服务进程申请豁免；系统不支持或失败仅记日志，不影响启动。
+            // 设置项「禁用电源节流」默认开启，可在设置页关闭。
+            #[cfg(windows)]
+            if app_settings.disable_power_throttling {
+                use windows::Win32::System::Threading::{
+                    GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
+                    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                    PROCESS_POWER_THROTTLING_STATE,
+                };
+                let throttle = PROCESS_POWER_THROTTLING_STATE {
+                    Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                    ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+                    StateMask: 0,
+                };
+                let r = unsafe {
+                    SetProcessInformation(
+                        GetCurrentProcess(),
+                        ProcessPowerThrottling,
+                        &throttle as *const _ as *const _,
+                        std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                    )
+                };
+                match r {
+                    Ok(()) => tracing::info!("已申请进程电源节流豁免（EcoQoS opt-out）"),
+                    Err(e) => tracing::warn!("申请电源节流豁免失败（忽略）: {}", e),
+                }
+            }
+
             // 初始化开机启动状态（以系统实际状态为准修正配置）
             let autolaunch = app.handle().autolaunch();
             let mut settings_fixed = app_settings.clone();
@@ -126,11 +156,13 @@ pub fn run() {
             };
             let hls_dir = paths.data_dir.join("hls");
             let allow_peer_view = Arc::new(AtomicBool::new(settings_fixed.allow_peer_view));
+            let stream_buf_kb = Arc::new(AtomicUsize::new(settings_fixed.stream_buffer_kb as usize));
             let server = HttpServer::new(
                 db.clone(),
                 &thumb_dir,
                 &hls_dir,
                 allow_peer_view.clone(),
+                stream_buf_kb.clone(),
             );
 
             let state = AppState {
@@ -140,6 +172,7 @@ pub fn run() {
                 server: server.clone(),
                 recent_logs,
                 allow_peer_view,
+                stream_buf_kb,
                 easytier_forced_lan: AtomicBool::new(false),
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 convert_queue: convert_queue::ConvertQueue::default(),

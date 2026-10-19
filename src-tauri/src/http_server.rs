@@ -1,16 +1,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, Path as AxumPath, State};
 use axum::http::header::{self, HeaderValue};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
@@ -41,6 +45,8 @@ struct MediaState {
     /// 已校验路径缓存：文件名 → (规范化路径, 校验时间)，TTL 60s
     /// 用于避免每次 Range 请求重复执行 safe_registered_file + File::open
     validated_paths: Arc<dashmap::DashMap<String, (PathBuf, Instant)>>,
+    /// 媒体流读缓冲（KB），与设置页「媒体流读缓冲」实时同步
+    stream_buf_kb: Arc<AtomicUsize>,
 }
 
 /// 在线视频的官方 CDN 直链缓存条目
@@ -64,6 +70,7 @@ impl HttpServer {
         thumb_dir: &Path,
         hls_dir: &Path,
         allow_peer_view: Arc<std::sync::atomic::AtomicBool>,
+        stream_buf_kb: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             status: Arc::new(RwLock::new(ServerStatus {
@@ -79,6 +86,7 @@ impl HttpServer {
                 allow_peer_view,
                 online_links: Arc::new(Mutex::new(HashMap::new())),
                 validated_paths: Arc::new(dashmap::DashMap::new()),
+                stream_buf_kb,
             },
             tx: Arc::new(RwLock::new(None)),
         }
@@ -364,7 +372,7 @@ async fn serve_download(
     if !crate::media_library::safe_registered_file(&path) {
         return not_found();
     }
-    let mut resp = serve_file(&path, &method, &headers).await;
+    let mut resp = serve_file(&path, &method, &headers, Some("下载"), stream_buf(&state)).await;
     if resp.status().is_success() {
         let encoded: String = percent_encoding::utf8_percent_encode(
             &item.file_name,
@@ -424,7 +432,7 @@ async fn serve_media_basename(
 
     // 阶段 2A：已校验路径缓存优先，命中即跳过全部校验与库查询
     if let Some(cached_path) = cached_valid_path(&state, &file_name) {
-        return serve_file(&cached_path, &method, &headers).await;
+        return serve_file(&cached_path, &method, &headers, Some("媒体"), stream_buf(&state)).await;
     }
 
     enum Target {
@@ -513,7 +521,7 @@ async fn serve_media_basename(
             }
             // 校验通过，写入缓存（后续 Range 请求将跳过校验）
             cache_valid_path(&state, &file_name, &path);
-            serve_file(&path, &method, &headers).await
+            serve_file(&path, &method, &headers, Some("媒体"), stream_buf(&state)).await
         }
     }
 }
@@ -528,7 +536,9 @@ async fn serve_media(
     // 键以 "/media/" 前缀区分（文件名不可能含 '/'，故不会与 basename 键冲突）。
     let cache_key = format!("/media/{}", id);
     if let Some(cached_path) = cached_valid_path(&state, &cache_key) {
-        return serve_file(&cached_path, &method, &headers).await.into_response();
+        return serve_file(&cached_path, &method, &headers, Some("媒体"), stream_buf(&state))
+            .await
+            .into_response();
     }
     let item = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -542,7 +552,9 @@ async fn serve_media(
         return not_found().into_response();
     }
     cache_valid_path(&state, &cache_key, &path);
-    serve_file(&path, &method, &headers).await.into_response()
+    serve_file(&path, &method, &headers, Some("媒体"), stream_buf(&state))
+        .await
+        .into_response()
 }
 
 async fn serve_media_short(
@@ -579,7 +591,9 @@ async fn serve_thumb(
     if !path.is_file() {
         return not_found().into_response();
     }
-    serve_file(&path, &method, &headers).await.into_response()
+    serve_file(&path, &method, &headers, None, stream_buf(&state))
+        .await
+        .into_response()
 }
 
 /// 提供 HLS 播放列表与分片：/hls/{id}/index.m3u8、/hls/{id}/segNNN.ts
@@ -610,7 +624,7 @@ async fn serve_hls(
     if !path.starts_with(&state.hls_dir) || !path.is_file() {
         return not_found().into_response();
     }
-    let mut resp = serve_file(&path, &method, &headers).await;
+    let mut resp = serve_file(&path, &method, &headers, None, stream_buf(&state)).await;
     // m3u8 必须使用标准 MIME，部分播放器据此识别
     if file.to_ascii_lowercase().ends_with(".m3u8") {
         resp.headers_mut().insert(
@@ -833,7 +847,107 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Response<Body> {
+/// 当前生效的媒体流读缓冲（字节）；设置范围 8KB-4MB，越界收敛
+fn stream_buf(state: &MediaState) -> usize {
+    state
+        .stream_buf_kb
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(8, 4096)
+        * 1024
+}
+
+/// 媒体传输遥测：统计实际交给 HTTP 层的字节数，在正常结束（EOF）或被对端
+/// 提前中止（连接断开导致流被丢弃）时各记录一条日志。
+/// 响应头日志只能看到「允诺发多少」，看不到「实际发了多少、谁停的」；
+/// 这条日志用于区分卡顿是「客户端主动掐断」还是「服务器供数中断」。
+struct CountingStream<S> {
+    inner: S,
+    label: String,
+    sent: u64,
+    started: Instant,
+    done: bool,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S, label: String) -> Self {
+        Self {
+            inner,
+            label,
+            sent: 0,
+            started: Instant::now(),
+            done: false,
+        }
+    }
+
+    fn write_log(&self, aborted: bool) {
+        let secs = self.started.elapsed().as_secs_f64();
+        let kbps = if secs > 0.001 {
+            self.sent as f64 / secs / 1024.0
+        } else {
+            0.0
+        };
+        tracing::info!(
+            "媒体传输{}: {} | 已发={} | 耗时={:.1}s | 均速={:.0}KB/s",
+            if aborted { "中止" } else { "完成" },
+            self.label,
+            self.sent,
+            secs,
+            kbps
+        );
+    }
+
+    fn write_error_log(&self, error: &str) {
+        let secs = self.started.elapsed().as_secs_f64();
+        tracing::error!(
+            "媒体传输错误: {} | 已发={} | 耗时={:.1}s | 错误={}",
+            self.label,
+            self.sent,
+            secs,
+            error
+        );
+    }
+}
+
+impl<S, E> Stream for CountingStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let poll = Pin::new(&mut self.inner).poll_next(cx);
+        match &poll {
+            Poll::Ready(Some(Ok(chunk))) => self.sent += chunk.len() as u64,
+            Poll::Ready(Some(Err(e))) => {
+                self.done = true;
+                self.write_error_log(&format!("{}", e));
+            }
+            Poll::Ready(None) => {
+                self.done = true;
+                self.write_log(false);
+            }
+            _ => {}
+        }
+        poll
+    }
+}
+
+impl<S> Drop for CountingStream<S> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.write_log(true);
+        }
+    }
+}
+
+async fn serve_file(
+    path: &Path,
+    method: &Method,
+    headers: &HeaderMap,
+    telemetry: Option<&'static str>,
+    buf_cap: usize,
+) -> Response<Body> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(e) => {
@@ -864,6 +978,15 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
 
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let range_header = headers.get(header::RANGE).cloned();
+    // 遥测标签：媒体/下载路由传入，封面与 HLS 分片不记录（量小且刷屏）
+    let telemetry_label = telemetry.map(|kind| {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        (kind, name)
+    });
 
     if let Some(range_val) = range_header {
         if let Ok(range_str) = range_val.to_str() {
@@ -880,9 +1003,14 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
                     let body_stream = match file.seek(std::io::SeekFrom::Start(start)).await {
                         Ok(_) => {
                             let limited = file.take(length);
-                            // 阶段 3.1：加大读缓冲到 256KB，覆盖 MF 4-16 次 Range 步进
-                            let stream = ReaderStream::with_capacity(limited, 256 * 1024);
-                            Body::from_stream(stream)
+                            let stream = ReaderStream::with_capacity(limited, buf_cap);
+                            match &telemetry_label {
+                                Some((kind, name)) => Body::from_stream(CountingStream::new(
+                                    stream,
+                                    format!("{} {} [range {}..+{}]", kind, name, start, length),
+                                )),
+                                None => Body::from_stream(stream),
+                            }
                         }
                         Err(_) => {
                             return internal_error("文件定位失败");
@@ -941,8 +1069,15 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
             .unwrap();
     }
 
-    // 阶段 3.1：加大读缓冲到 256KB
-    let stream = ReaderStream::with_capacity(file, 256 * 1024);
+    // 无 Range 的完整 GET
+    let stream = ReaderStream::with_capacity(file, buf_cap);
+    let body = match &telemetry_label {
+        Some((kind, name)) => Body::from_stream(CountingStream::new(
+            stream,
+            format!("{} {} [full {}]", kind, name, total_len),
+        )),
+        None => Body::from_stream(stream),
+    };
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -952,7 +1087,7 @@ async fn serve_file(path: &Path, method: &Method, headers: &HeaderMap) -> Respon
         )
         .header(header::CONTENT_LENGTH, HeaderValue::from(total_len))
         .header(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"))
-        .body(Body::from_stream(stream))
+        .body(body)
         .unwrap()
 }
 

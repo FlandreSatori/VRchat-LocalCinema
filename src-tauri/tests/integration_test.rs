@@ -35,6 +35,7 @@ fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, Strin
         &thumb_dir,
         &thumb_dir,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        Arc::new(std::sync::atomic::AtomicUsize::new(256)),
     );
     (server, item, PathBufWrap(dir), id)
 }
@@ -296,6 +297,7 @@ async fn test_duplicate_names_resolve_case_sensitively() {
         &dir.0,
         &dir.0,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        Arc::new(std::sync::atomic::AtomicUsize::new(256)),
     );
     server.start("127.0.0.1", 0).await.unwrap();
     let base = format!("http://127.0.0.1:{}", server.status().port);

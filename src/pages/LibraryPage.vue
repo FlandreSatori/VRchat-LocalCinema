@@ -193,6 +193,7 @@ async function doImport(paths: string[]) {
   try {
     const items = await importMediaPaths(paths)
     toast.success(`已导入 ${items.length} 个视频`)
+    // FastStart 提示由 store 的共享状态触发（App.vue 渲染），不在此处处理
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
