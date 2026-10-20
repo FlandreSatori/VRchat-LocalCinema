@@ -93,6 +93,10 @@ const selectedPeer = ref<PeerInfo | null>(null)
 const localCount = computed(() => mediaStore.items.length)
 const installed = computed(() => easytierComponent.value?.installed ?? false)
 
+// 组网媒体共享依赖局域网监听，而局域网监听需先开启「允许其他人查看我的媒体库」；
+// 未开启时禁止启动组网，避免成员之间无法连接。
+const allowPeerView = computed(() => settingsCache.value?.allowPeerView ?? false)
+
 const listenHint = computed(() => {
   if (cfg.protocols.length === 0) return '至少启用一种协议，否则无法被其他成员连接。'
   const offsets: Record<string, number> = { ws: 1, wss: 2, quic: 3 }
@@ -386,7 +390,7 @@ onUnmounted(() => {
           <p v-else class="text-sm text-muted-foreground">启动后可与同一房间的成员互相访问媒体库</p>
         </div>
         <div class="flex flex-wrap gap-2">
-          <Button :disabled="status.running || operating !== ''" @click="operate('start')">
+          <Button :disabled="status.running || operating !== '' || !allowPeerView" @click="operate('start')">
             <Play class="h-4 w-4" />
             {{ operating === 'start' ? '启动中…' : '启动组网' }}
           </Button>
@@ -400,6 +404,9 @@ onUnmounted(() => {
           </Button>
         </div>
       </div>
+      <p v-if="!allowPeerView" class="mt-3 text-xs text-amber-600 dark:text-amber-500">
+        启动组网前请先在「设置 · HTTP 服务」开启「允许其他人查看我的媒体库」：组网媒体共享需要局域网监听。
+      </p>
       <p class="mt-3 text-xs text-muted-foreground">
         重置网卡会停止组网、卸载 EasyTier 虚拟网卡设备并清理本地缓存；若组网正在进行，会自动重启并重装网卡（需要管理员权限）。
       </p>

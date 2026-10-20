@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { FolderOpen, RotateCcw, Trash2, Save, Download, ExternalLink, AlertTriangle, RefreshCw } from 'lucide-vue-next'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { FolderOpen, RotateCcw, Trash2, Download, ExternalLink, AlertTriangle, RefreshCw } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
@@ -10,7 +10,6 @@ import Badge from '../components/ui/Badge.vue'
 import Select from '../components/ui/Select.vue'
 import Switch from '../components/ui/Switch.vue'
 import Separator from '../components/ui/Separator.vue'
-import Dialog from '../components/ui/Dialog.vue'
 import {
   getSettings,
   saveSettings,
@@ -55,7 +54,9 @@ const form = reactive<Settings>({
   defaultPlayerArgs: '',
   thumbDir: '',
   autostart: false,
-  closeBehavior: 'exit',
+  closeBehavior: 'ask',
+  // 占位初始值，实际以 getSettings() 返回的版本号为准
+  settingsRevision: 1,
   ffmpegPath: '',
   ffprobePath: '',
   easytierCorePath: '',
@@ -154,20 +155,29 @@ async function openManual(kind: ComponentKindId) {
 
 const loading = ref(true)
 const saving = ref(false)
-const savedOpen = ref(false)
+/// 遮罩仅在保存耗时较长（如重启 HTTP 服务）时出现，避免每次修改都闪遮罩
+const applyingOpen = ref(false)
+/// 首次加载完成前不自动保存，避免把占位初始值写进配置
+const ready = ref(false)
+/// 外部同步（settingsCache → form）期间暂停自动保存，防止回声
+const syncing = ref(false)
+let saveTimer: number | null = null
 const appPaths = ref<AppPaths | null>(null)
 const players = ref<PlayerInfo[]>([])
 
-const listenModeOptions = [
+// 监听模式为局域网时服务需要绑定到 0.0.0.0，而这依赖「允许其他人查看我的媒体库」；
+// 未开启该开关时禁用局域网选项，避免出现「局域网模式却只监听 127.0.0.1」的矛盾状态。
+const listenModeOptions = computed(() => [
   { value: 'loopback', label: '本地模式' },
-  { value: 'lan', label: '局域网模式' },
-]
-const urlModeOptions = [
+  { value: 'lan', label: '局域网模式', disabled: !form.allowPeerView },
+])
+const urlModeOptions = computed(() => [
   { value: 'localhost', label: '本地模式' },
-  { value: 'lan', label: '局域网模式' },
-]
+  { value: 'lan', label: '局域网模式', disabled: !form.allowPeerView },
+])
 const closeBehaviorOptions = [
-  { value: 'exit', label: '退出程序' },
+  { value: 'ask', label: '每次都询问' },
+  { value: 'exit', label: '完全关闭' },
   { value: 'tray', label: '最小化到托盘' },
 ]
 const streamBufferOptions = [
@@ -187,12 +197,35 @@ const playerOptions = computed(() => {
   return opts
 })
 
+/// 端口无效时暂停自动保存，由行内提示纠错
+const portInvalid = computed(() => form.port < 1 || form.port > 65535)
+
+/// 其他页面改动设置后（左下角快捷开关、关闭弹窗「不再提示」、组网页保存等）
+/// 表单实时跟随刷新，避免显示滞后；同步期间暂停自动保存，防止回声。
+/// 注意：需定义在 listenMode watcher 之前，保证同批触发时 syncing 先行置位
+watch(settingsCache, (s) => {
+  if (!s) return
+  syncing.value = true
+  Object.assign(form, s)
+  void nextTick(() => {
+    syncing.value = false
+  })
+})
+
 watch(() => form.listenMode, (mode, prev) => {
   form.defaultUrlMode = mode === 'lan' ? 'lan' : 'localhost'
-  if (mode === 'lan' && prev !== 'lan') {
+  if (mode === 'lan' && prev !== 'lan' && !syncing.value) {
     toast.info('已切换到局域网模式')
     if (largeMediaItems.value.length) toast.warning(`媒体库有 ${largeMediaItems.value.length} 个 2 GB 以上视频；开放局域网分享前建议压制为流媒体 MP4`)
   }
+})
+
+// 关闭「允许其他人查看我的媒体库」后必须回到本地模式：此时服务只会绑定环回地址，
+// 若仍保持局域网模式就会出现「局域网模式却只监听 127.0.0.1」的矛盾状态。
+watch(() => form.allowPeerView, (on) => {
+  if (on || form.listenMode !== 'lan') return
+  form.listenMode = 'loopback'
+  if (!syncing.value) toast.info('已关闭「允许其他人查看我的媒体库」，监听模式已切回本地')
 })
 
 /// 局域网模式使用的网卡（IP）选择
@@ -217,9 +250,11 @@ function setLanAdapter(v: string) {
 }
 
 function setListenMode(v: string) {
+  if (v === 'lan' && !form.allowPeerView) return
   form.listenMode = v as ListenMode
 }
 function setUrlMode(v: string) {
+  if (v === 'lan' && !form.allowPeerView) return
   form.defaultUrlMode = v as UrlMode
   form.listenMode = v === 'lan' ? 'lan' : 'loopback'
 }
@@ -306,25 +341,44 @@ async function browseDownloadDir() {
   }
 }
 
-async function save() {
-  if (saving.value) return
-  if (form.port < 1 || form.port > 65535) {
-    toast.error('端口必须在 1-65535 之间')
-    return
-  }
+/// 所有设置项修改即应用：表单任意变化防抖后整体保存（端口等网络项变化会触发服务自动重启）
+function scheduleSave() {
+  if (saveTimer !== null) window.clearTimeout(saveTimer)
+  saveTimer = window.setTimeout(() => {
+    saveTimer = null
+    void persist()
+  }, 600)
+}
+
+async function persist() {
+  if (!ready.value || syncing.value || saving.value) return
+  if (portInvalid.value) return
   form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
   form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
   saving.value = true
+  // 保存很快（仅写配置）时不打扰；只有重启 HTTP 服务等耗时操作才显示遮罩
+  const slow = window.setTimeout(() => {
+    applyingOpen.value = true
+  }, 250)
   try {
     await saveSettings({ ...form })
     settingsCache.value = { ...form }
-    savedOpen.value = true
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
+    window.clearTimeout(slow)
+    applyingOpen.value = false
     saving.value = false
   }
 }
+
+watch(
+  form,
+  () => {
+    if (ready.value && !syncing.value) scheduleSave()
+  },
+  { deep: true }
+)
 
 async function reset() {
   const ok = await confirmDialog({
@@ -433,6 +487,9 @@ onMounted(async () => {
     unlistenProgress = await onComponentDownloadProgress((p) => {
       progressMap[p.kind] = { downloaded: p.downloaded, total: p.total }
     })
+    // 等首批 watch 回调跑完再启用自动保存，避免把加载时的赋值当成用户修改
+    await nextTick()
+    ready.value = true
   } catch (e) {
     toast.error(errMsg(e))
   } finally {
@@ -447,9 +504,9 @@ onUnmounted(() => {
 
 <template>
   <div class="mx-auto max-w-3xl space-y-4 p-6 pb-12">
-    <!-- 设置生效前阻止用户操作 -->
+    <!-- 保存耗时较长（如重启 HTTP 服务）时提示，短暂保存不显示 -->
     <div
-      v-if="saving"
+      v-if="applyingOpen"
       class="fixed inset-0 z-[60] flex items-center justify-center bg-background/70 backdrop-blur-sm"
     >
       <div class="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3 shadow-lg">
@@ -458,23 +515,9 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <Dialog
-      :open="savedOpen"
-      title="设置已保存"
-      description="设置已生效"
-      @update:open="savedOpen = $event"
-    >
-      <div class="flex justify-end">
-        <Button type="button" @click="savedOpen = false">确定</Button>
-      </div>
-    </Dialog>
-
     <div class="flex items-center justify-between">
       <h1 class="text-xl font-semibold">设置</h1>
-      <Button :disabled="loading || saving" @click="save">
-        <Save class="h-4 w-4" />
-        {{ saving ? '保存中…' : '保存设置' }}
-      </Button>
+      <p class="text-xs text-muted-foreground">所有修改即时生效</p>
     </div>
 
     <Card class="space-y-4 p-5">
@@ -496,17 +539,23 @@ onUnmounted(() => {
             :model-value="String(form.port)"
             @update:model-value="form.port = Math.round(Number($event)) || 0"
           />
+          <p v-if="portInvalid" class="text-xs text-destructive">
+            端口必须在 1-65535 之间；修正前其他修改不会保存
+          </p>
         </div>
       </div>
       <p class="text-xs text-muted-foreground">
         本地模式仅允许本机访问；局域网模式会自动选择本机可用的物理网卡地址，其他同网络设备可访问。
+      </p>
+      <p v-if="!form.allowPeerView" class="text-xs text-amber-600 dark:text-amber-500">
+        局域网模式需先开启下方「允许其他人查看我的媒体库」；未开启时服务只监听本机地址。
       </p>
       <Separator />
       <div class="flex items-center justify-between gap-4">
         <div>
           <Label>允许其他人查看我的媒体库</Label>
           <p class="mt-0.5 text-xs text-muted-foreground">
-            开启后自动添加入站防火墙放行规则（首次需管理员授权）；请将监听模式设为局域网，并确保所有成员的监听端口一致
+            开启后才能切换到局域网监听模式；开启时自动添加入站防火墙放行规则（首次需管理员授权），请确保所有成员的监听端口一致
           </p>
         </div>
         <Switch v-model:checked="form.allowPeerView" />

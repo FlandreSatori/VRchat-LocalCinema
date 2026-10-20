@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Play, Square, RotateCw, RefreshCw, AlertTriangle, Cloud, Copy, Check, Download, ExternalLink, Loader2 } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import Card from '../components/ui/Card.vue'
@@ -25,7 +25,7 @@ import {
   type ComponentDownloadProgress,
   type UnlistenFn,
 } from '../lib/api'
-import { serverStore, mediaStore, largeMediaItems, applyServerStatus, loadSettings, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
+import { serverStore, mediaStore, largeMediaItems, applyServerStatus, loadSettings, settingsCache, lanListenAvailable, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
 import { confirmDialog } from '../lib/confirm'
 import { formatTime } from '../lib/format'
 import { toast, errMsg } from '../lib/toast'
@@ -57,8 +57,13 @@ const listenModeText = computed(() => {
     case 'loopback':
       return '仅本机 (127.0.0.1)'
     case 'lan':
-      return '局域网 (0.0.0.0)'
+      return lanListenAvailable.value ? '局域网 (0.0.0.0)' : '局域网（尚未生效）'
   }
+})
+
+/// 左下角快捷开关改动监听模式后跟随刷新，避免本页显示滞后
+watch(settingsCache, (s) => {
+  if (s) settings.value = s
 })
 
 async function operate(kind: 'start' | 'stop' | 'restart') {
@@ -349,6 +354,13 @@ onUnmounted(() => {
           >
             <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
             局域网模式允许其他设备访问你媒体库中的视频，请确认网络环境可信
+          </p>
+          <p
+            v-if="settings?.listenMode === 'lan' && !lanListenAvailable"
+            class="mt-2 flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-400"
+          >
+            <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+            服务当前仍只监听本机地址（127.0.0.1）：监听配置刚修改时服务会重启，请稍候；若持续如此请在「设置」页检查「监听模式」与「允许其他人查看我的媒体库」配置。
           </p>
         </div>
         <RouterLink to="/settings">

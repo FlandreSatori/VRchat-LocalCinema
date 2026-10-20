@@ -42,16 +42,23 @@ impl Default for UrlMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CloseBehavior {
+    /// 直接退出程序（先停止后台服务）
     Exit,
+    /// 最小化到托盘，服务继续运行
     Tray,
+    /// 每次关闭主窗口时弹窗询问
+    Ask,
 }
 
 impl Default for CloseBehavior {
     fn default() -> Self {
-        // 阶段 3.3：默认最小化到托盘，避免误关闭导致服务停止
-        CloseBehavior::Tray
+        // 关闭主窗口时先询问用户，避免误关闭导致服务停止；用户可在设置中固定为某一动作
+        CloseBehavior::Ask
     }
 }
+
+/// 配置结构版本号：用于对历史配置做一次性迁移（见 [`Settings::normalize_legacy`]）
+const SETTINGS_REVISION: u32 = 1;
 
 fn default_port() -> u16 {
     17001
@@ -180,6 +187,9 @@ pub struct Settings {
     pub thumb_dir: String,
     pub autostart: bool,
     pub close_behavior: CloseBehavior,
+    /// 配置结构版本号：用于历史配置的一次性迁移，请勿手动修改
+    #[serde(default)]
+    pub settings_revision: u32,
     /// 外部 ffmpeg/ffprobe 路径，空表示自动从 PATH 查找
     pub ffmpeg_path: String,
     pub ffprobe_path: String,
@@ -222,7 +232,8 @@ impl Default for Settings {
             default_player_args: String::new(),
             thumb_dir: String::new(),
             autostart: false,
-            close_behavior: CloseBehavior::Tray,
+            close_behavior: CloseBehavior::Ask,
+            settings_revision: SETTINGS_REVISION,
             ffmpeg_path: String::new(),
             ffprobe_path: String::new(),
             easytier_core_path: String::new(),
@@ -245,6 +256,7 @@ impl Settings {
         }
         let text = fs::read_to_string(path)?;
         let mut settings: Settings = serde_json::from_str(&text)?;
+        settings.normalize_legacy();
         settings.normalize_network_mode();
         Ok(settings)
     }
@@ -261,9 +273,27 @@ impl Settings {
         Ok(())
     }
 
+    /// 对历史配置做一次性迁移：早期版本把「关闭动作」的默认值写成最小化到托盘，
+    /// 且没有版本号字段（revision = 0）。这类配置无法与用户显式选择区分，
+    /// 统一迁移为新版默认「每次都询问」，让用户自己决定；用户后续的选择会记入更高的版本号而不再被改动。
+    pub fn normalize_legacy(&mut self) {
+        if self.settings_revision < SETTINGS_REVISION {
+            if self.close_behavior == CloseBehavior::Tray {
+                self.close_behavior = CloseBehavior::Ask;
+            }
+            self.settings_revision = SETTINGS_REVISION;
+        }
+    }
+
     pub fn normalize_network_mode(&mut self) {
         if self.listen_mode == ListenMode::Custom {
             self.listen_mode = ListenMode::Lan;
+        }
+        // 局域网监听只有在「允许其他人查看我的媒体库」开启时才真正绑定 0.0.0.0；
+        // 未开启时绑定逻辑会强制退回环回地址，为避免出现「局域网模式却只监听 127.0.0.1」
+        // 的矛盾状态，这里统一把监听模式回落为本地模式。
+        if self.listen_mode == ListenMode::Lan && !self.allow_peer_view {
+            self.listen_mode = ListenMode::Loopback;
         }
         self.default_url_mode = match self.listen_mode {
             ListenMode::Loopback => UrlMode::Localhost,

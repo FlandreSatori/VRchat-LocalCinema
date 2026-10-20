@@ -15,7 +15,7 @@ import {
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
-import { loadSettings, convertTaskStore, tunnelStore, transcodeStreamingItem } from '../lib/store'
+import { loadSettings, convertTaskStore, tunnelStore, transcodeStreamingItem, lanListenAvailable, lanUnavailableReason } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 import { cn } from '../lib/utils'
 
@@ -72,6 +72,26 @@ const modeHint = computed(() => {
   }
 })
 
+/// 局域网模式依赖服务实际绑定到局域网；未生效时生成的局域网链接其他设备必然连不上，故不可选
+const lanAvailable = lanListenAvailable
+const lanDisabledHint = lanUnavailableReason
+
+function modeUnavailable(v: LinkMode): boolean {
+  return v === 'lan' && !lanAvailable.value
+}
+
+function modeButtonClass(v: LinkMode) {
+  if (modeUnavailable(v)) {
+    return 'flex cursor-not-allowed items-center justify-center gap-1.5 rounded-md border border-border px-3 py-2 text-sm text-muted-foreground opacity-50'
+  }
+  return cn(
+    'flex cursor-pointer items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-sm transition-colors',
+    mode.value === v
+      ? 'border-primary bg-primary/10 text-primary'
+      : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground'
+  )
+}
+
 /// 分段转码任务的进行中进度（用于第二段状态提示）
 const segmentTask = computed(() =>
   convertTaskStore.tasks.find(
@@ -111,6 +131,8 @@ watch(
       if (ticket !== rebuildGeneration) return
       mode.value = 'localhost'
     }
+    // 仅本机监听时局域网链接不可用，回落到本机模式
+    if (mode.value === 'lan' && !lanAvailable.value) mode.value = 'localhost'
     await rebuild()
   }
 )
@@ -264,21 +286,19 @@ async function openInBrowser() {
             v-for="opt in modeOptions"
             :key="opt.value"
             type="button"
+            :disabled="modeUnavailable(opt.value)"
+            :title="modeUnavailable(opt.value) ? lanDisabledHint : undefined"
             @click="mode = opt.value"
-            :class="
-              cn(
-                'flex cursor-pointer items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-sm transition-colors',
-                mode === opt.value
-                  ? 'border-primary bg-primary/10 text-primary'
-                  : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground'
-              )
-            "
+            :class="modeButtonClass(opt.value)"
           >
             <component :is="opt.icon" class="h-4 w-4" />
             {{ opt.label }}
           </button>
         </div>
         <p class="mt-2 text-xs text-muted-foreground">{{ modeHint }}</p>
+        <p v-if="!lanAvailable" class="mt-1 text-xs text-amber-600 dark:text-amber-500">
+          {{ lanDisabledHint }}
+        </p>
       </div>
 
       <div v-if="!isOnline">

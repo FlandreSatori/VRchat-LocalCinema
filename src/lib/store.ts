@@ -1,4 +1,4 @@
-import { reactive, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { message } from '@tauri-apps/plugin-dialog'
 import {
   getServerStatus,
@@ -49,6 +49,20 @@ export const folderStore = reactive<{ folders: Folder[]; loaded: boolean }>({
 })
 
 export const settingsCache = ref<Settings | null>(null)
+
+/// 局域网地址是否真正可达：只有服务实际绑定到非环回地址时才成立。
+/// 仅本机监听时生成的 192.168.x.x 链接其他设备必然连不上（VRChat 表现为 Loading failed）。
+export const lanListenAvailable = computed(() => {
+  const addr = serverStore.bindAddr
+  return serverStore.running && !!addr && !addr.startsWith('127.0.0.1')
+})
+
+/// 局域网链接不可用时的原因说明（禁用项的悬停提示与说明文字共用）
+export const lanUnavailableReason = computed(() =>
+  settingsCache.value?.listenMode === 'lan'
+    ? '服务尚未绑定到局域网地址（可能正在重启），请稍候；若持续如此请在「设置 · HTTP 服务」检查监听配置'
+    : '需要开放局域网访问：请先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」，再切换到局域网模式（左下角快捷开关或设置页）'
+)
 
 export const tunnelStore = reactive<TunnelStatus>({
   running: false,

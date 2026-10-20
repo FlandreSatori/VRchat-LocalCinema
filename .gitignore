@@ -1,6 +1,12 @@
 /交接文档.md
 /agent.md
 
+# Agent tooling（仅本地使用）
+/AGENTS.md
+/.trae/
+/.claude/
+/.mcp.json
+
 # Logs
 logs
 *.log

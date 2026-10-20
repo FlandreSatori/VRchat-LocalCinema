@@ -50,7 +50,7 @@ import {
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
 import { formatSize, formatDuration } from '../lib/format'
-import { serverStore, convertStore, convertTaskStore, transcodeStreamingItem } from '../lib/store'
+import { serverStore, convertStore, convertTaskStore, transcodeStreamingItem, lanListenAvailable, lanUnavailableReason } from '../lib/store'
 
 const props = withDefaults(
   defineProps<{
@@ -276,7 +276,14 @@ const menuItems = computed<MenuEntry[]>(() => {
   if (isShortcut.value) {
     return [
       { type: 'item', label: '复制本机 URL', icon: Copy, onSelect: () => copyUrl('localhost', '本机 URL') },
-      { type: 'item', label: '复制局域网 URL', icon: Copy, onSelect: () => copyUrl('lan', '局域网 URL') },
+      {
+        type: 'item',
+        label: '复制局域网 URL',
+        icon: Copy,
+        disabled: !lanListenAvailable.value,
+        title: lanListenAvailable.value ? '同一局域网内的设备可访问' : lanUnavailableReason.value,
+        onSelect: () => copyUrl('lan', '局域网 URL'),
+      },
       { type: 'separator' },
       { type: 'item', label: '查看视频信息', icon: Info, onSelect: () => (infoOpen.value = true) },
       { type: 'item', label: '打开文件所在目录', icon: FolderOpen, onSelect: openFolder },

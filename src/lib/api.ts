@@ -5,7 +5,7 @@ export type { UnlistenFn }
 
 export type ListenMode = 'loopback' | 'lan'
 export type UrlMode = 'localhost' | 'lan'
-export type CloseBehavior = 'exit' | 'tray'
+export type CloseBehavior = 'exit' | 'tray' | 'ask'
 export type MediaStatus = 'ok' | 'processing' | 'missing'
 export type CompatStatus = 'supported' | 'unsupported'
 
@@ -41,7 +41,10 @@ export interface Settings {
   defaultPlayerArgs: string
   thumbDir: string
   autostart: boolean
+  /** 关闭主窗口的动作：完全关闭 / 最小化到托盘 / 每次都询问 */
   closeBehavior: CloseBehavior
+  /** 配置结构版本号（后端一次性迁移用），前端原样回传即可 */
+  settingsRevision: number
   ffmpegPath: string
   ffprobePath: string
   easytierCorePath: string
@@ -595,6 +598,10 @@ export function isRunningInTempDir(): Promise<boolean> {
 export function quitApp(): Promise<void> {
   return invoke('quit_app')
 }
+/** 隐藏主窗口到系统托盘（服务继续运行） */
+export function hideToTray(): Promise<void> {
+  return invoke('hide_to_tray')
+}
 export function openDataDir(): Promise<void> {
   return invoke('open_data_dir')
 }
@@ -634,6 +641,10 @@ export function onMediaUpdated(callback: (item: MediaItem) => void): Promise<Unl
 }
 export function onServerStatusChanged(callback: (status: ServerStatus) => void): Promise<UnlistenFn> {
   return listen<ServerStatus>('server-status-changed', (e) => callback(e.payload))
+}
+/** 关闭主窗口且关闭动作设为「每次都询问」时，后端广播该事件请求前端弹窗 */
+export function onCloseRequested(callback: () => void): Promise<UnlistenFn> {
+  return listen('close-requested', () => callback())
 }
 
 // 内置组件（FFmpeg / EasyTier）

@@ -37,6 +37,11 @@ pub struct AppState {
     /// 监听模式是否由「启动内置 EasyTier 组网」自动切换为局域网；
     /// 组网停止时据此自动恢复为本地模式，用户手动设置的局域网模式不受影响
     pub easytier_forced_lan: AtomicBool,
+    /// 是否已进入退出流程（完全关闭 / 托盘退出 / 快速退出）。
+    /// app.exit() 会再次触发窗口 CloseRequested，若此时仍按关闭动作处理，
+    /// 「每次都询问」的 prevent_close 会挡住退出流程，导致关闭无效；
+    /// 置位后 CloseRequested 直接放行，交由退出流程结束进程。
+    pub exiting: AtomicBool,
     pub easytier: easytier::EasytierManager,
     /// Cloudflare 快速隧道（无需组网即可公网分享）
     pub tunnel: crate::tunnel::TunnelManager,
@@ -697,6 +702,14 @@ pub async fn build_media_url(
     mode: UrlMode,
 ) -> AppResult<String> {
     let settings = state.current_settings();
+    // 局域网链接只有服务绑定到局域网时才可能被其他设备访问：仅本机监听的 127.0.0.1
+    // 绑定下生成的 192.168.x.x 链接必然连不上（VRChat 表现为 Loading failed），直接拒绝。
+    if mode == UrlMode::Lan && settings.listen_mode != ListenMode::Lan {
+        return Err(AppError::Msg(
+            "当前为「本地模式（仅本机）」监听，无法生成局域网链接；请先把监听模式切换为「局域网模式」"
+                .to_string(),
+        ));
+    }
     let item = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         let item = db.get(&id)?
@@ -816,13 +829,19 @@ pub async fn is_running_in_temp_dir() -> AppResult<bool> {
     Ok(running_in_temp_dir(&std::env::current_exe()?))
 }
 
-/// 退出应用（与托盘菜单「退出」一致：先停掉后台服务再退出）
+/// 退出应用（与托盘菜单「退出」一致：先停掉后台服务再强制结束进程）
 #[tauri::command]
 pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
-    state.server.stop();
-    state.easytier.stop_detached();
-    state.tunnel.stop_detached();
-    app.exit(0);
+    crate::exit_app(&app, &state);
+    Ok(())
+}
+
+/// 隐藏主窗口到系统托盘（关闭确认弹窗中选择「最小化到托盘」时调用；服务继续运行）
+#[tauri::command]
+pub async fn hide_to_tray(app: AppHandle) -> AppResult<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.hide().map_err(|e| AppError::Msg(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -1140,6 +1159,15 @@ pub async fn get_easytier_status(state: State<'_, AppState>) -> AppResult<Easyti
 pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
     let _network = state.network_operation.lock().await;
     let mut settings = state.current_settings();
+    // 组网媒体共享需要监听局域网地址（0.0.0.0），而局域网监听只有在开启
+    // 「允许其他人查看我的媒体库」后才会真正生效；未开启时直接拒绝启动，
+    // 否则成员之间（包括查看自己的媒体库）无法连接。
+    if !settings.allow_peer_view {
+        return Err(AppError::Msg(
+            "组网媒体共享需要开放局域网访问：请先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」，再启动组网"
+                .to_string(),
+        ));
+    }
     // 组网媒体共享通过虚拟网段访问 HTTP 服务，仅本机（127.0.0.1）监听会导致
     // 成员之间（包括查看自己的媒体库）无法连接，启动组网时自动切换为局域网监听
     if settings.listen_mode == ListenMode::Loopback {

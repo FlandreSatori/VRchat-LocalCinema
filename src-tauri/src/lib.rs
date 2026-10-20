@@ -18,17 +18,32 @@ pub mod transcode;
 pub mod tunnel;
 pub mod url_builder;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, Manager, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 
 use commands::AppState;
 use http_server::HttpServer;
 use settings::CloseBehavior;
+
+/// 统一退出入口：停掉后台服务后强制结束进程。
+/// 不使用 app.exit()：其退出依赖事件循环正常走完退出流程，在托盘存在等场景下
+/// 可能不生效（表现为点击退出无响应）；配置与数据库均在各自操作时落盘，
+/// 此处直接结束进程不会造成数据损坏。
+pub fn exit_app(app: &AppHandle, state: &AppState) {
+    state.exiting.store(true, Ordering::SeqCst);
+    // 强制销毁所有窗口（destroy 会立即销毁而不触发 CloseRequested 事件）
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.destroy();
+    }
+    tracing::info!("正在退出进程");
+    // 直接退出，无需等待后台服务停止（进程终止时所有线程会被强制结束）
+    std::process::exit(0);
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -176,6 +191,7 @@ pub fn run() {
                 allow_peer_view,
                 stream_buf_kb,
                 easytier_forced_lan: AtomicBool::new(false),
+                exiting: AtomicBool::new(false),
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 tunnel: tunnel::TunnelManager::new(),
                 convert_queue: convert_queue::ConvertQueue::default(),
@@ -203,23 +219,55 @@ pub fn run() {
                 let _ = handle.emit("server-status-changed", server.status());
             });
 
-            // 系统托盘
-            build_tray(app)?;
+            // 系统托盘：刷新播放进度、上传带宽和设备数
+            let tray_status = build_tray(app)?;
+            let tray_state = server.tray_metrics_handle();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let snapshot = tray_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .snapshot();
+                    let label = if !snapshot.has_recent_activity {
+                        "无播放 | 上传 0 Mbps | 设备 0".to_string()
+                    } else {
+                        let progress = snapshot.progress
+                            .map(|(name, value)| format!("{} {:.0}%", name, value * 100.0))
+                            .unwrap_or_else(|| "播放中".to_string());
+                        format!("{} | 上传 {:.1} Mbps | 设备 {}", progress, snapshot.bandwidth_mbps, snapshot.devices)
+                    };
+                    let _ = tray_status.set_text(&label);
+                }
+            });
 
             Ok(())
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
+                // 已进入退出流程（完全关闭 / 托盘退出 / 快速退出）：直接放行关闭，不再拦截
+                if state.exiting.load(Ordering::SeqCst) {
+                    return;
+                }
                 let behavior = state.current_settings().close_behavior;
-                if behavior == CloseBehavior::Tray {
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else {
-                    // 退出前停止 HTTP 服务与组网进程（组网提权运行，退出时不阻塞等待）
-                    state.server.stop();
-                    state.easytier.stop_detached();
-                    state.tunnel.stop_detached();
+                match behavior {
+                    CloseBehavior::Tray => {
+                        // 最小化到托盘：服务继续运行，仅隐藏窗口
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    CloseBehavior::Ask => {
+                        // 每次都询问：阻止本次关闭，交由前端弹窗让用户选择完全关闭或最小化到托盘
+                        api.prevent_close();
+                        let _ = window.set_focus();
+                        let _ = window.emit("close-requested", ());
+                    }
+                    CloseBehavior::Exit => {
+                        // 退出前停止 HTTP 服务与组网进程（组网提权运行，退出时不阻塞等待），
+                        // 随后强制结束进程（见 exit_app 注释）
+                        exit_app(window.app_handle(), &state);
+                    }
                 }
             }
         })
@@ -251,6 +299,7 @@ pub fn run() {
             commands::mark_disclaimer_accepted,
             commands::is_running_in_temp_dir,
             commands::quit_app,
+            commands::hide_to_tray,
             commands::open_data_dir,
             commands::open_dir,
             commands::clear_thumbnail_cache,
@@ -306,29 +355,22 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let show = MenuItemBuilder::with_id("show", "显示主窗口").build(app)?;
+fn build_tray(app: &mut tauri::App) -> Result<MenuItem<tauri::Wry>, Box<dyn std::error::Error>> {
+    let status = MenuItemBuilder::with_id("status", "媒体服务：状态检查中")
+        .enabled(false)
+        .build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
-    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+    let menu = MenuBuilder::new(app).items(&[&status, &quit]).build()?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
+        .show_menu_on_left_click(false)
         .menu(&menu)
         .tooltip("VRchat-LocalCinema")
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "quit" => {
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == "quit" {
                 let state = app.state::<AppState>();
-                state.server.stop();
-                state.easytier.stop_detached();
-                state.tunnel.stop_detached();
-                app.exit(0);
+                exit_app(app, &state);
             }
-            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -349,5 +391,5 @@ fn build_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.icon(icon.clone());
     }
     builder.build(app)?;
-    Ok(())
+    Ok(status)
 }

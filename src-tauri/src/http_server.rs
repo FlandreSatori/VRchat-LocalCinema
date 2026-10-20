@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Method, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
@@ -47,6 +47,72 @@ struct MediaState {
     validated_paths: Arc<dashmap::DashMap<String, (PathBuf, Instant)>>,
     /// 媒体流读缓冲（KB），与设置页「媒体流读缓冲」实时同步
     stream_buf_kb: Arc<AtomicUsize>,
+    /// 托盘媒体传输统计
+    tray_metrics: Arc<Mutex<TrayMetrics>>,
+}
+
+pub(crate) struct TrayMetrics {
+    devices: HashMap<std::net::IpAddr, DeviceActivity>,
+    sample_bytes: u64,
+    sample_at: Instant,
+}
+
+struct DeviceActivity {
+    last_seen: Instant,
+    last_file: String,
+    last_progress: f64,
+}
+
+#[derive(Clone)]
+pub(crate) struct TraySnapshot {
+    pub(crate) devices: usize,
+    pub(crate) progress: Option<(String, f64)>,
+    pub(crate) bandwidth_mbps: f64,
+    pub(crate) has_recent_activity: bool,
+}
+
+impl TrayMetrics {
+    fn new() -> Self {
+        Self {
+            devices: HashMap::new(),
+            sample_bytes: 0,
+            sample_at: Instant::now(),
+        }
+    }
+
+    fn update_device(&mut self, ip: std::net::IpAddr, file_name: String, progress: f64) {
+        let now = Instant::now();
+        self.devices.entry(ip).and_modify(|dev| {
+            dev.last_seen = now;
+            dev.last_file = file_name.clone();
+            dev.last_progress = progress;
+        }).or_insert(DeviceActivity {
+            last_seen: now,
+            last_file: file_name,
+            last_progress: progress,
+        });
+    }
+
+    pub(crate) fn snapshot(&mut self) -> TraySnapshot {
+        let now = Instant::now();
+        self.devices.retain(|_, dev| dev.last_seen.elapsed() < Duration::from_secs(30));
+        
+        let elapsed = self.sample_at.elapsed().as_secs_f64().max(1.0);
+        let bandwidth_mbps = (self.sample_bytes as f64 * 8.0) / elapsed / 1_000_000.0;
+        self.sample_bytes = 0;
+        self.sample_at = now;
+
+        let progress = self.devices.values()
+            .max_by(|a, b| a.last_progress.total_cmp(&b.last_progress))
+            .map(|dev| (dev.last_file.clone(), dev.last_progress.min(1.0)));
+
+        TraySnapshot {
+            devices: self.devices.len(),
+            progress,
+            bandwidth_mbps,
+            has_recent_activity: self.devices.values().any(|dev| dev.last_seen.elapsed() < Duration::from_secs(10)),
+        }
+    }
 }
 
 /// 在线视频的官方 CDN 直链缓存条目
@@ -88,6 +154,7 @@ impl HttpServer {
                 online_links: Arc::new(Mutex::new(HashMap::new())),
                 validated_paths: Arc::new(dashmap::DashMap::new()),
                 stream_buf_kb,
+                tray_metrics: Arc::new(Mutex::new(TrayMetrics::new())),
             },
             tx: Arc::new(RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -96,6 +163,10 @@ impl HttpServer {
 
     pub fn status(&self) -> ServerStatus {
         self.status.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn tray_metrics_handle(&self) -> Arc<Mutex<TrayMetrics>> {
+        self.state.tray_metrics.clone()
     }
 
     /// 启动 HTTP 服务。会检查端口是否被占用。
@@ -145,6 +216,7 @@ impl HttpServer {
             .route("/", get(|| async { "VRchat-LocalCinema" }))
             .route("/{file_name}", get(serve_media_basename))
             .layer(ConcurrencyLimitLayer::new(64))
+            .layer(axum::middleware::from_fn_with_state(self.state.clone(), track_response))
             .layer(axum::middleware::from_fn(log_peer_request))
             .with_state(self.state.clone());
 
@@ -310,6 +382,63 @@ async fn log_peer_request(
     res
 }
 
+async fn track_response(
+    State(state): State<MediaState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response<Body> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let response = next.run(req).await;
+    let status = response.status();
+    let range = response.headers().get(header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).and_then(parse_content_range);
+    let total = response.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let is_download = path.starts_with("/download/");
+    let tracked = method == Method::GET && status.is_success() && !is_download
+        && (path.starts_with("/media/") || path.starts_with("/online/") || is_media_path(&path) || path.starts_with("/hls/"));
+    
+    if tracked {
+        let media_id = if path.starts_with("/media/") || path.starts_with("/online/") || path.starts_with("/download/") {
+            path.split('/').nth(2)
+        } else {
+            None
+        };
+        let name = if let Some(id) = media_id {
+            let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+            db.get(id).ok().flatten().map(|item| item.file_name).unwrap_or_else(|| path.rsplit('/').next().unwrap_or("媒体").to_string())
+        } else {
+            path.rsplit('/').next().unwrap_or("媒体").to_string()
+        };
+        let total_size = range.map(|(_, _, total)| total).or(total).unwrap_or(0);
+        let position = range.map(|(start, _, _)| start).unwrap_or(0);
+        let progress = if total_size > 0 { (position as f64) / (total_size as f64) } else { 0.0 };
+        
+        let mut metrics = state.tray_metrics.lock().unwrap_or_else(|e| e.into_inner());
+        metrics.update_device(addr.ip(), name, progress);
+        metrics.sample_bytes = metrics.sample_bytes.saturating_add(total_size);
+    }
+    
+    let metrics = state.tray_metrics.clone();
+    let (parts, original_body) = response.into_parts();
+    let stream = original_body.into_data_stream().map(move |result| {
+        if let Ok(bytes) = &result {
+            let mut metrics = metrics.lock().unwrap_or_else(|e| e.into_inner());
+            metrics.sample_bytes = metrics.sample_bytes.saturating_add(bytes.len() as u64);
+        }
+        result
+    });
+    let body = Body::from_stream(stream);
+    Response::from_parts(parts, body)
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?, total.parse().ok()?))
+}
+
 /// 返回对等节点的媒体清单（用于房间内互相浏览媒体库）
 async fn api_media(State(state): State<MediaState>) -> Response<Body> {
     // 未开启「允许其他人查看我的媒体库」时返回空清单（对方看不到任何视频）
@@ -387,7 +516,14 @@ async fn serve_download(
     if !crate::media_library::safe_registered_file(&path) {
         return not_found();
     }
-    let mut resp = serve_file(&path, &method, &headers, Some("下载"), stream_buf(&state)).await;
+    let mut resp = serve_file(
+        &path,
+        &method,
+        &headers,
+        Some("下载"),
+        stream_buf(&state),
+    )
+    .await;
     if resp.status().is_success() {
         let encoded: String = percent_encoding::utf8_percent_encode(
             &item.file_name,
@@ -444,10 +580,16 @@ async fn serve_media_basename(
     if !crate::url_builder::valid_basename(&file_name) {
         return not_found();
     }
-
     // 阶段 2A：已校验路径缓存优先，命中即跳过全部校验与库查询
     if let Some(cached_path) = cached_valid_path(&state, &file_name) {
-        return serve_file(&cached_path, &method, &headers, Some("媒体"), stream_buf(&state)).await;
+        return serve_file(
+            &cached_path,
+            &method,
+            &headers,
+            Some("媒体"),
+            stream_buf(&state),
+        )
+        .await;
     }
 
     enum Target {
@@ -536,7 +678,14 @@ async fn serve_media_basename(
             }
             // 校验通过，写入缓存（后续 Range 请求将跳过校验）
             cache_valid_path(&state, &file_name, &path);
-            serve_file(&path, &method, &headers, Some("媒体"), stream_buf(&state)).await
+            serve_file(
+                &path,
+                &method,
+                &headers,
+                Some("媒体"),
+                stream_buf(&state),
+            )
+            .await
         }
     }
 }
@@ -551,9 +700,15 @@ async fn serve_media(
     // 键以 "/media/" 前缀区分（文件名不可能含 '/'，故不会与 basename 键冲突）。
     let cache_key = format!("/media/{}", id);
     if let Some(cached_path) = cached_valid_path(&state, &cache_key) {
-        return serve_file(&cached_path, &method, &headers, Some("媒体"), stream_buf(&state))
-            .await
-            .into_response();
+        return serve_file(
+            &cached_path,
+            &method,
+            &headers,
+            Some("媒体"),
+            stream_buf(&state),
+        )
+        .await
+        .into_response();
     }
     let item = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
@@ -567,9 +722,15 @@ async fn serve_media(
         return not_found().into_response();
     }
     cache_valid_path(&state, &cache_key, &path);
-    serve_file(&path, &method, &headers, Some("媒体"), stream_buf(&state))
-        .await
-        .into_response()
+    serve_file(
+        &path,
+        &method,
+        &headers,
+        Some("媒体"),
+        stream_buf(&state),
+    )
+    .await
+    .into_response()
 }
 
 async fn serve_media_short(
@@ -606,9 +767,15 @@ async fn serve_thumb(
     if !path.is_file() {
         return not_found().into_response();
     }
-    serve_file(&path, &method, &headers, None, stream_buf(&state))
-        .await
-        .into_response()
+    serve_file(
+        &path,
+        &method,
+        &headers,
+        None,
+        stream_buf(&state),
+    )
+    .await
+    .into_response()
 }
 
 /// 提供 HLS 播放列表与分片：/hls/{id}/index.m3u8、/hls/{id}/segNNN.ts
@@ -639,7 +806,14 @@ async fn serve_hls(
     if !path.starts_with(&state.hls_dir) || !path.is_file() {
         return not_found().into_response();
     }
-    let mut resp = serve_file(&path, &method, &headers, None, stream_buf(&state)).await;
+    let mut resp = serve_file(
+        &path,
+        &method,
+        &headers,
+        None,
+        stream_buf(&state),
+    )
+    .await;
     // m3u8 必须使用标准 MIME，部分播放器据此识别
     if file.to_ascii_lowercase().ends_with(".m3u8") {
         resp.headers_mut().insert(
@@ -884,7 +1058,10 @@ struct CountingStream<S> {
 }
 
 impl<S> CountingStream<S> {
-    fn new(inner: S, label: String) -> Self {
+    fn new(
+        inner: S,
+        label: String,
+    ) -> Self {
         Self {
             inner,
             label,
@@ -933,7 +1110,10 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let poll = Pin::new(&mut self.inner).poll_next(cx);
         match &poll {
-            Poll::Ready(Some(Ok(chunk))) => self.sent += chunk.len() as u64,
+            Poll::Ready(Some(Ok(chunk))) => {
+                let bytes = chunk.len() as u64;
+                self.sent += bytes;
+            }
             Poll::Ready(Some(Err(e))) => {
                 self.done = true;
                 self.write_error_log(&format!("{}", e));
@@ -1123,6 +1303,39 @@ fn internal_error(msg: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_metrics_track_devices_by_ip_and_report_max_progress() {
+        let mut metrics = TrayMetrics::new();
+        let phone: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+        let pc: std::net::IpAddr = "192.168.1.11".parse().unwrap();
+
+        // 同一 IP 的多次请求只算一台设备，进度取最近一次上报
+        metrics.update_device(phone, "a.mp4".into(), 0.25);
+        metrics.update_device(phone, "a.mp4".into(), 0.4);
+        metrics.update_device(pc, "b.mp4".into(), 0.2);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.devices, 2);
+        assert!(snapshot.has_recent_activity);
+        // 状态行取进度最高的设备
+        assert_eq!(snapshot.progress, Some(("a.mp4".into(), 0.4)));
+
+        // 进度按 100% 封顶
+        metrics.update_device(phone, "a.mp4".into(), 1.5);
+        assert_eq!(metrics.snapshot().progress, Some(("a.mp4".into(), 1.0)));
+
+        // 采样字节在每次快照后清零，带宽不会被重复累计
+        metrics.sample_bytes = 8_000_000;
+        assert!(metrics.snapshot().bandwidth_mbps > 0.0);
+        assert_eq!(metrics.sample_bytes, 0);
+    }
+
+    #[test]
+    fn parses_range_position_and_rejects_unsatisfied_ranges() {
+        assert_eq!(parse_content_range("bytes 500-999/2000"), Some((500, 999, 2000)));
+        assert_eq!(parse_content_range("bytes */2000"), None);
+    }
 
     #[test]
     fn media_paths_are_logged_but_ui_noise_is_not() {

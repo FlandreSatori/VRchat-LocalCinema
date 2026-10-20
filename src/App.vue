@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare, TriangleAlert } from 'lucide-vue-next'
+import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare, TriangleAlert, Globe, Monitor, Minimize2, Power } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -13,11 +13,12 @@ import DisclaimerDialog from './components/DisclaimerDialog.vue'
 import Dialog from './components/ui/Dialog.vue'
 import Button from './components/ui/Button.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
+import Switch from './components/ui/Switch.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
-import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, transcodeStreamingItem } from './lib/store'
+import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, transcodeStreamingItem, loadSettings, settingsCache } from './lib/store'
 import { formatSize } from './lib/format'
 import { toast, errMsg } from './lib/toast'
-import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, type MediaItem } from './lib/api'
+import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, hideToTray, onCloseRequested, saveSettings, type CloseBehavior, type MediaItem, type ListenMode } from './lib/api'
 
 const router = useRouter()
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -50,6 +51,69 @@ const statusText = computed(() => {
   if (serverStore.running) return `运行中 · ${serverStore.bindAddr}`
   return '服务已停止'
 })
+
+/// 左下角监听模式快捷切换：局域网模式让同网络设备（含 EasyTier 组网成员）能访问本服务
+/// 切换中的目标模式（乐观状态）：点击后立即驱动滑块滑动，不必等保存与服务重启完成
+const listenPending = ref<ListenMode | null>(null)
+const lanMode = computed(() =>
+  listenPending.value ? listenPending.value === 'lan' : settingsCache.value?.listenMode === 'lan'
+)
+/// 切换进行中：屏蔽后续点击，切换完成后才允许再次操作
+const listenBusy = ref(false)
+
+/// 「允许其他人查看我的媒体库」未开启时服务只会绑定环回地址，
+/// 局域网模式的开关保持禁用，避免出现「局域网模式却只监听 127.0.0.1」的矛盾状态。
+const allowPeerView = computed(() => settingsCache.value?.allowPeerView ?? false)
+
+const listenOptions = [
+  {
+    value: 'loopback' as const,
+    label: '本地',
+    icon: Monitor,
+    title: '本地模式：仅本机（127.0.0.1）可访问',
+  },
+  {
+    value: 'lan' as const,
+    label: '局域网',
+    icon: Globe,
+    title: '局域网模式：同一网络的设备（含 EasyTier 组网成员）可访问',
+  },
+]
+
+function selectListenMode(value: ListenMode) {
+  if (value === 'lan' && !allowPeerView.value) {
+    toast.info('请先在「设置 · HTTP 服务」开启「允许其他人查看我的媒体库」，再切换到局域网模式')
+    return
+  }
+  void setListenMode(value === 'lan')
+}
+
+async function setListenMode(checked: boolean) {
+  if (listenBusy.value) return
+  const target: ListenMode = checked ? 'lan' : 'loopback'
+  if (settingsCache.value?.listenMode === target) return
+  // 先滑动：立即上屏乐观状态，随后才发起保存（后端会重启 HTTP 服务，约需 1 秒）
+  listenBusy.value = true
+  listenPending.value = target
+  try {
+    const cur = settingsCache.value ?? (await loadSettings())
+    if (cur.listenMode === target) return
+    const next = {
+      ...cur,
+      listenMode: target,
+      defaultUrlMode: checked ? ('lan' as const) : ('localhost' as const),
+    }
+    await saveSettings(next)
+    settingsCache.value = next
+    toast.success(checked ? '已切换为局域网模式，同网络设备可访问' : '已切换为本地模式，仅本机可访问')
+  } catch (e) {
+    toast.error(errMsg(e))
+  } finally {
+    // 清除乐观状态：失败时滑块回到真实配置位置，成功时由 settingsCache 接管
+    listenPending.value = null
+    listenBusy.value = false
+  }
+}
 
 async function windowAction(action: 'minimize' | 'toggleMaximize' | 'close' | 'startDragging') {
   if (!appWindow) return
@@ -108,6 +172,73 @@ async function quitFromTempWarning() {
   }
 }
 
+/// 关闭主窗口确认弹窗：关闭动作设为「每次都询问」时，后端阻止关闭并广播 close-requested，
+/// 由本弹窗让用户选择「完全关闭」或「最小化到托盘」
+const closeAskOpen = ref(false)
+/// 勾选「不再提示」后，把本次选择写入设置中的关闭动作
+const closeRemember = ref(false)
+const closeBusy = ref(false)
+
+function handleCloseRequested() {
+  // 临时目录警告已强制弹出并只能退出：此时直接关闭窗口，避免无弹窗可用的死锁
+  if (tempDirWarning.value) {
+    void quitApp()
+    return
+  }
+  closeRemember.value = false
+  closeAskOpen.value = true
+}
+
+/// 记住本次选择：仅写入关闭动作，不涉及网络配置，因此不会重启 HTTP 服务
+async function rememberCloseBehavior(value: CloseBehavior) {
+  try {
+    const cur = settingsCache.value ?? (await loadSettings())
+    if (cur.closeBehavior === value) return
+    const next = { ...cur, closeBehavior: value }
+    await saveSettings(next)
+    settingsCache.value = next
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
+
+async function chooseMinimizeToTray() {
+  if (closeBusy.value) return
+  closeBusy.value = true
+  try {
+    if (closeRemember.value) await rememberCloseBehavior('tray')
+    closeAskOpen.value = false
+    await hideToTray()
+  } catch (e) {
+    toast.error(errMsg(e))
+  } finally {
+    closeBusy.value = false
+  }
+}
+
+async function chooseExit() {
+  if (closeBusy.value) return
+  closeBusy.value = true
+  try {
+    if (closeRemember.value) await rememberCloseBehavior('exit')
+    closeAskOpen.value = false
+    closeBusy.value = false
+    // 调用退出：成功时进程直接结束并自动关闭所有窗口
+    await quitApp()
+    // 执行到这里说明退出失败（正常退出时进程已被终止）
+    toast.error('退出失败，请改用托盘菜单「退出」，或重启应用后重试')
+  } catch (e) {
+    closeAskOpen.value = false
+    closeBusy.value = false
+    toast.error(errMsg(e))
+  }
+}
+
+/// 取消（Esc / 关闭按钮 / 点击遮罩）：留在应用内，不执行任何操作
+function onCloseAskUpdate(open: boolean) {
+  if (!open) closeAskOpen.value = false
+}
+
 // 导入含 ≥2GB 大文件的批次时提示可一键压制
 const compressingId = ref('')
 async function compressLargeItem(item: MediaItem) {
@@ -134,6 +265,7 @@ function onImportDialogUpdate(open: boolean) {
 
 let unlistenDrag: UnlistenFn | null = null
 let unlistenResize: UnlistenFn | null = null
+let unlistenClose: UnlistenFn | null = null
 let disposed = false
 
 // 禁用 WebView 原生右键菜单（返回/前进等），右键菜单位置由应用自定义菜单接管；
@@ -146,6 +278,15 @@ function onContextMenu(e: MouseEvent) {
 
 onMounted(async () => {
   document.addEventListener('contextmenu', onContextMenu)
+
+  // 关闭动作设为「每次都询问」时的弹窗请求：尽早订阅，避免启动早期关闭窗口无响应
+  try {
+    const unlisten = await onCloseRequested(handleCloseRequested)
+    if (disposed) unlisten()
+    else unlistenClose = unlisten
+  } catch {
+    // 非 Tauri 环境（如纯浏览器预览）下忽略
+  }
 
   // 运行在临时目录（如直接在压缩包里双击运行）时警告并退出：随包组件可能缺失、临时路径会被系统清理
   try {
@@ -214,6 +355,7 @@ onUnmounted(() => {
   document.removeEventListener('contextmenu', onContextMenu)
   unlistenDrag?.()
   unlistenResize?.()
+  unlistenClose?.()
 })
 </script>
 
@@ -278,6 +420,39 @@ onUnmounted(() => {
             <span class="h-2 w-2 shrink-0 rounded-full" :class="statusDotClass" />
             <span class="truncate">{{ statusText }}</span>
           </div>
+          <div
+            class="relative flex items-center rounded-full border border-border bg-muted/60 p-0.5"
+            role="group"
+            aria-label="监听模式"
+          >
+            <!-- 滑块：指示当前生效的监听模式，随选择左右滑动 -->
+            <span
+              aria-hidden="true"
+              class="pointer-events-none absolute inset-y-0.5 left-0.5 w-[calc(50%-2px)] rounded-full bg-primary shadow-sm transition-transform duration-200 ease-out"
+              :class="lanMode ? 'translate-x-full' : 'translate-x-0'"
+            />
+            <button
+              v-for="opt in listenOptions"
+              :key="opt.value"
+              type="button"
+              :disabled="listenBusy || (opt.value === 'lan' && !allowPeerView)"
+              :title="
+                opt.value === 'lan' && !allowPeerView
+                  ? '需先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」'
+                  : opt.title
+              "
+              @click="selectListenMode(opt.value)"
+              class="relative z-10 flex flex-1 items-center justify-center gap-1 rounded-full px-2 py-1 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              :class="
+                (opt.value === 'lan') === lanMode
+                  ? 'text-primary-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              "
+            >
+              <component :is="opt.icon" class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              {{ opt.label }}
+            </button>
+          </div>
           <ThemeToggle />
         </div>
       </aside>
@@ -307,6 +482,34 @@ onUnmounted(() => {
         </div>
         <div class="flex justify-end gap-2">
           <Button @click="quitFromTempWarning">退出软件</Button>
+        </div>
+      </div>
+    </Dialog>
+
+    <!-- 关闭主窗口确认：关闭动作设为「每次都询问」时，让用户选择完全关闭或最小化到托盘 -->
+    <Dialog
+      :open="closeAskOpen"
+      title="关闭程序"
+      description="请选择关闭方式；勾选「不再提示」后可在「设置 · 系统 · 关闭窗口时」修改"
+      @update:open="onCloseAskUpdate"
+    >
+      <div class="space-y-4">
+        <div class="flex items-center justify-between gap-4 rounded-md border border-border bg-muted/40 px-3 py-2">
+          <div class="min-w-0">
+            <div class="text-sm">不再提示</div>
+            <p class="mt-0.5 text-xs text-muted-foreground">记住本次选择，下次直接执行</p>
+          </div>
+          <Switch :checked="closeRemember" @update:checked="closeRemember = $event" />
+        </div>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" :disabled="closeBusy" @click="chooseMinimizeToTray">
+            <Minimize2 class="h-4 w-4" aria-hidden="true" />
+            最小化到托盘
+          </Button>
+          <Button variant="destructive" :disabled="closeBusy" @click="chooseExit">
+            <Power class="h-4 w-4" aria-hidden="true" />
+            完全关闭
+          </Button>
         </div>
       </div>
     </Dialog>
