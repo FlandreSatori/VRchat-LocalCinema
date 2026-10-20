@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { FolderOpen, RotateCcw, Trash2, Download, ExternalLink, AlertTriangle, RefreshCw } from 'lucide-vue-next'
 import { open } from '@tauri-apps/plugin-dialog'
 import Card from '../components/ui/Card.vue'
+import CollapsibleCard from '../components/ui/CollapsibleCard.vue'
 import Button from '../components/ui/Button.vue'
 import Input from '../components/ui/Input.vue'
 import Label from '../components/ui/Label.vue'
@@ -22,6 +23,7 @@ import {
   getConvertCacheInfo,
   openConvertDir,
   clearConvertCache,
+  clearDownloadTemp,
   listMedia,
   getComponentsStatus,
   downloadComponent,
@@ -155,6 +157,12 @@ async function openManual(kind: ComponentKindId) {
 
 const loading = ref(true)
 const saving = ref(false)
+
+/// 折叠分组：同一时间只展开一组（'' 表示全部收起）
+const openGroup = ref('library')
+function setGroup(id: string, open: boolean) {
+  openGroup.value = open ? id : ''
+}
 /// 遮罩仅在保存耗时较长（如重启 HTTP 服务）时出现，避免每次修改都闪遮罩
 const applyingOpen = ref(false)
 /// 首次加载完成前不自动保存，避免把占位初始值写进配置
@@ -421,6 +429,22 @@ async function openDir() {
 
 const convertCache = ref<ConvertCacheInfo | null>(null)
 const clearingConvertCache = ref(false)
+const clearingDownloadTemp = ref(false)
+
+/// 清理下载目录中未完成的 .part 残留分片（不动已下载完成的媒体文件）
+async function doClearDownloadTemp() {
+  if (clearingDownloadTemp.value) return
+  clearingDownloadTemp.value = true
+  try {
+    const r = await clearDownloadTemp()
+    if (r.removedFiles === 0) toast.info('下载目录中没有需要清理的残留临时文件')
+    else toast.success(`已清理 ${r.removedFiles} 个残留临时文件（释放 ${formatSize(r.freedBytes)}）`)
+  } catch (e) {
+    toast.error(errMsg(e))
+  } finally {
+    clearingDownloadTemp.value = false
+  }
+}
 
 async function refreshConvertCache() {
   try {
@@ -520,11 +544,11 @@ onUnmounted(() => {
       <p class="text-xs text-muted-foreground">所有修改即时生效</p>
     </div>
 
-    <Card class="space-y-4 p-5">
-      <div>
-        <h2 class="font-medium">HTTP 服务</h2>
-        <p class="mt-0.5 text-xs text-muted-foreground">修改监听或端口后服务将自动重启</p>
-      </div>
+    <CollapsibleCard
+      title="媒体库"
+      :open="openGroup === 'library'"
+      @update:open="(v) => setGroup('library', v)"
+    >
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1.5">
           <Label>监听模式</Label>
@@ -563,10 +587,7 @@ onUnmounted(() => {
       <p v-if="form.allowPeerView" class="text-xs text-amber-600 dark:text-amber-500">
         已开启：他人可通过 {{ form.port }} 端口查看你的媒体库。请保持所有人的监听端口一致；关闭后对方将看不到任何视频。
       </p>
-    </Card>
-
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">播放链接</h2>
+      <Separator />
       <div class="space-y-1.5">
         <Label>默认地址模式</Label>
         <Select :model-value="form.defaultUrlMode" :options="urlModeOptions" class="w-full" @update:model-value="setUrlMode" />
@@ -578,29 +599,28 @@ onUnmounted(() => {
       <p class="text-xs text-muted-foreground">
         局域网模式默认自动选地址：EasyTier 组网运行时优先使用虚拟 IP，未运行时使用物理网卡地址；也可在此手动指定网卡。
       </p>
-    </Card>
+    </CollapsibleCard>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">外部播放器</h2>
+    <CollapsibleCard title="数据缓存" :open="openGroup === 'cache'" @update:open="(v) => setGroup('cache', v)">
       <div class="space-y-1.5">
-        <Label>默认播放器</Label>
+        <Label>下载保存目录</Label>
         <div class="flex gap-2">
-          <Select v-model="form.defaultPlayerPath" :options="playerOptions" class="flex-1" />
-          <Button variant="outline" @click="browsePlayer">
+          <Input v-model="form.downloadDir" :placeholder="appPaths?.downloadDir ?? '默认目录'" class="flex-1" />
+          <Button variant="outline" @click="browseDownloadDir">
             <FolderOpen class="h-4 w-4" />
             浏览…
           </Button>
         </div>
+        <p class="text-xs text-muted-foreground">从房间成员处下载的媒体保存到此目录，留空使用默认目录{{ appPaths ? `：${appPaths.downloadDir}` : '' }}</p>
       </div>
-      <div class="space-y-1.5">
-        <Label>启动参数</Label>
-        <Input v-model="form.defaultPlayerArgs" placeholder="{path} 将被替换为文件路径" />
-        <p class="text-xs text-muted-foreground">留空则使用播放器默认参数；{path} 占位符会被替换为视频文件路径。</p>
-      </div>
-    </Card>
-
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">封面与缓存</h2>
+      <Button variant="outline" size="sm" :disabled="clearingDownloadTemp" @click="doClearDownloadTemp">
+        <Trash2 class="h-4 w-4" />
+        {{ clearingDownloadTemp ? '清理中…' : '清理残留临时文件' }}
+      </Button>
+      <p class="text-xs text-muted-foreground">
+        仅删除下载目录中未完成的 <span class="font-mono">.part</span> 临时分片，已下载完成的媒体文件不受影响。
+      </p>
+      <Separator />
       <div class="space-y-1.5">
         <Label>封面缓存目录</Label>
         <Input v-model="form.thumbDir" :placeholder="appPaths?.thumbDir ?? '默认目录'" />
@@ -639,20 +659,21 @@ onUnmounted(() => {
       <p class="text-xs text-muted-foreground">
         清除会同时从媒体库移除对应的转码产物卡片，源视频保留在原位置；转码队列中有任务进行时无法清理。
       </p>
-    </Card>
+    </CollapsibleCard>
 
-    <Card class="space-y-4 p-5">
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="font-medium">内置组件</h2>
-          <p class="mt-0.5 text-xs text-muted-foreground">优先使用内置目录中的组件，其次回退到系统 PATH</p>
-        </div>
+    <CollapsibleCard
+      title="内置组件"
+      :open="openGroup === 'components'"
+      @update:open="(v) => setGroup('components', v)"
+    >
+      <template #actions>
         <Button variant="ghost" size="sm" :disabled="loading" @click="refreshComponents">
           <RefreshCw class="h-4 w-4" />
           刷新
         </Button>
-      </div>
+      </template>
 
+      <h3 class="text-sm font-medium">内置组件</h3>
       <div v-for="kind in (['ffmpeg', 'easytier', 'cloudflared'] as const)" :key="kind" class="space-y-2 rounded-md border border-border p-3">
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2">
@@ -686,10 +707,9 @@ onUnmounted(() => {
         </div>
         <p v-if="progressText(kind)" class="text-xs text-muted-foreground">{{ progressText(kind) }}</p>
       </div>
-    </Card>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">FFmpeg 手动路径</h2>
+      <Separator />
+      <h3 class="text-sm font-medium">FFmpeg 手动路径</h3>
       <div class="space-y-1.5">
         <Label>ffmpeg 路径</Label>
         <div class="flex gap-2">
@@ -710,10 +730,9 @@ onUnmounted(() => {
           </Button>
         </div>
       </div>
-    </Card>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">EasyTier 手动路径</h2>
+      <Separator />
+      <h3 class="text-sm font-medium">EasyTier 手动路径</h3>
       <div class="space-y-1.5">
         <Label>easytier-core 路径</Label>
         <div class="flex gap-2">
@@ -735,10 +754,9 @@ onUnmounted(() => {
         </div>
       </div>
       <p class="text-xs text-muted-foreground">组网配置请前往「EasyTier 组网」页面。</p>
-    </Card>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">Cloudflare 隧道手动路径</h2>
+      <Separator />
+      <h3 class="text-sm font-medium">Cloudflare 隧道手动路径</h3>
       <div class="space-y-1.5">
         <Label>cloudflared 路径</Label>
         <div class="flex gap-2">
@@ -750,25 +768,27 @@ onUnmounted(() => {
         </div>
         <p class="text-xs text-muted-foreground">用于「公网隧道」快速分享；隧道开关在「HTTP 服务」页面。</p>
       </div>
-    </Card>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">下载</h2>
+      <Separator />
+      <h3 class="text-sm font-medium">外部播放器</h3>
       <div class="space-y-1.5">
-        <Label>下载保存目录</Label>
+        <Label>默认播放器</Label>
         <div class="flex gap-2">
-          <Input v-model="form.downloadDir" :placeholder="appPaths?.downloadDir ?? '默认目录'" class="flex-1" />
-          <Button variant="outline" @click="browseDownloadDir">
+          <Select v-model="form.defaultPlayerPath" :options="playerOptions" class="flex-1" />
+          <Button variant="outline" @click="browsePlayer">
             <FolderOpen class="h-4 w-4" />
             浏览…
           </Button>
         </div>
-        <p class="text-xs text-muted-foreground">从房间成员处下载的媒体保存到此目录，留空使用默认目录{{ appPaths ? `：${appPaths.downloadDir}` : '' }}</p>
       </div>
-    </Card>
+      <div class="space-y-1.5">
+        <Label>启动参数</Label>
+        <Input v-model="form.defaultPlayerArgs" placeholder="{path} 将被替换为文件路径" />
+        <p class="text-xs text-muted-foreground">留空则使用播放器默认参数；{path} 占位符会被替换为视频文件路径。</p>
+      </div>
+    </CollapsibleCard>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">系统</h2>
+    <CollapsibleCard title="系统" :open="openGroup === 'system'" @update:open="(v) => setGroup('system', v)">
       <div class="flex items-center justify-between">
         <div>
           <Label>开机启动</Label>
@@ -800,10 +820,9 @@ onUnmounted(() => {
         </div>
         <Select :model-value="String(form.streamBufferKb)" :options="streamBufferOptions" class="w-40" @update:model-value="setStreamBuffer" />
       </div>
-    </Card>
+    </CollapsibleCard>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">一键压制</h2>
+    <CollapsibleCard title="一键压制" :open="openGroup === 'transcode'" @update:open="(v) => setGroup('transcode', v)">
       <div class="space-y-1.5">
         <Label>720P 码率（Mbps）</Label>
         <Input
@@ -831,10 +850,9 @@ onUnmounted(() => {
         />
         <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 6）</p>
       </div>
-    </Card>
+    </CollapsibleCard>
 
-    <Card class="space-y-4 p-5">
-      <h2 class="font-medium">其他</h2>
+    <Card class="p-5">
       <div class="flex flex-wrap gap-2">
         <Button variant="outline" @click="openDir">
           <FolderOpen class="h-4 w-4" />

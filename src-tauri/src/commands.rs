@@ -1019,6 +1019,45 @@ pub async fn clear_convert_cache(_app: AppHandle, state: State<'_, AppState>) ->
     })
 }
 
+/// 下载目录残留清理结果
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearDownloadTempResult {
+    pub removed_files: u64,
+    pub freed_bytes: u64,
+}
+
+/// 清理下载目录中的残留临时文件（仅 `*.part` 未完成分片，不动已完成的媒体文件）。
+/// 正在下载的分片被进程占用，Windows 下删除会失败，天然不会误删进行中的任务。
+#[tauri::command]
+pub async fn clear_download_temp(state: State<'_, AppState>) -> AppResult<ClearDownloadTempResult> {
+    let dir = download_dir_of(&state);
+    let mut removed_files = 0u64;
+    let mut freed_bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_part = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("part"))
+                .unwrap_or(false);
+            if !is_part {
+                continue;
+            }
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                removed_files += 1;
+                freed_bytes += len;
+            }
+        }
+    }
+    Ok(ClearDownloadTempResult {
+        removed_files,
+        freed_bytes,
+    })
+}
+
 /// 计算文件 BLAKE3（流式分块读取，避免占用大量内存；比 SHA-256 更快）
 pub(crate) async fn hash_file(path: &std::path::Path) -> Option<String> {
     let path = path.to_path_buf();

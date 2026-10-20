@@ -306,6 +306,7 @@ pub fn run() {
             commands::get_convert_cache_info,
             commands::open_convert_dir,
             commands::clear_convert_cache,
+            commands::clear_download_temp,
             commands::get_close_behavior,
             commands::get_components_status,
             commands::download_component,

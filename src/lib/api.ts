@@ -635,6 +635,16 @@ export function clearConvertCache(): Promise<ClearConvertCacheResult> {
   return invoke('clear_convert_cache')
 }
 
+export interface ClearDownloadTempResult {
+  removedFiles: number
+  freedBytes: number
+}
+
+/** 清理下载目录中的残留临时文件（仅 *.part 未完成分片） */
+export function clearDownloadTemp(): Promise<ClearDownloadTempResult> {
+  return invoke('clear_download_temp')
+}
+
 // Events
 export function onMediaUpdated(callback: (item: MediaItem) => void): Promise<UnlistenFn> {
   return listen<MediaItem>('media-updated', (e) => callback(e.payload))
