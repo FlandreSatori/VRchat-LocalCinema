@@ -49,6 +49,7 @@ struct MediaState {
     stream_buf_kb: Arc<AtomicUsize>,
     /// 托盘媒体传输统计
     tray_metrics: Arc<Mutex<TrayMetrics>>,
+    traffic_stats: crate::traffic_stats::TrafficStats,
 }
 
 pub(crate) struct TrayMetrics {
@@ -138,6 +139,7 @@ impl HttpServer {
         hls_dir: &Path,
         allow_peer_view: Arc<std::sync::atomic::AtomicBool>,
         stream_buf_kb: Arc<AtomicUsize>,
+        traffic_stats: crate::traffic_stats::TrafficStats,
     ) -> Self {
         Self {
             status: Arc::new(RwLock::new(ServerStatus {
@@ -155,6 +157,7 @@ impl HttpServer {
                 validated_paths: Arc::new(dashmap::DashMap::new()),
                 stream_buf_kb,
                 tray_metrics: Arc::new(Mutex::new(TrayMetrics::new())),
+                traffic_stats,
             },
             tx: Arc::new(RwLock::new(None)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -416,13 +419,17 @@ async fn track_response(
         
         let mut metrics = state.tray_metrics.lock().unwrap_or_else(|e| e.into_inner());
         metrics.update_device(addr.ip(), name, progress);
-        metrics.sample_bytes = metrics.sample_bytes.saturating_add(total_size);
     }
     
     let metrics = state.tray_metrics.clone();
+    let traffic = state.traffic_stats.clone();
+    let is_local = addr.ip().is_loopback();
+    let track_upload = method == Method::GET && status.is_success()
+        && (path.starts_with("/media/") || path.starts_with("/download/") || path.starts_with("/online/") || path.starts_with("/hls/") || is_media_path(&path));
     let (parts, original_body) = response.into_parts();
     let stream = original_body.into_data_stream().map(move |result| {
         if let Ok(bytes) = &result {
+            if track_upload { traffic.record_upload(bytes.len() as u64, is_local); }
             let mut metrics = metrics.lock().unwrap_or_else(|e| e.into_inner());
             metrics.sample_bytes = metrics.sample_bytes.saturating_add(bytes.len() as u64);
         }
@@ -837,7 +844,8 @@ async fn serve_hls(
 /// 2. 原样转发请求（含 Range）到 CDN 并流式回传，因此可 seek；
 /// 3. 直链过期（含 `deadline` 签名，约 2 小时）时自动重新解析；CDN 返回 403/410 时重试一次。
 ///
-/// 仅在环回地址（127.0.0.1）使用，绝不生成局域网链接。
+/// 用于本地模式（127.0.0.1 代理链接）；局域网模式由 `commands::build_media_url`
+/// 直接返回 B 站 CDN 直链，不经过本路由。
 async fn serve_online(
     State(state): State<MediaState>,
     AxumPath(id): AxumPath<String>,
@@ -880,7 +888,7 @@ async fn serve_online(
     };
 
     // 3. 转发到 CDN；直链失效（403/410）时重解析并重试一次
-    let resp = forward_to_cdn(&url, &method, &headers).await;
+    let resp = forward_to_cdn(&url, &method, &headers, &state.traffic_stats).await;
     if matches!(
         resp.status(),
         StatusCode::FORBIDDEN | StatusCode::GONE | StatusCode::UNAUTHORIZED
@@ -895,7 +903,7 @@ async fn serve_online(
             cache.remove(&id);
         }
         if let Ok(fresh) = resolve_and_cache(&state, &id, &bvid, cid).await {
-            return forward_to_cdn(&fresh, &method, &headers).await;
+            return forward_to_cdn(&fresh, &method, &headers, &state.traffic_stats).await;
         }
     }
     resp
@@ -923,9 +931,14 @@ async fn resolve_and_cache(
 }
 
 /// 原样转发请求到 B 站官方 CDN（注入浏览器 UA 与 Referer，透传 Range），流式回传正文。
-async fn forward_to_cdn(url: &str, method: &Method, req_headers: &HeaderMap) -> Response<Body> {
+async fn forward_to_cdn(
+    url: &str,
+    method: &Method,
+    req_headers: &HeaderMap,
+    traffic: &crate::traffic_stats::TrafficStats,
+) -> Response<Body> {
     let mut rb = crate::bilibili::stream_client()
-        .request(reqwest::Method::GET, url)
+        .request(method.clone(), url)
         .header(reqwest::header::REFERER, "https://www.bilibili.com/");
     if let Some(range) = req_headers
         .get(header::RANGE)
@@ -959,7 +972,13 @@ async fn forward_to_cdn(url: &str, method: &Method, req_headers: &HeaderMap) -> 
     let body = if *method == Method::HEAD {
         Body::empty()
     } else {
-        Body::from_stream(upstream.bytes_stream())
+        let traffic = traffic.clone();
+        Body::from_stream(upstream.bytes_stream().map(move |result| {
+            if let Ok(bytes) = &result {
+                traffic.record_download(bytes.len() as u64, false);
+            }
+            result
+        }))
     };
     builder
         .body(body)
@@ -1058,10 +1077,7 @@ struct CountingStream<S> {
 }
 
 impl<S> CountingStream<S> {
-    fn new(
-        inner: S,
-        label: String,
-    ) -> Self {
+    fn new(inner: S, label: String) -> Self {
         Self {
             inner,
             label,

@@ -51,6 +51,7 @@ import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
 import { formatSize, formatDuration } from '../lib/format'
 import { serverStore, convertStore, convertTaskStore, transcodeStreamingItem, lanListenAvailable, lanUnavailableReason } from '../lib/store'
+import { maybeRemindAfterCopy } from '../lib/copyReminder'
 
 const props = withDefaults(
   defineProps<{
@@ -58,8 +59,9 @@ const props = withDefaults(
     /** 批量管理模式：显示勾选框，点击卡片切换选中 */
     selectable?: boolean
     selected?: boolean
+    detailed?: boolean
   }>(),
-  { selectable: false, selected: false }
+  { selectable: false, selected: false, detailed: false }
 )
 
 const emit = defineEmits<{
@@ -151,6 +153,7 @@ async function copyUrl(mode: UrlMode, label: string) {
     const url = await buildMediaUrl(props.item.id, mode)
     await writeText(url)
     toast.success(`已复制${label}`)
+    await maybeRemindAfterCopy(props.item, mode)
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -260,10 +263,20 @@ async function doRemove() {
 }
 
 const menuItems = computed<MenuEntry[]>(() => {
-  // 在线（B 站）条目：只有本机代理链接，不能本地播放/转码；可直接打开 B 站原页面
+  // 在线（B 站）条目：本机代理链接 + 局域网模式下直接可用的 B 站 CDN 直链；不能本地播放/转码
   if (isOnline.value) {
     return [
       { type: 'item', label: '复制本机 URL', icon: Copy, onSelect: () => copyUrl('localhost', '本机 URL') },
+      {
+        type: 'item',
+        label: '复制 B 站直链',
+        icon: Copy,
+        disabled: !lanListenAvailable.value,
+        title: lanListenAvailable.value
+          ? '局域网模式使用：观众直连 B 站 CDN 播放，约 2 小时后过期且不会自动更新'
+          : lanUnavailableReason.value,
+        onSelect: () => copyUrl('lan', ' B 站直链'),
+      },
       { type: 'separator' },
       { type: 'item', label: '在浏览器打开 B 站页面', icon: ExternalLink, onSelect: openSource },
       { type: 'item', label: '查看视频信息', icon: Info, onSelect: () => (infoOpen.value = true) },
@@ -366,7 +379,7 @@ function navigateToConvert() {
       :style="selected ? 'border-color: hsl(var(--primary))' : ''"
       @click="selectable && emit('toggle-select', item.id)"
     >
-      <div class="relative aspect-square w-full overflow-hidden bg-zinc-900">
+      <div :class="['relative w-full overflow-hidden bg-zinc-900', detailed ? 'aspect-video' : 'aspect-square']">
         <!-- 批量管理勾选框 -->
         <button
           v-if="selectable"
@@ -463,8 +476,11 @@ function navigateToConvert() {
         >
           最高 720P；1080P+ 请用 JJdown 下载后导入
         </div>
-        <div v-if="unsupported && !isShortcut" class="mt-0.5 line-clamp-2 break-all text-xs text-destructive" :title="item.compatReason ?? ''">
+        <div v-if="unsupported && !isShortcut" :class="['mt-0.5 break-all text-xs text-destructive', detailed ? 'whitespace-normal' : 'line-clamp-2']" :title="item.compatReason ?? ''">
           {{ item.compatReason ?? '不支持该视频格式或编码组合' }}
+        </div>
+        <div v-if="unsupported && detailed && !isShortcut" class="mt-1 text-xs leading-relaxed text-muted-foreground">
+          多音轨选音轨保留；含字幕选字幕轨烧录；视频流不支持选仅转视频；音频流不支持选仅转音频。
         </div>
         <div v-if="unsupported && !isShortcut" class="mt-2 flex gap-1.5">
           <Button size="sm" variant="outline" :disabled="busy" class="h-7 flex-1 px-2 text-xs" title="打开转码设置：可选全部转码或分段转码、音轨与字幕" @click="doTranscode">

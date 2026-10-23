@@ -161,6 +161,29 @@ impl Default for EasytierConfig {
     }
 }
 
+/// frp 公网隧道配置（SakuraFrp 等服务；本程序只负责启动/停止 frpc）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct FrpConfig {
+    /// 启动参数，对应 frpc -f：访问密钥:隧道ID[,隧道ID...]（多条隧道用半角逗号分隔）
+    pub launch_params: String,
+    /// 应用启动时自动拉起 frpc
+    pub auto_start: bool,
+    /// frpc 异常退出后自动重新拉起
+    pub auto_restart: bool,
+}
+
+impl Default for FrpConfig {
+    fn default() -> Self {
+        Self {
+            launch_params: String::new(),
+            auto_start: false,
+            auto_restart: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +223,8 @@ pub struct Settings {
     /// cloudflared 路径，空表示自动检测（内置优先，其次系统 PATH）
     #[serde(default)]
     pub cloudflared_path: String,
+    /// frpc 路径，空表示自动检测（内置优先，其次系统 PATH）
+    pub frpc_path: String,
     /// 从对等节点下载的媒体存放目录，空表示 data_dir/downloads
     pub download_dir: String,
     /// 媒体流读缓冲（KB）：排查播放卡顿时按开发者建议调整，平时不推荐修改
@@ -216,6 +241,8 @@ pub struct Settings {
     pub streaming_1080p_bitrate_mbps: f64,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,
+    /// frp 公网隧道配置
+    pub frp: FrpConfig,
 }
 
 impl Default for Settings {
@@ -239,12 +266,14 @@ impl Default for Settings {
             easytier_core_path: String::new(),
             easytier_cli_path: String::new(),
             cloudflared_path: String::new(),
+            frpc_path: String::new(),
             download_dir: String::new(),
             stream_buffer_kb: default_stream_buffer_kb(),
             disable_power_throttling: default_disable_power_throttling(),
             streaming_720p_bitrate_mbps: default_streaming_720p_bitrate_mbps(),
             streaming_1080p_bitrate_mbps: default_streaming_1080p_bitrate_mbps(),
             easytier: EasytierConfig::default(),
+            frp: FrpConfig::default(),
         }
     }
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { Github } from 'lucide-vue-next'
+import { Github, MessageCircle, Users } from 'lucide-vue-next'
 import brandIcon from '../../watching_video.png'
 import Card from '../components/ui/Card.vue'
 import Badge from '../components/ui/Badge.vue'
@@ -9,6 +9,38 @@ import DisclaimerDialog from '../components/DisclaimerDialog.vue'
 import { getAppPaths, openUrl, openDir, type AppPaths } from '../lib/api'
 import { APP_NAME, APP_VERSION, APP_DESCRIPTION } from '../lib/appinfo'
 import { toast, errMsg } from '../lib/toast'
+
+interface FeedbackChannel {
+  name: string
+  description: string
+  url: string
+  icon: any
+  color: string
+}
+
+const feedbackChannels: FeedbackChannel[] = [
+  {
+    name: 'B站私信',
+    description: '通过 B 站私信联系作者，适合快速反馈问题或建议',
+    url: 'https://space.bilibili.com/2199618',
+    icon: MessageCircle,
+    color: 'text-pink-600',
+  },
+  {
+    name: 'GitHub Issue',
+    description: '在 GitHub 上提交 Issue，适合报告 Bug 或功能建议',
+    url: 'https://github.com/FlandreSatori/VRchat-LocalCinema/issues',
+    icon: Github,
+    color: 'text-gray-700 dark:text-gray-300',
+  },
+  {
+    name: 'QQ 群',
+    description: '加入 QQ 群（1128168990）与其他用户交流讨论',
+    url: 'https://qm.qq.com/q/l9QaFgvJWo',
+    icon: Users,
+    color: 'text-blue-600',
+  },
+]
 
 const appPaths = ref<AppPaths | null>(null)
 const showDisclaimer = ref(false)
@@ -27,7 +59,7 @@ const links = [
   },
 ]
 
-async function openLink(url: string) {
+async function handleOpenUrl(url: string) {
   try {
     await openUrl(url)
   } catch (e) {
@@ -111,7 +143,7 @@ onMounted(async () => {
           type="button"
           class="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           :title="link.url"
-          @click="openLink(link.url)"
+          @click="handleOpenUrl(link.url)"
         >
           <svg v-if="link.icon === 'bilibili'" viewBox="0 0 24 24" fill="currentColor" class="h-3.5 w-3.5" aria-hidden="true">
             <path d="M17.813 4.653h.854c1.51.054 2.769.578 3.773 1.574 1.004.995 1.524 2.249 1.56 3.76v7.36c-.036 1.51-.556 2.769-1.56 3.773s-2.262 1.524-3.773 1.56H5.333c-1.51-.036-2.769-.556-3.773-1.56S.036 18.858 0 17.347v-7.36c.036-1.511.556-2.765 1.56-3.76 1.004-.996 2.262-1.52 3.773-1.574h.774l-1.174-1.12a1.234 1.234 0 0 1-.373-.906c0-.356.124-.658.373-.907l.027-.027c.267-.249.573-.373.92-.373.347 0 .653.124.92.373L9.653 4.44c.071.071.134.142.187.213h4.267a.836.836 0 0 1 .16-.213l2.853-2.747c.267-.249.573-.373.92-.373.347 0 .662.151.929.4.267.249.391.551.391.907 0 .355-.124.657-.373.906zM5.333 7.24c-.746.018-1.373.276-1.88.773-.506.498-.769 1.13-.786 1.894v7.52c.017.764.28 1.395.786 1.893.507.498 1.134.756 1.88.773h13.334c.746-.017 1.373-.275 1.88-.773.506-.498.769-1.129.786-1.893v-7.52c-.017-.765-.28-1.396-.786-1.894-.507-.497-1.134-.755-1.88-.773zM8 11.107c.373 0 .684.124.933.373.25.249.383.569.4.96v1.173c-.017.391-.15.711-.4.96-.249.25-.56.374-.933.374s-.684-.125-.933-.374c-.25-.249-.383-.569-.4-.96V12.44c0-.373.129-.689.386-.947.258-.257.574-.386.947-.386zm8 0c.373 0 .684.124.933.373.25.249.383.569.4.96v1.173c-.017.391-.15.711-.4.96-.249.25-.56.374-.933.374s-.684-.125-.933-.374c-.25-.249-.383-.569-.4-.96V12.44c.017-.391.15-.711.4-.96.249-.249.56-.373.933-.373Z" />
@@ -126,6 +158,38 @@ onMounted(async () => {
       <h2 class="font-medium">技术栈</h2>
       <div class="mt-3 flex flex-wrap gap-2">
         <Badge v-for="t in techStack" :key="t" variant="secondary">{{ t }}</Badge>
+      </div>
+    </Card>
+
+    <Card class="p-5">
+      <h2 class="font-medium">反馈与改进</h2>
+      <p class="mt-2 text-sm text-muted-foreground">
+        欢迎通过以下渠道反馈问题、提出建议或寻求帮助。
+      </p>
+      <div class="mt-4 space-y-3">
+        <button
+          v-for="channel in feedbackChannels"
+          :key="channel.name"
+          type="button"
+          class="flex w-full items-start gap-4 rounded-lg border border-border bg-card p-4 text-left transition-colors hover:bg-accent"
+          @click="handleOpenUrl(channel.url)"
+        >
+          <component :is="channel.icon" :class="['mt-0.5 h-5 w-5 shrink-0', channel.color]" />
+          <div class="flex-1">
+            <h3 class="font-medium">{{ channel.name }}</h3>
+            <p class="mt-1 text-sm text-muted-foreground">{{ channel.description }}</p>
+          </div>
+        </button>
+      </div>
+      <div class="border-t border-border" />
+      <div class="mt-4 space-y-2 text-sm text-muted-foreground">
+        <h3 class="font-medium text-foreground">反馈建议</h3>
+        <ul class="space-y-1.5">
+          <li>• 报告 Bug 时，请尽量描述复现步骤和错误信息</li>
+          <li>• 如遇到转码或播放问题，建议提供样本文件</li>
+          <li>• 功能建议请说明使用场景和期望效果</li>
+          <li>• 可以在日志目录（下方查看）中找到详细日志</li>
+        </ul>
       </div>
     </Card>
 

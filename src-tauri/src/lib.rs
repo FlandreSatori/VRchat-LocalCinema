@@ -7,6 +7,7 @@ pub mod easytier;
 pub mod estimate;
 pub mod error;
 pub mod external_player;
+pub mod frp;
 pub mod http_server;
 pub mod logger;
 pub mod media_library;
@@ -16,6 +17,7 @@ pub mod system_codecs;
 pub mod thumbnail;
 pub mod transcode;
 pub mod tunnel;
+pub mod traffic_stats;
 pub mod url_builder;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -36,6 +38,12 @@ use settings::CloseBehavior;
 /// 此处直接结束进程不会造成数据损坏。
 pub fn exit_app(app: &AppHandle, state: &AppState) {
     state.exiting.store(true, Ordering::SeqCst);
+    state.server.stop();
+    if let Err(e) = state.traffic_stats.finish() {
+        tracing::warn!("退出时保存流量统计失败: {}", e);
+    }
+    // frpc 是本程序拉起的子进程，强制结束进程不会触发析构，这里先送终止信号，避免留下孤儿进程占着隧道
+    state.frp.stop_detached();
     // 强制销毁所有窗口（destroy 会立即销毁而不触发 CloseRequested 事件）
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.destroy();
@@ -164,6 +172,22 @@ pub fn run() {
                 e
             })?;
             let db = Arc::new(Mutex::new(db));
+            let traffic_stats = traffic_stats::TrafficStats::open(&paths.data_dir.join("traffic-stats.sqlite"))
+                .map_err(|e| format!("流量统计数据库初始化失败: {}", e))?;
+            let traffic_flush = traffic_stats.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let traffic = traffic_flush.clone();
+                    match tauri::async_runtime::spawn_blocking(move || traffic.flush()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!("流量统计保存失败: {}", e),
+                        Err(e) => tracing::warn!("流量统计后台任务失败: {}", e),
+                    }
+                }
+            });
 
             let thumb_dir = if settings_fixed.thumb_dir.trim().is_empty() {
                 paths.thumb_dir.clone()
@@ -179,12 +203,14 @@ pub fn run() {
                 &hls_dir,
                 allow_peer_view.clone(),
                 stream_buf_kb.clone(),
+                traffic_stats.clone(),
             );
 
             let state = AppState {
                 paths: paths.clone(),
                 settings: RwLock::new(settings_fixed.clone()),
                 db,
+                traffic_stats,
                 server: server.clone(),
                 network_operation: tokio::sync::Mutex::new(()),
                 recent_logs,
@@ -194,6 +220,7 @@ pub fn run() {
                 exiting: AtomicBool::new(false),
                 easytier: easytier::EasytierManager::new(paths.data_dir.clone()),
                 tunnel: tunnel::TunnelManager::new(),
+                frp: frp::FrpManager::new(),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
             };
@@ -217,6 +244,25 @@ pub fn run() {
                     tracing::error!("HTTP 服务自动启动失败: {}", e);
                 }
                 let _ = handle.emit("server-status-changed", server.status());
+
+                // 按设置自动拉起 frp 公网隧道（依赖 HTTP 服务已就绪）
+                let frp_cfg = settings_for_start.frp.clone();
+                if frp_cfg.auto_start && !frp_cfg.launch_params.trim().is_empty() {
+                    let settings_now = st.current_settings();
+                    let (bin, _) = components::frpc_binary(&settings_now, &st.paths);
+                    match bin {
+                        Some(bin) => {
+                            if let Err(e) = st
+                                .frp
+                                .start(&handle, &bin, &frp_cfg, server.status().port)
+                                .await
+                            {
+                                tracing::warn!("frp 隧道自动启动失败: {}", e);
+                            }
+                        }
+                        None => tracing::warn!("配置了 frp 自动启动，但未检测到 frpc"),
+                    }
+                }
             });
 
             // 系统托盘：刷新播放进度、上传带宽和设备数
@@ -272,6 +318,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_traffic_stats,
+            commands::get_upload_baseline,
             commands::get_settings,
             commands::save_settings,
             commands::reset_settings,
@@ -315,6 +363,10 @@ pub fn run() {
             commands::start_tunnel,
             commands::stop_tunnel,
             commands::build_tunnel_url,
+            commands::get_frp_status,
+            commands::start_frp,
+            commands::stop_frp,
+            commands::read_frp_output,
             commands::get_easytier_status,
             commands::start_easytier,
             commands::stop_easytier,
@@ -352,8 +404,17 @@ pub fn run() {
             commands::rename_media,
             commands::move_media,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = app.try_state::<AppState>() {
+                    if let Err(e) = state.traffic_stats.finish() {
+                        tracing::warn!("退出时保存流量统计失败: {}", e);
+                    }
+                }
+            }
+        });
 }
 
 fn build_tray(app: &mut tauri::App) -> Result<MenuItem<tauri::Wry>, Box<dyn std::error::Error>> {

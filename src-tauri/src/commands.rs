@@ -12,6 +12,7 @@ use crate::components::{self, ComponentKind, ComponentStatus};
 use crate::easytier::{self, EasytierStatus, RoomInfo};
 use crate::error::{AppError, AppResult};
 use crate::external_player::{self, PlayerInfo};
+use crate::frp::FrpStatus;
 use crate::http_server::{HttpServer, ServerStatus};
 use crate::logger::LogEntry;
 use crate::logger::RecentLogs;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub paths: AppPaths,
     pub settings: RwLock<Settings>,
     pub db: Arc<Mutex<Db>>,
+    pub traffic_stats: crate::traffic_stats::TrafficStats,
     pub server: HttpServer,
     /// HTTP 重配与隧道启停共用，避免端口切换时仍启动指向旧端口的隧道。
     pub network_operation: tokio::sync::Mutex<()>,
@@ -45,6 +47,8 @@ pub struct AppState {
     pub easytier: easytier::EasytierManager,
     /// Cloudflare 快速隧道（无需组网即可公网分享）
     pub tunnel: crate::tunnel::TunnelManager,
+    /// frp 公网隧道（SakuraFrp 等服务，本程序只负责启动/停止 frpc）
+    pub frp: crate::frp::FrpManager,
     /// 转码任务队列（按任务序列执行）
     pub convert_queue: crate::convert_queue::ConvertQueue,
     /// 正在进行的 HLS 转码任务（媒体 id）
@@ -68,6 +72,26 @@ fn thumb_dir_of(state: &AppState) -> PathBuf {
     } else {
         PathBuf::from(s.thumb_dir.trim())
     }
+}
+
+#[tauri::command]
+pub async fn get_traffic_stats(
+    state: State<'_, AppState>,
+    range: String,
+) -> AppResult<crate::traffic_stats::TrafficStatsResult> {
+    if !matches!(range.as_str(), "1h" | "24h" | "all") {
+        return Err(AppError::Msg("统计范围只能为 1h、24h 或 all".to_string()));
+    }
+    let traffic = state.traffic_stats.clone();
+    tauri::async_runtime::spawn_blocking(move || traffic.query(&range))
+        .await
+        .map_err(|e| AppError::Msg(e.to_string()))?
+        .map_err(|e| AppError::Msg(e.to_string()))
+}
+
+#[tauri::command]
+pub fn get_upload_baseline(state: State<'_, AppState>) -> f64 {
+    state.traffic_stats.baseline_mbps()
 }
 
 #[tauri::command]
@@ -115,9 +139,15 @@ pub async fn save_settings(
     }
 
     // 端口改变会令现有隧道回源地址失效；关闭旧隧道，由用户手动重新开启。
-    if old.port != settings.port && state.tunnel.status().running {
-        state.tunnel.stop(&app).await?;
-        tracing::info!("HTTP 端口变化，已关闭公网隧道，请重新启动以生成新链接");
+    if old.port != settings.port {
+        if state.tunnel.status().running {
+            state.tunnel.stop(&app).await?;
+            tracing::info!("HTTP 端口变化，已关闭公网隧道，请重新启动以生成新链接");
+        }
+        if state.frp.status().running {
+            state.frp.stop(&app).await?;
+            tracing::info!("HTTP 端口变化，已停止 frp 隧道，请在面板同步隧道回源端口后重新启动");
+        }
     }
 
     {
@@ -184,6 +214,7 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> AppResu
 pub async fn stop_server(app: AppHandle, state: State<'_, AppState>) -> AppResult<ServerStatus> {
     let _network = state.network_operation.lock().await;
     state.tunnel.stop(&app).await?;
+    state.frp.stop(&app).await?;
     state.server.stop();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     AppState::emit_status(&app, &state.server);
@@ -201,6 +232,7 @@ pub async fn restart_server(app: AppHandle, state: State<'_, AppState>) -> AppRe
     AppState::emit_status(&app, &server);
     if result.is_err() {
         state.tunnel.stop(&app).await?;
+        state.frp.stop(&app).await?;
     }
     result?;
     Ok(server.status())
@@ -718,6 +750,15 @@ pub async fn build_media_url(
             .ok_or_else(|| AppError::Msg("文件名无法映射".into()))?;
         item
     };
+    // 在线条目（B 站）在局域网模式下直接给出官方 CDN 直链：同房间观众从自己的网络直连 B 站播放，
+    // 不再经本机代理转发。代价是直链约 2 小时后过期且**不会自动续期**（需重新复制）；
+    // 本地模式仍走本机代理链接，保留过期自动重解析。
+    if item.source_kind == "online" && mode == UrlMode::Lan {
+        let (bvid, cid) = crate::bilibili::parse_online_key(&item.file_path)
+            .ok_or_else(|| AppError::Msg("在线视频条目缺少 B 站分 P 信息".to_string()))?;
+        let link = crate::bilibili::resolve_play_url(&bvid, cid).await?;
+        return Ok(link.url);
+    }
     let lan_ip = resolve_lan_ip(&state).await;
     let input = UrlInput {
         mode,
@@ -1088,6 +1129,7 @@ pub async fn get_components_status(state: State<'_, AppState>) -> AppResult<Vec<
         components::status(ComponentKind::Ffmpeg, &settings, &state.paths),
         components::status(ComponentKind::Easytier, &settings, &state.paths),
         components::status(ComponentKind::Cloudflared, &settings, &state.paths),
+        components::status(ComponentKind::Frp, &settings, &state.paths),
     ])
 }
 
@@ -1150,6 +1192,10 @@ pub async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> AppResu
         state.server.start(&settings.bind_ip(), settings.port).await?;
         AppState::emit_status(&app, &state.server);
     }
+    // Cloudflare 快速隧道与 frp 隧道二选一：开启本隧道前先停掉另一个
+    if state.frp.status().running {
+        let _ = state.frp.stop(&app).await;
+    }
     state.tunnel.start(&app, &bin, state.server.status().port).await
 }
 
@@ -1184,6 +1230,51 @@ pub async fn build_tunnel_url(state: State<'_, AppState>, id: String) -> AppResu
         base.trim_end_matches('/'),
         url_builder::encode_segment(&item.file_name)
     ))
+}
+
+// ===== frp 公网隧道（SakuraFrp 等服务，本程序只负责启停 frpc） =====
+
+#[tauri::command]
+pub async fn get_frp_status(state: State<'_, AppState>) -> AppResult<FrpStatus> {
+    Ok(state.frp.status())
+}
+
+#[tauri::command]
+pub async fn start_frp(app: AppHandle, state: State<'_, AppState>) -> AppResult<FrpStatus> {
+    let _network = state.network_operation.lock().await;
+    let settings = state.current_settings();
+    let (bin, _) = components::frpc_binary(&settings, &state.paths);
+    let bin = bin.ok_or_else(|| {
+        AppError::Msg(
+            "未检测到 frpc，请在「设置 · 内置组件」手动下载后指定路径或放入内置组件目录"
+                .to_string(),
+        )
+    })?;
+    // 隧道转发的是本机媒体服务，确保 HTTP 服务在运行
+    if !state.server.status().running {
+        state.server.start(&settings.bind_ip(), settings.port).await?;
+        AppState::emit_status(&app, &state.server);
+    }
+    // Cloudflare 快速隧道与 frp 隧道二选一：开启本隧道前先停掉另一个
+    if state.tunnel.status().running {
+        let _ = state.tunnel.stop(&app).await;
+    }
+    state
+        .frp
+        .start(&app, &bin, &settings.frp, state.server.status().port)
+        .await
+}
+
+#[tauri::command]
+pub async fn stop_frp(app: AppHandle, state: State<'_, AppState>) -> AppResult<FrpStatus> {
+    let _network = state.network_operation.lock().await;
+    state.frp.stop(&app).await
+}
+
+/// frpc 运行输出（最近一块），供「公网隧道」页展示
+#[tauri::command]
+pub async fn read_frp_output(state: State<'_, AppState>) -> AppResult<String> {
+    Ok(state.frp.read_output())
 }
 
 // ===== EasyTier 组网 =====
@@ -1377,28 +1468,69 @@ const FIREWALL_RULE_NAME: &str = "VRchat-LocalCinema Media Library";
 
 /// 增删媒体库入站防火墙规则。需要管理员权限，通过 Start-Process -Verb RunAs 提权执行
 /// （首次会弹出一次 UAC 授权）。allow=true 时放行该端口的入站 TCP；allow=false 时移除规则。
+///
+/// 提权子脚本把失败原因写入结果文件（UTF-8），由外层脚本以十六进制回传，
+/// 避免 PowerShell 以本地代码页（GBK）写 stdout、Rust 按 UTF-8 解码导致中文乱码。
 async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResult<()> {
     let name = crate::easytier::ps_quote(FIREWALL_RULE_NAME);
-    let script = if allow {
+    let body = if allow {
         format!(
-            "$ErrorActionPreference = 'Stop'\nGet-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\nNew-NetFirewallRule -DisplayName {} -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -Profile Any | Out-Null\nWrite-Output 'OK'\n",
+            "  Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\n  New-NetFirewallRule -DisplayName {} -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -Profile Any | Out-Null\n",
             name, name, port
         )
     } else {
         format!(
-            "$ErrorActionPreference = 'Stop'\nGet-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\nWrite-Output 'OK'\n",
+            "  Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue\n",
             name
         )
     };
+    let result_path = crate::easytier::elevation_result_path(data_dir);
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\n$out = {}\ntry {{\n{}}} catch {{\n  $m = $_.Exception.Message\n  if (-not $m) {{ $m = ($_ | Out-String) }}\n  [IO.File]::WriteAllText($out, $m, (New-Object System.Text.UTF8Encoding $false))\n  exit 1\n}}\nWrite-Output 'OK'\n",
+        crate::easytier::ps_quote(&result_path.to_string_lossy()),
+        body
+    );
     let path = data_dir.join("firewall-rule.ps1");
     crate::easytier::write_utf8_bom(&path, &script)?;
-    let wrapper = format!(
-        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|防火墙规则执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
-        crate::easytier::ps_quote(&path.to_string_lossy())
+    let wrapper = crate::easytier::elevation_wrapper(
+        &[
+            "-NoProfile".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            path.to_string_lossy().to_string(),
+        ],
+        &result_path,
     );
     let result = crate::easytier::run_powershell_script(&wrapper).await;
     let _ = std::fs::remove_file(&path);
-    result
+    let _ = std::fs::remove_file(&result_path);
+    match result {
+        Ok(()) => {
+            tracing::info!(
+                "已{}媒体库入站防火墙规则：TCP {}",
+                if allow { "放行" } else { "移除" },
+                port
+            );
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{}媒体库入站防火墙规则失败（TCP {}）: {}",
+                if allow { "放行" } else { "移除" },
+                port,
+                e
+            );
+            if allow {
+                Err(AppError::Msg(format!(
+                    "{}。请右键以管理员身份运行本程序后重试，或在 Windows 防火墙中手动放行入站 TCP 端口 {}",
+                    e, port
+                )))
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// 对端连通性检测结果
@@ -1605,6 +1737,7 @@ async fn run_download_session(
     part: &std::path::Path,
     cancel_flag: &std::sync::atomic::AtomicBool,
     pause_flag: &std::sync::atomic::AtomicBool,
+    traffic: &crate::traffic_stats::TrafficStats,
     mut on_progress: impl FnMut(u64, Option<u64>, Option<f64>),
 ) -> DownloadEnd {
     use std::sync::atomic::Ordering;
@@ -1682,6 +1815,7 @@ async fn run_download_session(
                     None => break,
                     Some(Err(e)) => return DownloadEnd::Failed(format!("下载中断: {}", e)),
                     Some(Ok(bytes)) => {
+                        traffic.record_download(bytes.len() as u64, false);
                         if let Err(e) = file.write_all(&bytes).await {
                             return DownloadEnd::Failed(format!("写入文件失败: {}", e));
                         }
@@ -1764,6 +1898,7 @@ async fn run_download_task(
         &part,
         &cancel_flag,
         &pause_flag,
+        &st.traffic_stats,
         move |received, total, percent| {
             let now = std::time::Instant::now();
             let (sample_time, sample_bytes) = *speed_sample.get_or_insert((now, received));

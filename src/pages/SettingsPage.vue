@@ -64,6 +64,7 @@ const form = reactive<Settings>({
   easytierCorePath: '',
   easytierCliPath: '',
   cloudflaredPath: '',
+  frpcPath: '',
   downloadDir: '',
   streamBufferKb: 256,
   disablePowerThrottling: true,
@@ -121,11 +122,23 @@ function progressText(kind: string): string {
   return `已下载 ${(p.downloaded / 1048576).toFixed(1)} / ${(p.total / 1048576).toFixed(1)} MB（${pct}%）`
 }
 
-async function refreshComponents() {
+const refreshingComponents = ref(false)
+
+/// 刷新内置组件状态。手动点击时给出结果反馈，否则按钮看起来像「没反应」
+async function refreshComponents(notify = false) {
+  if (refreshingComponents.value) return
+  refreshingComponents.value = true
   try {
     components.value = await getComponentsStatus()
+    if (notify) {
+      const missing = components.value.filter((c) => !c.installed)
+      if (missing.length === 0) toast.success('已刷新：全部组件均已安装')
+      else toast.info(`已刷新：${missing.map((c) => c.label).join('、')} 未安装`)
+    }
   } catch (e) {
     toast.error(errMsg(e))
+  } finally {
+    refreshingComponents.value = false
   }
 }
 
@@ -231,6 +244,11 @@ watch(() => form.listenMode, (mode, prev) => {
 // 关闭「允许其他人查看我的媒体库」后必须回到本地模式：此时服务只会绑定环回地址，
 // 若仍保持局域网模式就会出现「局域网模式却只监听 127.0.0.1」的矛盾状态。
 watch(() => form.allowPeerView, (on) => {
+  if (on && portInvalid.value) {
+    // 端口无效时 persist() 不会保存，开关会停在「已开启」但实际未生效（也就不会弹 UAC）
+    if (!syncing.value) toast.error('端口无效，设置暂未保存；请先修正端口号')
+    return
+  }
   if (on || form.listenMode !== 'lan') return
   form.listenMode = 'loopback'
   if (!syncing.value) toast.info('已关闭「允许其他人查看我的媒体库」，监听模式已切回本地')
@@ -340,6 +358,14 @@ async function browseCloudflared() {
     toast.error(errMsg(e))
   }
 }
+async function browseFrpc() {
+  try {
+    const p = await pickExe('选择 frpc 可执行文件')
+    if (p) form.frpcPath = p
+  } catch (e) {
+    toast.error(errMsg(e))
+  }
+}
 async function browseDownloadDir() {
   try {
     const selected = await open({ directory: true, multiple: false, title: '选择下载保存目录' })
@@ -358,9 +384,17 @@ function scheduleSave() {
   }, 600)
 }
 
+/// 保存进行中又有新改动时记下标记，本次保存结束后再存一次，
+/// 否则防抖到期的保存会被直接跳过、改动静默丢失（例如点开「允许其他人查看媒体库」却没弹 UAC）
+let savePending = false
+
 async function persist() {
-  if (!ready.value || syncing.value || saving.value) return
+  if (!ready.value || syncing.value) return
   if (portInvalid.value) return
+  if (saving.value) {
+    savePending = true
+    return
+  }
   form.streaming720pBitrateMbps = clampBitrate(form.streaming720pBitrateMbps)
   form.streaming1080pBitrateMbps = clampBitrate(form.streaming1080pBitrateMbps)
   saving.value = true
@@ -373,10 +407,21 @@ async function persist() {
     settingsCache.value = { ...form }
   } catch (e) {
     toast.error(errMsg(e))
+    savePending = false
+    // 保存失败（如未授予管理员权限）：回滚到后端真实配置，避免开关显示与实际状态不一致
+    try {
+      settingsCache.value = await getSettings()
+    } catch {
+      // 读取失败时保留当前表单，用户再次修改会重新触发保存
+    }
   } finally {
     window.clearTimeout(slow)
     applyingOpen.value = false
     saving.value = false
+    if (savePending) {
+      savePending = false
+      void persist()
+    }
   }
 }
 
@@ -546,6 +591,7 @@ onUnmounted(() => {
 
     <CollapsibleCard
       title="媒体库"
+      :accent="openGroup === 'library'"
       :open="openGroup === 'library'"
       @update:open="(v) => setGroup('library', v)"
     >
@@ -601,7 +647,12 @@ onUnmounted(() => {
       </p>
     </CollapsibleCard>
 
-    <CollapsibleCard title="数据缓存" :open="openGroup === 'cache'" @update:open="(v) => setGroup('cache', v)">
+    <CollapsibleCard
+      title="数据缓存"
+      :accent="openGroup === 'cache'"
+      :open="openGroup === 'cache'"
+      @update:open="(v) => setGroup('cache', v)"
+    >
       <div class="space-y-1.5">
         <Label>下载保存目录</Label>
         <div class="flex gap-2">
@@ -663,21 +714,27 @@ onUnmounted(() => {
 
     <CollapsibleCard
       title="内置组件"
+      :accent="openGroup === 'components'"
       :open="openGroup === 'components'"
       @update:open="(v) => setGroup('components', v)"
     >
       <template #actions>
-        <Button variant="ghost" size="sm" :disabled="loading" @click="refreshComponents">
-          <RefreshCw class="h-4 w-4" />
-          刷新
+        <Button
+          variant="ghost"
+          size="sm"
+          :disabled="loading || refreshingComponents"
+          @click="refreshComponents(true)"
+        >
+          <RefreshCw class="h-4 w-4" :class="refreshingComponents ? 'animate-spin' : ''" />
+          {{ refreshingComponents ? '刷新中…' : '刷新' }}
         </Button>
       </template>
 
       <h3 class="text-sm font-medium">内置组件</h3>
-      <div v-for="kind in (['ffmpeg', 'easytier', 'cloudflared'] as const)" :key="kind" class="space-y-2 rounded-md border border-border p-3">
+      <div v-for="kind in (['ffmpeg', 'easytier', 'cloudflared', 'frp'] as const)" :key="kind" class="space-y-2 rounded-md border border-border p-3">
         <div class="flex items-center justify-between gap-2">
           <div class="flex items-center gap-2">
-            <span class="text-sm font-medium">{{ componentOf(kind)?.label ?? (kind === 'ffmpeg' ? 'FFmpeg' : kind === 'easytier' ? 'EasyTier' : 'cloudflared') }}</span>
+            <span class="text-sm font-medium">{{ componentOf(kind)?.label ?? (kind === 'ffmpeg' ? 'FFmpeg' : kind === 'easytier' ? 'EasyTier' : kind === 'frp' ? 'frpc' : 'cloudflared') }}</span>
             <Badge v-if="componentOf(kind)" :variant="sourceVariant(componentOf(kind)!)">
               {{ sourceText(componentOf(kind)!) }}
             </Badge>
@@ -706,6 +763,9 @@ onUnmounted(() => {
           </span>
         </div>
         <p v-if="progressText(kind)" class="text-xs text-muted-foreground">{{ progressText(kind) }}</p>
+        <p v-if="kind === 'frp'" class="text-xs text-muted-foreground">
+          frpc 由 SakuraFrp 分发，自动下载会从官方镜像解析当前最新版本（含 Sakura 定制补丁）。
+        </p>
       </div>
 
       <Separator />
@@ -753,7 +813,7 @@ onUnmounted(() => {
           </Button>
         </div>
       </div>
-      <p class="text-xs text-muted-foreground">组网配置请前往「EasyTier 组网」页面。</p>
+      <p class="text-xs text-muted-foreground">组网配置请前往「虚拟局域网」页面。</p>
 
       <Separator />
       <h3 class="text-sm font-medium">Cloudflare 隧道手动路径</h3>
@@ -767,6 +827,20 @@ onUnmounted(() => {
           </Button>
         </div>
         <p class="text-xs text-muted-foreground">用于「公网隧道」快速分享；隧道开关在「HTTP 服务」页面。</p>
+      </div>
+
+      <Separator />
+      <h3 class="text-sm font-medium">frp 隧道手动路径</h3>
+      <div class="space-y-1.5">
+        <Label>frpc 路径</Label>
+        <div class="flex gap-2">
+          <Input v-model="form.frpcPath" placeholder="留空则依次检测内置目录和 PATH" class="flex-1" />
+          <Button variant="outline" @click="browseFrpc">
+            <FolderOpen class="h-4 w-4" />
+            浏览…
+          </Button>
+        </div>
+        <p class="text-xs text-muted-foreground">frpc 需从 SakuraFrp 等服务面板下载；启动参数与隧道开关在「HTTP 服务 · 公网隧道」。</p>
       </div>
 
       <Separator />
@@ -788,7 +862,12 @@ onUnmounted(() => {
       </div>
     </CollapsibleCard>
 
-    <CollapsibleCard title="系统" :open="openGroup === 'system'" @update:open="(v) => setGroup('system', v)">
+    <CollapsibleCard
+      title="系统"
+      :accent="openGroup === 'system'"
+      :open="openGroup === 'system'"
+      @update:open="(v) => setGroup('system', v)"
+    >
       <div class="flex items-center justify-between">
         <div>
           <Label>开机启动</Label>
@@ -822,7 +901,12 @@ onUnmounted(() => {
       </div>
     </CollapsibleCard>
 
-    <CollapsibleCard title="一键压制" :open="openGroup === 'transcode'" @update:open="(v) => setGroup('transcode', v)">
+    <CollapsibleCard
+      title="一键压制"
+      :accent="openGroup === 'transcode'"
+      :open="openGroup === 'transcode'"
+      @update:open="(v) => setGroup('transcode', v)"
+    >
       <div class="space-y-1.5">
         <Label>720P 码率（Mbps）</Label>
         <Input

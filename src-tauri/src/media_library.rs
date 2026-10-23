@@ -228,10 +228,11 @@ impl Db {
              CREATE INDEX IF NOT EXISTS idx_media_source_media_id ON media(source_media_id);
              CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);",
         )?;
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO folders (id, name, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)",
-            params![BUILTIN_INCOMPATIBLE_ID, "不兼容", now_ms()],
-        );
+        conn.execute(
+            "INSERT INTO folders (id, name, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+            params![BUILTIN_INCOMPATIBLE_ID, "待处理", now_ms()],
+        )?;
         Ok(Self { conn })
     }
 

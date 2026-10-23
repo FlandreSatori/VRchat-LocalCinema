@@ -51,8 +51,9 @@ pub struct UrlInput {
 }
 
 pub fn build_media_url(item: &MediaItem, input: &UrlInput) -> Result<String, String> {
-    // 在线流媒体条目：字节由本软件经 HTTP 代理转发，只允许本机回环地址，
-    // 绝不生成局域网链接（避免把「用户自己电脑上的 B 站会话」暴露给同房间其他机器）。
+    // 在线流媒体条目：字节由本软件经 HTTP 代理转发，这里只生成本机回环地址。
+    // 局域网模式下不生成局域网地址，而是由命令层（commands::build_media_url）直接返回
+    // B 站官方 CDN 直链，因此不会走到本函数。
     if item.source_kind == "online" {
         return Ok(format!("http://127.0.0.1:{}/online/{}", input.port, item.id));
     }

@@ -36,6 +36,7 @@ fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, Strin
         &thumb_dir,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         Arc::new(std::sync::atomic::AtomicUsize::new(256)),
+        app_lib::traffic_stats::TrafficStats::open(&dir.join("traffic.sqlite")).unwrap(),
     );
     (server, item, PathBufWrap(dir), id)
 }
@@ -328,6 +329,7 @@ async fn test_duplicate_names_resolve_case_sensitively() {
         &dir.0,
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         Arc::new(std::sync::atomic::AtomicUsize::new(256)),
+        app_lib::traffic_stats::TrafficStats::open(&dir.0.join("traffic.sqlite")).unwrap(),
     );
     server.start("127.0.0.1", 0).await.unwrap();
     let base = format!("http://127.0.0.1:{}", server.status().port);
@@ -382,7 +384,8 @@ fn test_online_media_url_is_localhost_only_and_excluded_from_peers() {
         build_media_url(&item, &input).unwrap(),
         format!("http://127.0.0.1:17001/online/{}", item.id)
     );
-    // 局域网模式：仍然只生成本机链接（绝不暴露给同房间其他机器）
+    // 局域网模式：不在这里生成（由 commands::build_media_url 直接解析 B 站 CDN 直链返回），
+    // 同步构造函数始终只给回环代理链接，避免误把在线视频映射成局域网地址
     let input_lan = UrlInput { mode: UrlMode::Lan, port: 17001, lan_ip: Some("192.168.1.10".into()) };
     let lan_url = build_media_url(&item, &input_lan).unwrap();
     assert!(lan_url.starts_with("http://127.0.0.1:17001/online/"), "{}", lan_url);

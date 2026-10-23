@@ -300,23 +300,33 @@ fn newest_vrchat_log(dir: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// 后台跟踪 VRChat 客户端日志，把关键行同步写入本应用日志。
-/// 每 2 秒轮询一次；检测到 VRChat 新会话（新的 output_log 文件）时从头读取，
-/// 因此软件启动后也能看到本次 VRChat 会话已有的记录。
+/// 每 2 秒轮询一次；只捕获本软件启动之后的日志：
+/// - 会话文件在本软件启动前已存在（VRChat 早已在运行）→ 跳过已有内容，只读新增行；
+/// - 本软件运行期间 VRChat 新开的会话（新 output_log 文件）→ 从头读取（整份都是新日志）。
 pub fn spawn_vrchat_log_tailer() {
     tauri::async_runtime::spawn(async move {
         // 未安装 VRChat（无该目录）时静默空转，不影响其他功能
         let Some(dir) = vrchat_log_dir() else {
             return;
         };
+        let started = std::time::SystemTime::now();
         let mut current: Option<PathBuf> = None;
         let mut offset: u64 = 0;
         let mut pending = String::new();
         loop {
             if let Some(path) = newest_vrchat_log(&dir) {
                 if current.as_deref() != Some(path.as_path()) {
-                    tracing::info!("[VRChat] 开始跟踪客户端日志: {}", path.display());
+                    offset = initial_offset(&path, started);
+                    tracing::info!(
+                        "[VRChat] 开始跟踪客户端日志: {}（{}）",
+                        path.display(),
+                        if offset > 0 {
+                            "跳过软件启动前已有内容"
+                        } else {
+                            "从头读取"
+                        }
+                    );
                     current = Some(path.clone());
-                    offset = 0;
                     pending.clear();
                 }
                 read_new_vrchat_lines(&path, &mut offset, &mut pending);
@@ -324,6 +334,21 @@ pub fn spawn_vrchat_log_tailer() {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     });
+}
+
+/// 新检测到的会话文件的起始读取位置：
+/// 文件创建于本软件启动之前 → 返回当前文件长度（跳过已有内容）；
+/// 创建于本软件启动之后 → 返回 0（从头读取）。取不到创建时间时按启动前处理。
+fn initial_offset(path: &std::path::Path, started: std::time::SystemTime) -> u64 {
+    let created_before_start = std::fs::metadata(path)
+        .and_then(|m| m.created())
+        .map(|created| created < started)
+        .unwrap_or(true);
+    if created_before_start {
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 /// 增量读取日志文件新增内容，按行切分后筛选关键行写入应用日志
@@ -378,6 +403,23 @@ mod tests {
         ));
         assert!(!is_vrc_interesting("2026.10.17 01:48:33 Debug -  [Behaviour] OnPlayerJoined x"));
         assert!(!is_vrc_interesting("   "));
+    }
+
+    #[test]
+    fn initial_offset_skips_preexisting_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output_log_2026-04-04_00-00-00.txt");
+        std::fs::write(&path, "old lines\n").unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        // 文件创建于软件启动之前 → 跳过已有内容，只读新增
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(initial_offset(&path, future), len);
+        // 文件创建于软件启动之后（运行期间新开的会话）→ 从头读取
+        #[cfg(windows)]
+        {
+            let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            assert_eq!(initial_offset(&path, past), 0);
+        }
     }
 
     #[test]

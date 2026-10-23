@@ -1,69 +1,29 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Play, Square, RotateCw, RefreshCw, AlertTriangle, Cloud, Copy, Check, Download, ExternalLink, Loader2 } from 'lucide-vue-next'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { computed, onMounted, ref } from 'vue'
+import { Play, Square, RotateCw, RefreshCw } from 'lucide-vue-next'
 import Card from '../components/ui/Card.vue'
 import Button from '../components/ui/Button.vue'
 import Badge from '../components/ui/Badge.vue'
-import Input from '../components/ui/Input.vue'
-import {
-  startServer,
-  stopServer,
-  restartServer,
-  getRecentLogs,
-  getTunnelStatus,
-  startTunnel,
-  stopTunnel,
-  getComponentsStatus,
-  downloadComponent,
-  openComponentPage,
-  onComponentDownloadProgress,
-  openUrl,
-  type LogEntry,
-  type Settings,
-  type ComponentStatus,
-  type ComponentDownloadProgress,
-  type UnlistenFn,
-} from '../lib/api'
-import { serverStore, mediaStore, largeMediaItems, applyServerStatus, loadSettings, settingsCache, lanListenAvailable, tunnelStore as tunnel, applyTunnelStatus } from '../lib/store'
-import { confirmDialog } from '../lib/confirm'
+import CollapsibleCard from '../components/ui/CollapsibleCard.vue'
+import CloudflareTunnelCard from '../components/CloudflareTunnelCard.vue'
+import FrpCard from '../components/FrpCard.vue'
+import { startServer, stopServer, restartServer, getRecentLogs, type LogEntry } from '../lib/api'
+import { serverStore, applyServerStatus } from '../lib/store'
 import { formatTime } from '../lib/format'
 import { toast, errMsg } from '../lib/toast'
 
 const operating = ref<'' | 'start' | 'stop' | 'restart'>('')
 const logs = ref<LogEntry[]>([])
 const logsLoading = ref(false)
-const settings = ref<Settings | null>(null)
 
-// ===== 公网隧道（Cloudflare 快速隧道） =====
-const tunnelOperating = ref<'' | 'start' | 'stop'>('')
-const tunnelCopied = ref(false)
-const cloudflared = ref<ComponentStatus | null>(null)
-const cfInstalling = ref(false)
-const cfProgress = ref<ComponentDownloadProgress | null>(null)
-let unlistenCf: UnlistenFn | null = null
+/// 「公网隧道」分组默认展开；两条隧道（Cloudflare / frp）以分隔线并列，同时只能运行一个
+const tunnelsOpen = ref(true)
 
 const statusBadge = computed(() => {
   if (serverStore.error && !serverStore.running) return { variant: 'destructive' as const, text: '错误' }
   return serverStore.running
     ? { variant: 'success' as const, text: '运行中' }
     : { variant: 'secondary' as const, text: '已停止' }
-})
-
-const listenModeText = computed(() => {
-  const s = settings.value
-  if (!s) return '-'
-  switch (s.listenMode) {
-    case 'loopback':
-      return '仅本机 (127.0.0.1)'
-    case 'lan':
-      return lanListenAvailable.value ? '局域网 (0.0.0.0)' : '局域网（尚未生效）'
-  }
-})
-
-/// 左下角快捷开关改动监听模式后跟随刷新，避免本页显示滞后
-watch(settingsCache, (s) => {
-  if (s) settings.value = s
 })
 
 async function operate(kind: 'start' | 'stop' | 'restart') {
@@ -106,131 +66,8 @@ function levelVariant(level: string) {
   }
 }
 
-const tunnelBadge = computed(() => {
-  if (tunnel.running) {
-    return { variant: tunnel.ready ? 'success' as const : 'warning' as const, text: tunnel.ready ? '已连接' : '连接中…' }
-  }
-  if (tunnel.error) return { variant: 'destructive' as const, text: '错误' }
-  return { variant: 'secondary' as const, text: '已停止' }
-})
-
-async function loadTunnel() {
-  try {
-    applyTunnelStatus(await getTunnelStatus())
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-async function loadCloudflared() {
-  try {
-    const list = await getComponentsStatus()
-    cloudflared.value = list.find((c) => c.kind === 'cloudflared') ?? null
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-async function operateTunnel(kind: 'start' | 'stop') {
-  if (tunnelOperating.value) return
-  if (kind === 'start') {
-    const count = largeMediaItems.value.length
-    if (count && !(await confirmDialog({
-      title: '启动公网隧道',
-      description: `媒体库中有 ${count} 个 2 GB 以上视频。公网播放受本机上传带宽影响，建议分享前压制为流媒体 MP4。仍要启动隧道吗？`,
-      confirmText: '仍然启动',
-    }))) return
-  }
-  tunnelOperating.value = kind
-  try {
-    applyTunnelStatus(kind === 'start' ? await startTunnel() : await stopTunnel())
-    toast.success(kind === 'start' ? '隧道启动中，稍候生成公网地址' : '隧道已停止')
-  } catch (e) {
-    toast.error(errMsg(e))
-  } finally {
-    tunnelOperating.value = ''
-  }
-}
-
-async function copyTunnelUrl() {
-  try {
-    applyTunnelStatus(await getTunnelStatus())
-    if (!tunnel.ready || !tunnel.url) throw new Error('隧道尚未连接，无法复制公网地址')
-    await writeText(tunnel.url)
-    tunnelCopied.value = true
-    toast.success('已复制公网地址')
-    setTimeout(() => {
-      tunnelCopied.value = false
-    }, 1500)
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-async function openTunnelInBrowser() {
-  if (!tunnel.ready || !tunnel.url) return
-  try {
-    await openUrl(tunnel.url)
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-async function installCloudflared() {
-  if (cfInstalling.value) return
-  cfInstalling.value = true
-  cfProgress.value = null
-  try {
-    cloudflared.value = await downloadComponent('cloudflared')
-    toast.success('cloudflared 已安装')
-  } catch (e) {
-    toast.error(errMsg(e))
-  } finally {
-    cfInstalling.value = false
-    cfProgress.value = null
-  }
-}
-
-async function openCloudflaredPage() {
-  try {
-    await openComponentPage('cloudflared')
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-const cfProgressText = computed(() => {
-  const p = cfProgress.value
-  if (!p) return ''
-  if (!p.total) return `已下载 ${(p.downloaded / 1048576).toFixed(1)} MB`
-  const pct = Math.min(100, Math.round((p.downloaded / p.total) * 100))
-  return `已下载 ${(p.downloaded / 1048576).toFixed(1)} / ${(p.total / 1048576).toFixed(1)} MB（${pct}%）`
-})
-
-onMounted(async () => {
-  try {
-    settings.value = await loadSettings()
-  } catch {
-    settings.value = null
-  }
+onMounted(() => {
   loadLogs()
-  loadTunnel()
-  loadCloudflared()
-  try {
-    const unlisten = await onComponentDownloadProgress((p) => {
-      if (p.kind === 'cloudflared') cfProgress.value = p
-    })
-    if (disposed) unlisten()
-    else unlistenCf = unlisten
-  } catch (e) {
-    if (!disposed) toast.error(errMsg(e))
-  }
-})
-
-let disposed = false
-onUnmounted(() => {
-  disposed = true
-  unlistenCf?.()
 })
 </script>
 
@@ -267,107 +104,11 @@ onUnmounted(() => {
       </div>
     </Card>
 
-    <Card class="space-y-4 p-5">
-      <div class="flex items-center justify-between gap-4">
-        <div class="flex items-center gap-2">
-          <Cloud class="h-4 w-4" />
-          <h2 class="font-medium">公网隧道（Cloudflare）</h2>
-          <Badge :variant="tunnelBadge.variant">{{ tunnelBadge.text }}</Badge>
-        </div>
-        <div class="flex gap-2">
-          <Button
-            v-if="!tunnel.running"
-            :disabled="tunnelOperating !== '' || (cloudflared !== null && !cloudflared.installed)"
-            @click="operateTunnel('start')"
-          >
-            <Play class="h-4 w-4" />
-            {{ tunnelOperating === 'start' ? '启动中…' : '启动隧道' }}
-          </Button>
-          <Button v-else variant="destructive" :disabled="tunnelOperating !== ''" @click="operateTunnel('stop')">
-            <Square class="h-4 w-4" />
-            {{ tunnelOperating === 'stop' ? '停止中…' : '停止隧道' }}
-          </Button>
-        </div>
-      </div>
-
-      <p class="text-xs text-muted-foreground">
-        无需 Cloudflare 账号与自有域名，即可把本机媒体服务暴露为一个临时公网 HTTPS 地址。
-        观看方<strong>无需安装本程序、也无需组网</strong>，直接在 VRChat / 浏览器打开链接即可。
-        注意：快速隧道地址每次启动都会变化，且带宽受本机上传限制。
-        修改 HTTP 端口或停止 HTTP 服务会自动关闭隧道；需要时请重新开启并分享新链接。
-      </p>
-
-      <!-- 缺少 cloudflared：引导下载 -->
-      <div
-        v-if="cloudflared && !cloudflared.installed"
-        class="flex flex-wrap items-center gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400"
-      >
-        <AlertTriangle class="h-4 w-4 shrink-0" />
-        <span class="flex-1">
-          未检测到 cloudflared（缺少 {{ cloudflared.missing.join(', ') }}），需先下载后才能启动隧道。
-        </span>
-        <Button size="sm" :disabled="cfInstalling" @click="installCloudflared">
-          <Download class="h-4 w-4" />
-          {{ cfInstalling ? '下载中…' : '自动下载' }}
-        </Button>
-        <Button variant="outline" size="sm" @click="openCloudflaredPage">
-          <ExternalLink class="h-4 w-4" />
-          手动下载
-        </Button>
-      </div>
-      <p v-if="cfProgressText" class="text-xs text-muted-foreground">{{ cfProgressText }}</p>
-
-      <!-- 运行中：展示公网地址 -->
-      <div v-if="tunnel.running">
-        <template v-if="tunnel.ready && tunnel.url">
-          <div class="flex gap-2">
-            <Input :model-value="tunnel.url" readonly class="flex-1 font-mono text-xs" />
-            <Button variant="outline" size="sm" class="h-9 shrink-0 px-3" @click="openTunnelInBrowser">
-              <ExternalLink class="h-4 w-4" />
-            </Button>
-            <Button size="sm" class="h-9 shrink-0 px-3" @click="copyTunnelUrl">
-              <Check v-if="tunnelCopied" class="h-4 w-4" />
-              <Copy v-else class="h-4 w-4" />
-              {{ tunnelCopied ? '已复制' : '复制' }}
-            </Button>
-          </div>
-          <p class="mt-2 text-xs text-muted-foreground">
-            在媒体库对某个视频「复制链接」时选择「公网隧道」，即可得到可直接分享的完整播放链接。
-          </p>
-        </template>
-        <p v-else class="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 class="h-4 w-4 animate-spin" />
-          正在申请地址或连接 Cloudflare（最长等待 60 秒）…
-        </p>
-      </div>
-      <p v-if="tunnel.error" class="max-h-48 overflow-y-auto whitespace-pre-wrap break-all text-xs text-destructive">{{ tunnel.error }}</p>
-    </Card>
-
-    <Card class="p-5">
-      <div class="flex items-start justify-between gap-4">
-        <div>
-          <h2 class="font-medium">监听模式</h2>
-          <p class="mt-1 text-sm text-muted-foreground">当前模式：{{ listenModeText }}</p>
-          <p
-            v-if="settings?.listenMode === 'lan'"
-            class="mt-2 flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-400"
-          >
-            <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-            局域网模式允许其他设备访问你媒体库中的视频，请确认网络环境可信
-          </p>
-          <p
-            v-if="settings?.listenMode === 'lan' && !lanListenAvailable"
-            class="mt-2 flex items-start gap-1.5 text-sm text-amber-600 dark:text-amber-400"
-          >
-            <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-            服务当前仍只监听本机地址（127.0.0.1）：监听配置刚修改时服务会重启，请稍候；若持续如此请在「设置」页检查「监听模式」与「允许其他人查看我的媒体库」配置。
-          </p>
-        </div>
-        <RouterLink to="/settings">
-          <Button variant="outline" size="sm">修改监听设置</Button>
-        </RouterLink>
-      </div>
-    </Card>
+    <CollapsibleCard v-model:open="tunnelsOpen" title="公网隧道（二选一）">
+      <CloudflareTunnelCard />
+      <div class="border-t border-border" />
+      <FrpCard />
+    </CollapsibleCard>
 
     <Card class="p-5">
       <div class="flex items-center justify-between">

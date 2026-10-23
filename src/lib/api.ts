@@ -7,6 +7,29 @@ export type ListenMode = 'loopback' | 'lan'
 export type UrlMode = 'localhost' | 'lan'
 export type CloseBehavior = 'exit' | 'tray' | 'ask'
 export type MediaStatus = 'ok' | 'processing' | 'missing'
+
+export type TrafficRange = '1h' | '24h' | 'all'
+export interface TrafficPoint {
+  timestamp: number
+  durationMs: number
+  uploadBytes: number
+  downloadBytes: number
+  sessionId: string
+}
+export interface TrafficStats {
+  points: TrafficPoint[]
+  totalUploadBytes: number
+  totalDownloadBytes: number
+  activeDurationMs: number
+  startedAt: number
+  uploadBaselineMbps: number
+}
+export function getTrafficStats(range: TrafficRange): Promise<TrafficStats> {
+  return invoke('get_traffic_stats', { range })
+}
+export function getUploadBaseline(): Promise<number> {
+  return invoke('get_upload_baseline')
+}
 export type CompatStatus = 'supported' | 'unsupported'
 
 export interface EasytierConfig {
@@ -30,6 +53,16 @@ export interface EasytierConfig {
   listenPort: number
 }
 
+/** frp 公网隧道配置（SakuraFrp 等服务，本程序只负责启停 frpc） */
+export interface FrpConfig {
+  /** 启动参数：访问密钥:隧道ID（多条隧道用半角逗号分隔） */
+  launchParams: string
+  /** 应用启动时自动拉起 frpc */
+  autoStart: boolean
+  /** frpc 异常退出后自动重连 */
+  autoRestart: boolean
+}
+
 export interface Settings {
   listenMode: ListenMode
   port: number
@@ -51,6 +84,8 @@ export interface Settings {
   easytierCliPath: string
   /** cloudflared 路径（Cloudflare 快速隧道），空表示自动检测 */
   cloudflaredPath: string
+  /** frpc 路径（frp 公网隧道），空表示自动检测 */
+  frpcPath: string
   downloadDir: string
   /** 媒体流读缓冲（KB），默认 256，不推荐修改 */
   streamBufferKb: number
@@ -61,6 +96,7 @@ export interface Settings {
   /** 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数） */
   streaming1080pBitrateMbps: number
   easytier: EasytierConfig
+  frp: FrpConfig
 }
 
 export interface MediaItem {
@@ -127,6 +163,20 @@ export interface TunnelStatus {
   revision: number
 }
 
+/** frp 公网隧道状态 */
+export interface FrpStatus {
+  running: boolean
+  /** 启动参数中的隧道都已建立 */
+  ready: boolean
+  tunnelCount: number
+  /** 隧道回源的 HTTP 端口 */
+  port: number | null
+  error: string | null
+  /** 当前启动参数 */
+  params: string
+  revision: number
+}
+
 export interface NetInterface {
   name: string
   ips: string[]
@@ -156,7 +206,7 @@ export interface AppPaths {
   portable: boolean
 }
 
-export type ComponentKindId = 'ffmpeg' | 'easytier' | 'cloudflared'
+export type ComponentKindId = 'ffmpeg' | 'easytier' | 'cloudflared' | 'frp'
 
 export interface ComponentStatus {
   kind: ComponentKindId
@@ -689,6 +739,24 @@ export function buildTunnelUrl(id: string): Promise<string> {
 }
 export function onTunnelStatusChanged(callback: (status: TunnelStatus) => void): Promise<UnlistenFn> {
   return listen<TunnelStatus>('tunnel-status-changed', (e) => callback(e.payload))
+}
+
+// frp 公网隧道（SakuraFrp 等服务，本程序只负责启停 frpc）
+export function getFrpStatus(): Promise<FrpStatus> {
+  return invoke('get_frp_status')
+}
+export function startFrp(): Promise<FrpStatus> {
+  return invoke('start_frp')
+}
+export function stopFrp(): Promise<FrpStatus> {
+  return invoke('stop_frp')
+}
+/** frpc 运行输出（最近一块），用于排查隧道不连通的原因 */
+export function readFrpOutput(): Promise<string> {
+  return invoke('read_frp_output')
+}
+export function onFrpStatusChanged(callback: (status: FrpStatus) => void): Promise<UnlistenFn> {
+  return listen<FrpStatus>('frp-status-changed', (e) => callback(e.payload))
 }
 
 // EasyTier 组网

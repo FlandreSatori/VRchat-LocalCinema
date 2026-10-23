@@ -17,11 +17,15 @@ pub const FFMPEG_MANUAL_URL: &str = "https://ffmpeg.org/download.html";
 pub const EASYTIER_MANUAL_URL: &str = "https://github.com/EasyTier/EasyTier/releases/";
 /// cloudflared 发布页（手动下载入口）
 pub const CLOUDFLARED_MANUAL_URL: &str = "https://github.com/cloudflare/cloudflared/releases/";
+/// SakuraFrp 软件下载页（frpc 手动下载入口）
+pub const FRP_MANUAL_URL: &str = "https://www.natfrp.com/tunnel/download";
 
 const FFMPEG_RELEASE_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";
 const EASYTIER_RELEASE_API: &str = "https://api.github.com/repos/EasyTier/EasyTier/releases/latest";
 const CLOUDFLARED_RELEASE_API: &str =
     "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
+/// SakuraFrp 官方客户端镜像的 frpc 目录（Apache 目录索引，可直接解析出版本子目录）
+const FRP_DOWNLOAD_BASE: &str = "https://nya.globalslb.net/natfrp/client/frpc/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -29,6 +33,8 @@ pub enum ComponentKind {
     Ffmpeg,
     Easytier,
     Cloudflared,
+    /// frp 客户端（frpc）：由 SakuraFrp 分发，自动下载时解析其官方镜像目录索引
+    Frp,
 }
 
 impl ComponentKind {
@@ -37,6 +43,7 @@ impl ComponentKind {
             "ffmpeg" => Ok(Self::Ffmpeg),
             "easytier" => Ok(Self::Easytier),
             "cloudflared" => Ok(Self::Cloudflared),
+            "frp" => Ok(Self::Frp),
             other => Err(AppError::Msg(format!("未知组件: {}", other))),
         }
     }
@@ -46,6 +53,7 @@ impl ComponentKind {
             Self::Ffmpeg => "ffmpeg",
             Self::Easytier => "easytier",
             Self::Cloudflared => "cloudflared",
+            Self::Frp => "frp",
         }
     }
 
@@ -54,6 +62,7 @@ impl ComponentKind {
             Self::Ffmpeg => "FFmpeg",
             Self::Easytier => "EasyTier",
             Self::Cloudflared => "cloudflared",
+            Self::Frp => "frpc",
         }
     }
 
@@ -62,6 +71,7 @@ impl ComponentKind {
             Self::Ffmpeg => FFMPEG_MANUAL_URL,
             Self::Easytier => EASYTIER_MANUAL_URL,
             Self::Cloudflared => CLOUDFLARED_MANUAL_URL,
+            Self::Frp => FRP_MANUAL_URL,
         }
     }
 
@@ -71,6 +81,7 @@ impl ComponentKind {
             Self::Ffmpeg => "ffmpeg",
             Self::Easytier => "easytier",
             Self::Cloudflared => "cloudflared",
+            Self::Frp => "frp",
         }
     }
 
@@ -80,6 +91,7 @@ impl ComponentKind {
             Self::Ffmpeg => &["ffmpeg", "ffprobe"],
             Self::Easytier => &["easytier-core", "easytier-cli"],
             Self::Cloudflared => &["cloudflared"],
+            Self::Frp => &["frpc"],
         }
     }
 }
@@ -237,6 +249,11 @@ pub fn cloudflared_binary(
     )
 }
 
+/// frpc（frp 公网隧道客户端）路径解析
+pub fn frpc_binary(settings: &Settings, paths: &AppPaths) -> (Option<PathBuf>, ComponentSource) {
+    resolve_binary(ComponentKind::Frp, "frpc", &settings.frpc_path, paths)
+}
+
 /// 组件整体状态，供前端展示
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,6 +301,7 @@ fn primary_version_args(kind: ComponentKind) -> &'static [&'static str] {
         ComponentKind::Ffmpeg => &["-version"],
         ComponentKind::Easytier => &["--version"],
         ComponentKind::Cloudflared => &["--version"],
+        ComponentKind::Frp => &["-v"],
     }
 }
 
@@ -297,6 +315,7 @@ pub fn status(kind: ComponentKind, settings: &Settings, paths: &AppPaths) -> Com
             (ComponentKind::Easytier, "easytier-core") => settings.easytier_core_path.as_str(),
             (ComponentKind::Easytier, "easytier-cli") => settings.easytier_cli_path.as_str(),
             (ComponentKind::Cloudflared, "cloudflared") => settings.cloudflared_path.as_str(),
+            (ComponentKind::Frp, "frpc") => settings.frpc_path.as_str(),
             _ => "",
         };
         let (path, source) = resolve_binary(kind, base, configured, paths);
@@ -358,6 +377,10 @@ fn arch_tag(kind: ComponentKind) -> &'static str {
         (ComponentKind::Cloudflared, "aarch64") => "arm64",
         (ComponentKind::Cloudflared, "x86") => "386",
         (ComponentKind::Cloudflared, _) => "amd64",
+        // frpc 走 SakuraFrp 目录索引（见 latest_frp_asset），不使用 GitHub 资产命名
+        (ComponentKind::Frp, "aarch64") => "arm64",
+        (ComponentKind::Frp, "x86") => "386",
+        (ComponentKind::Frp, _) => "amd64",
     }
 }
 
@@ -407,6 +430,8 @@ fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String, 
                 }
                 20
             }
+            // frpc 不走 GitHub 资产（见 latest_frp_asset）
+            ComponentKind::Frp => continue,
         };
         if best.as_ref().map(|(s, _, _, _)| score > *s).unwrap_or(true) {
             best = Some((score, name.to_string(), url.to_string(), size));
@@ -415,12 +440,110 @@ fn pick_asset(kind: ComponentKind, assets: &[Value]) -> Option<(String, String, 
     best.map(|(_, n, u, sz)| (n, u, sz))
 }
 
-fn release_api(kind: ComponentKind) -> &'static str {
+/// 该组件对应的 GitHub 发布接口；返回 None 表示不走 GitHub 发布源
+fn release_api(kind: ComponentKind) -> Option<&'static str> {
     match kind {
-        ComponentKind::Ffmpeg => FFMPEG_RELEASE_API,
-        ComponentKind::Easytier => EASYTIER_RELEASE_API,
-        ComponentKind::Cloudflared => CLOUDFLARED_RELEASE_API,
+        ComponentKind::Ffmpeg => Some(FFMPEG_RELEASE_API),
+        ComponentKind::Easytier => Some(EASYTIER_RELEASE_API),
+        ComponentKind::Cloudflared => Some(CLOUDFLARED_RELEASE_API),
+        // frpc 由 SakuraFrp 自己分发，改走官方镜像的目录索引（见 latest_frp_asset）
+        ComponentKind::Frp => None,
     }
+}
+
+/// frpc 的文件名（SakuraFrp 命名：frpc_windows_amd64.exe / _arm64.exe / _386.exe）
+fn frp_asset_name() -> String {
+    format!("frpc_windows_{}.exe", arch_tag(ComponentKind::Frp))
+}
+
+/// 提取 HTML 中所有 `href="..."` 的属性值（SakuraFrp 镜像为 Apache 目录索引，无需完整 HTML 解析）
+fn extract_hrefs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(rel) = html[idx..].find("href=\"") {
+        let start = idx + rel + "href=\"".len();
+        let Some(end_rel) = html[start..].find('"') else {
+            break;
+        };
+        let end = start + end_rel;
+        out.push(html[start..end].to_string());
+        idx = end + 1;
+    }
+    out
+}
+
+/// 把版本号拆成数字序列用于比较：`0.51.0-sakura-15` → [0, 51, 0, 15]
+/// （直接按字符串字典序会误判 `sakura-9` 比 `sakura-15` 新）
+fn version_key(v: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in v.chars() {
+        if ch.is_ascii_digit() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(cur.parse().unwrap_or(0));
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur.parse().unwrap_or(0));
+    }
+    out
+}
+
+/// 解析 SakuraFrp 镜像目录索引，得到所有版本子目录与对应的 frpc 直链
+fn parse_frp_versions(html: &str) -> Vec<(String, String)> {
+    let asset = frp_asset_name();
+    let mut out = Vec::new();
+    for href in extract_hrefs(html) {
+        let Some(name) = href.strip_suffix('/') else {
+            continue;
+        };
+        // 版本目录形如 `0.51.0-sakura-15`：必须数字开头；据此跳过父目录与排序链接
+        if name.is_empty()
+            || name.contains('/')
+            || !name.starts_with(|c: char| c.is_ascii_digit())
+        {
+            continue;
+        }
+        out.push((name.to_string(), format!("{}{}/{}", FRP_DOWNLOAD_BASE, name, asset)));
+    }
+    out
+}
+
+/// 查询 SakuraFrp 官方镜像，自动获取最新 frpc 的下载直链
+async fn latest_frp_asset() -> AppResult<ReleaseAsset> {
+    let client = http_client()?;
+    let resp = client
+        .get(FRP_DOWNLOAD_BASE)
+        .send()
+        .await
+        .map_err(|e| AppError::Msg(format!("查询 frpc 最新版本失败: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(AppError::Msg(format!(
+            "查询 frpc 最新版本失败（HTTP {}），可尝试手动下载",
+            resp.status().as_u16()
+        )));
+    }
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| AppError::Msg(format!("读取 frpc 版本列表失败: {}", e)))?;
+    let mut versions = parse_frp_versions(&html);
+    if versions.is_empty() {
+        return Err(AppError::Msg(
+            "未能从 SakuraFrp 下载站解析出 frpc 版本，可尝试手动下载后放入内置组件目录".to_string(),
+        ));
+    }
+    versions.sort_by(|a, b| version_key(&a.0).cmp(&version_key(&b.0)));
+    let (version, url) = versions.pop().expect("版本列表非空");
+    Ok(ReleaseAsset {
+        version,
+        name: frp_asset_name(),
+        url,
+        // 目录索引只提供约数大小（如 13.6 MiB），不做逐字节校验
+        size: None,
+    })
 }
 
 fn http_client() -> AppResult<reqwest::Client> {
@@ -433,9 +556,19 @@ fn http_client() -> AppResult<reqwest::Client> {
 
 /// 查询官方发布页的最新版本并解析出 Windows 直链
 pub async fn latest_release_asset(kind: ComponentKind) -> AppResult<ReleaseAsset> {
+    // frpc 由 SakuraFrp 分发：解析官方镜像的目录索引得到最新版直链
+    if kind == ComponentKind::Frp {
+        return latest_frp_asset().await;
+    }
+    let api = release_api(kind).ok_or_else(|| {
+        AppError::Msg(format!(
+            "{} 需从官方下载页手动下载后放入内置组件目录（本程序不提供自动下载）",
+            kind.label()
+        ))
+    })?;
     let client = http_client()?;
     let resp = client
-        .get(release_api(kind))
+        .get(api)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -612,4 +745,40 @@ fn extract_binaries(zip_path: &Path, dest_dir: &Path) -> AppResult<usize> {
         return Err(AppError::Msg("压缩包中未找到可执行文件".to_string()));
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_INDEX: &str = r#"<tbody>
+<tr><td colspan="2" class="link"><a href="../">Parent directory/</a></td></tr>
+<tr><td colspan="2" class="link"><a href="0.51.0-sakura-15/" title="0.51.0-sakura-15">0.51.0-sakura-15/</a></td></tr>
+<tr><td colspan="2" class="link"><a href="0.51.0-sakura-9/" title="0.51.0-sakura-9">0.51.0-sakura-9/</a></td></tr>
+</tbody>"#;
+
+    #[test]
+    fn parses_frp_versions_from_directory_index() {
+        let got = parse_frp_versions(SAMPLE_INDEX);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "0.51.0-sakura-15");
+        assert!(got[0]
+            .1
+            .starts_with("https://nya.globalslb.net/natfrp/client/frpc/0.51.0-sakura-15/frpc_windows_"));
+        assert!(got[0].1.ends_with(".exe"));
+    }
+
+    #[test]
+    fn version_key_orders_numerically_not_lexically() {
+        // 字典序会把 "9" 排在 "15" 之后，必须按数字比较
+        assert!(version_key("0.51.0-sakura-15") > version_key("0.51.0-sakura-9"));
+        assert!(version_key("0.52.0-sakura-1") > version_key("0.51.0-sakura-99"));
+        assert!(version_key("0.51.0-sakura-15.1") > version_key("0.51.0-sakura-15"));
+    }
+
+    #[test]
+    fn ignores_non_version_links() {
+        let html = r#"<a href="?C=N&amp;O=A">sort</a><a href="/abs/path/">abs</a><a href="notes/">notes</a>"#;
+        assert!(parse_frp_versions(html).is_empty());
+    }
 }

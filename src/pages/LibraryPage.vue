@@ -768,7 +768,12 @@ onUnmounted(() => {
     <!-- 内容区：返回上一级 / 文件夹 / 视频 同级网格展示（近似正方形卡片） -->
     <div
       v-else
-      class="mt-4 grid grid-cols-[repeat(auto-fill,minmax(170px,1fr))] gap-3"
+      :class="[
+        'mt-4 grid gap-3',
+        currentFolderId === BUILTIN_INCOMPATIBLE_ID
+          ? 'grid-cols-[repeat(auto-fill,minmax(300px,1fr))]'
+          : 'grid-cols-[repeat(auto-fill,minmax(170px,1fr))]',
+      ]"
     >
       <!-- 返回上一级（根目录不显示） -->
       <button
@@ -804,6 +809,7 @@ onUnmounted(() => {
         v-for="item in filtered"
         :key="item.id"
         :item="item"
+        :detailed="currentFolderId === BUILTIN_INCOMPATIBLE_ID"
         :selectable="selectMode"
         :selected="selectedIds.has(item.id)"
         @copy-link="openUrlDialog"

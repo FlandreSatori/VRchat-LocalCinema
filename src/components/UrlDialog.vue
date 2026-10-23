@@ -15,7 +15,8 @@ import {
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
-import { loadSettings, convertTaskStore, tunnelStore, transcodeStreamingItem, lanListenAvailable, lanUnavailableReason } from '../lib/store'
+import { loadSettings, convertTaskStore, tunnelStore, lanListenAvailable, lanUnavailableReason } from '../lib/store'
+import { maybeRemindAfterCopy } from '../lib/copyReminder'
 import { toast, errMsg } from '../lib/toast'
 import { cn } from '../lib/utils'
 
@@ -31,7 +32,7 @@ const emit = defineEmits<{
 }>()
 
 interface SegmentEntry {
-  id: string
+  item: MediaItem
   label: string
   url: string
 }
@@ -43,7 +44,6 @@ const urlError = ref('')
 const segments = ref<SegmentEntry[]>([])
 const segmentHint = ref('')
 const copiedId = ref('')
-const shareWarningOpen = ref(false)
 /// 每次重建自增；开关弹窗、切换媒体/模式/格式时旧请求失效，迟到结果被丢弃
 let rebuildGeneration = 0
 
@@ -101,7 +101,7 @@ const segmentTask = computed(() =>
 
 const sourceId = computed(() => props.item?.sourceMediaId ?? props.item?.id ?? null)
 
-/// 在线（B 站）条目：只提供本机播放链接，且没有分段概念
+/// 在线（B 站）条目：本地模式用本机代理链接，局域网模式用 B 站 CDN 直链；没有分段概念
 const isOnline = computed(() => props.item?.sourceKind === 'online')
 
 watch(
@@ -116,13 +116,6 @@ watch(
     segmentHint.value = ''
     if (!isOpen || !props.item) return
     format.value = props.initialFormat ?? 'whole'
-    // 在线视频只有本机链接、没有分段：直接按本机模式生成
-    if (isOnline.value) {
-      mode.value = 'localhost'
-      format.value = 'whole'
-      await rebuild()
-      return
-    }
     try {
       const settings = await loadSettings()
       if (ticket !== rebuildGeneration) return
@@ -130,6 +123,13 @@ watch(
     } catch {
       if (ticket !== rebuildGeneration) return
       mode.value = 'localhost'
+    }
+    // 在线视频没有分段：按当前默认地址模式生成。
+    // 局域网模式下后端直接返回 B 站官方 CDN 直链（不依赖本机 HTTP 服务），故不做局域网可用性回落。
+    if (isOnline.value) {
+      format.value = 'whole'
+      await rebuild()
+      return
     }
     // 仅本机监听时局域网链接不可用，回落到本机模式
     if (mode.value === 'lan' && !lanAvailable.value) mode.value = 'localhost'
@@ -167,7 +167,7 @@ async function rebuild() {
       // 并发获取各段链接；完毕后若已被更新请求取代则整体丢弃
       const entries: SegmentEntry[] = await Promise.all(
         list.map(async (seg, i) => ({
-          id: seg.id,
+          item: seg,
           label: `第 ${i + 1} 段`,
           url: useTunnel ? await buildTunnelUrl(seg.id) : await buildMediaUrl(seg.id, lanMode),
         }))
@@ -189,36 +189,18 @@ async function rebuild() {
   }
 }
 
-async function queueShareCompression() {
-  const item = props.item
-  if (!item) return
-  try {
-    await transcodeStreamingItem(item)
-    shareWarningOpen.value = false
-    toast.info('已加入压制队列；继续复制原视频链接')
-    await copyNow(true)
-  } catch (e) {
-    toast.error(errMsg(e))
-  }
-}
-
-async function copyNow(skipShareWarning = false) {
+async function copyNow() {
   if (!url.value) return
-  const isLargeShared = (props.item?.fileSize ?? 0) >= 2 * 1024 * 1024 * 1024 && mode.value !== 'localhost'
-  if (isLargeShared && !skipShareWarning) {
-    shareWarningOpen.value = true
-    return
-  }
   try {
     const value = mode.value === 'tunnel' && props.item
       ? await buildTunnelUrl(props.item.id) : url.value
     await writeText(value)
     copiedId.value = 'main'
     toast.success('已复制播放链接')
-    // 复制后自动关闭弹窗返回主界面
-    setTimeout(() => {
-      emit('update:open', false)
-    }, 500)
+    const reminderItem = props.item
+    const reminderMode = mode.value === 'tunnel' ? 'tunnel' : mode.value
+    emit('update:open', false)
+    if (reminderItem) setTimeout(() => void maybeRemindAfterCopy(reminderItem, reminderMode), 0)
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -228,21 +210,16 @@ async function copy() {
   await copyNow()
 }
 
-async function copyOriginal() {
-  shareWarningOpen.value = false
-  await copyNow(true)
-}
-
 async function copySegment(seg: SegmentEntry) {
   try {
-    const value = mode.value === 'tunnel' ? await buildTunnelUrl(seg.id) : seg.url
+    const value = mode.value === 'tunnel' ? await buildTunnelUrl(seg.item.id) : seg.url
     await writeText(value)
-    copiedId.value = seg.id
+    copiedId.value = seg.item.id
     toast.success(`已复制${seg.label}链接`)
-    // 复制后自动关闭弹窗返回主界面
-    setTimeout(() => {
-      emit('update:open', false)
-    }, 500)
+    const reminderItem = props.item ?? seg.item
+    const reminderMode = mode.value === 'tunnel' ? 'tunnel' : mode.value
+    emit('update:open', false)
+    setTimeout(() => void maybeRemindAfterCopy(reminderItem, reminderMode, seg.item), 0)
   } catch (e) {
     toast.error(errMsg(e))
   }
@@ -262,21 +239,14 @@ async function openInBrowser() {
 
 <template>
   <Dialog :open="open" @update:open="emit('update:open', $event)" title="复制播放链接" :description="item?.title">
-    <Dialog
-      :open="shareWarningOpen"
-      title="分享大文件链接"
-      description="该视频超过 2 GB。局域网/公网播放受本机上传带宽影响，建议先压制为流媒体 MP4。"
-      @update:open="shareWarningOpen = $event"
-    >
-      <div class="flex flex-wrap justify-end gap-2">
-        <Button variant="outline" @click="copyOriginal">仍复制原片链接</Button>
-        <Button @click="queueShareCompression">压制并继续复制</Button>
-      </div>
-    </Dialog>
     <div class="space-y-4">
       <div v-if="isOnline" class="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-        在线视频由本软件在你的电脑上转发 B 站官方 CDN 流，因此只生成 127.0.0.1 本机链接（不提供局域网链接）。
-        免登录画质上限 720P；如需 1080P 及以上，请用 JJdown（唧唧）下载后通过「导入视频」导入为本地视频。
+        <template v-if="mode === 'lan'">
+          直链，约 2 小时后过期。
+        </template>
+        <template v-else>
+          本地解析，画质上限 720P；如需 1080P+ 请用 JJdown 下载后导入。
+        </template>
       </div>
 
       <div v-if="!isOnline">
@@ -350,16 +320,16 @@ async function openInBrowser() {
             <Loader2 v-if="segmentTask?.state === 'running'" class="h-3.5 w-3.5 animate-spin" />
             {{ segmentHint }}
           </div>
-          <div v-for="seg in segments" :key="seg.id">
+          <div v-for="seg in segments" :key="seg.item.id">
             <div class="mb-1 flex items-center gap-2">
               <Badge variant="secondary">{{ seg.label }}</Badge>
             </div>
             <div class="flex gap-2">
               <Input :model-value="seg.url" readonly class="flex-1 font-mono text-xs" />
               <Button size="sm" class="h-9 shrink-0 px-3" @click="copySegment(seg)">
-                <Check v-if="copiedId === seg.id" class="h-4 w-4" />
+                <Check v-if="copiedId === seg.item.id" class="h-4 w-4" />
                 <Copy v-else class="h-4 w-4" />
-                {{ copiedId === seg.id ? '已复制' : '复制' }}
+                {{ copiedId === seg.item.id ? '已复制' : '复制' }}
               </Button>
             </div>
           </div>

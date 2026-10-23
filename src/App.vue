@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, MessageSquare, TriangleAlert, Globe, Monitor, Minimize2, Power } from 'lucide-vue-next'
+import { Film, Server, Network, Settings, Info, FilePlus, Minus, Square, Copy, X, ListVideo, TriangleAlert, Globe, Monitor, Minimize2, Power, BarChart3 } from 'lucide-vue-next'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
@@ -15,10 +15,11 @@ import Button from './components/ui/Button.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import Switch from './components/ui/Switch.vue'
 import { APP_BRAND, APP_VERSION } from './lib/appinfo'
-import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, transcodeStreamingItem, loadSettings, settingsCache } from './lib/store'
+import { initStore, serverStore, mediaStore, importMediaPaths, faststartHintState, incompatibleImportState, transcodeStreamingItem, loadSettings, settingsCache } from './lib/store'
 import { formatSize } from './lib/format'
 import { toast, errMsg } from './lib/toast'
 import { isFirstLaunch, markDisclaimerAccepted, isRunningInTempDir, quitApp, hideToTray, onCloseRequested, saveSettings, type CloseBehavior, type MediaItem, type ListenMode } from './lib/api'
+import { copyReminder, compressFromReminder } from './lib/copyReminder'
 
 const router = useRouter()
 const appWindow = isTauri() ? getCurrentWindow() : null
@@ -28,9 +29,9 @@ const navItems = [
   { to: '/library', label: '媒体库', icon: Film },
   { to: '/convert', label: '任务', icon: ListVideo },
   { to: '/server', label: 'HTTP 服务', icon: Server },
-  { to: '/easytier', label: 'EasyTier 组网', icon: Network },
+  { to: '/statistics', label: '流量统计', icon: BarChart3 },
+  { to: '/easytier', label: '虚拟局域网', icon: Network },
   { to: '/settings', label: '设置', icon: Settings },
-  { to: '/feedback', label: '反馈', icon: MessageSquare },
   { to: '/about', label: '关于', icon: Info },
 ]
 
@@ -254,9 +255,15 @@ async function compressLargeItem(item: MediaItem) {
   }
 }
 
+const incompatibleDialogOpen = ref(false)
+
 watch(() => faststartHintState.batch, () => {
   if (faststartHintState.batch === 0 || !faststartHintState.largeItems.length) return
   faststartHintState.dialogOpen = true
+})
+
+watch(() => incompatibleImportState.batch, () => {
+  if (incompatibleImportState.batch > 0 && incompatibleImportState.items.length) incompatibleDialogOpen.value = true
 })
 
 function onImportDialogUpdate(open: boolean) {
@@ -465,6 +472,16 @@ onUnmounted(() => {
     <Toaster />
     <ConfirmHost />
 
+    <Dialog :open="copyReminder.open" title="建议压制后分享" :description="copyReminder.item?.title" @update:open="copyReminder.open = $event">
+      <div class="space-y-4">
+        <p class="text-sm leading-relaxed">该视频平均总码率 <strong>{{ copyReminder.bitrate.toFixed(2) }} Mbps</strong>，高于历史最大上传速率的 70% 阈值。历史最大上传速率 {{ copyReminder.baseline.toFixed(2) }} Mbps，提醒阈值 {{ copyReminder.threshold.toFixed(2) }} Mbps。</p>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="copyReminder.open = false">稍后</Button>
+          <Button :disabled="copyReminder.busy" @click="compressFromReminder">{{ copyReminder.busy ? '正在加入…' : '一键压制' }}</Button>
+        </div>
+      </div>
+    </Dialog>
+
     <!-- 运行在系统临时目录（如直接在压缩包内运行）时的强制警告：确认后退出 -->
     <Dialog
       :open="tempDirWarning"
@@ -539,6 +556,31 @@ onUnmounted(() => {
         </div>
         <div class="flex justify-end gap-2">
           <Button variant="outline" @click="onImportDialogUpdate(false)">稍后处理</Button>
+        </div>
+      </div>
+    </Dialog>
+
+    <Dialog
+      :open="incompatibleDialogOpen"
+      title="视频已加入「待处理」"
+      :description="`检测到 ${incompatibleImportState.items.length} 个视频需要处理后才能在 VRChat 中播放`"
+      @update:open="incompatibleDialogOpen = $event"
+    >
+      <div class="space-y-4 text-sm">
+        <div class="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-3 leading-relaxed">
+          <p class="font-medium">请重点处理这些情况</p>
+          <p class="mt-1 text-muted-foreground">多音轨：在「转码为…」中选择要保留的音轨；含字幕：选择字幕轨并使用「烧录」，字幕才会显示在 VRChat 里；视频流或音频流不支持：分别选择「仅转视频」或「仅转音频」。</p>
+        </div>
+        <div class="max-h-64 space-y-2 overflow-y-auto rounded-md border border-border p-3">
+          <div v-for="item in incompatibleImportState.items" :key="item.id" class="space-y-1 border-b border-border/60 pb-2 last:border-0 last:pb-0">
+            <div class="font-medium">{{ item.title }}</div>
+            <div class="text-xs text-destructive">{{ item.compatReason ?? '不支持该视频格式或编码组合' }}</div>
+            <div class="text-xs text-muted-foreground">推荐：多音轨选音轨保留；含字幕选字幕轨烧录；视频流不支持选仅转视频；音频流不支持选仅转音频。也可选择完整转码。</div>
+          </div>
+        </div>
+        <p class="text-xs text-muted-foreground">打开「待处理」文件夹后，可在每张卡片上查看详细错误信息并点击「转码为…」选择方案。</p>
+        <div class="flex justify-end">
+          <Button variant="outline" @click="incompatibleDialogOpen = false">知道了</Button>
         </div>
       </div>
     </Dialog>

@@ -5,6 +5,8 @@ import {
   getSettings,
   getTunnelStatus,
   onTunnelStatusChanged,
+  getFrpStatus,
+  onFrpStatusChanged,
   listMedia,
   importFiles,
   transcodeStreamingCopy,
@@ -19,6 +21,7 @@ import {
   type ServerStatus,
   type Settings,
   type TunnelStatus,
+  type FrpStatus,
   type ConvertTask,
 } from './api'
 
@@ -33,6 +36,8 @@ export const mediaStore = reactive<{ items: MediaItem[]; loaded: boolean }>({
   items: [],
   loaded: false,
 })
+
+export const incompatibleImportState = reactive({ items: [] as MediaItem[], batch: 0 })
 
 /// 大文件阈值（≥2GB）
 export const LARGE_FILE_BYTES = 2_147_483_648
@@ -75,6 +80,21 @@ export const tunnelStore = reactive<TunnelStatus>({
 
 export function applyTunnelStatus(status: TunnelStatus) {
   if (status.revision >= tunnelStore.revision) Object.assign(tunnelStore, status)
+}
+
+/// frp 公网隧道状态（与 Cloudflare 隧道并列展示在「公网隧道」分组）
+export const frpStore = reactive<FrpStatus>({
+  running: false,
+  ready: false,
+  tunnelCount: 0,
+  port: null,
+  error: null,
+  params: '',
+  revision: 0,
+})
+
+export function applyFrpStatus(status: FrpStatus) {
+  if (status.revision >= frpStore.revision) Object.assign(frpStore, status)
 }
 
 /// 转码 / 分段 / HLS 任务状态：id -> { kind, percent, status }
@@ -169,6 +189,8 @@ export async function importMediaPaths(paths: string[]): Promise<MediaItem[]> {
   if (result.items.length > 0) {
     faststartHintState.largeItems = result.items.filter(isLargeMedia)
     faststartHintState.batch++
+    incompatibleImportState.items = result.items.filter(item => item.compatStatus === 'unsupported')
+    incompatibleImportState.batch++
   }
   return result.items
 }
@@ -204,11 +226,19 @@ export async function initStore() {
   } finally {
     mediaStore.loaded = true
   }
-  onMediaUpdated(upsertMedia)
+  onMediaUpdated((item) => {
+    upsertMedia(item)
+    if (item.compatStatus === 'unsupported') {
+      incompatibleImportState.items = [...incompatibleImportState.items.filter(existing => existing.id !== item.id), item]
+      incompatibleImportState.batch++
+    }
+  })
   onServerStatusChanged(applyServerStatus)
   // 先订阅再拉取快照；revision 保证迟到的快照不会覆盖较新的事件。
   await onTunnelStatusChanged(applyTunnelStatus)
   getTunnelStatus().then(applyTunnelStatus).catch(() => {})
+  await onFrpStatusChanged(applyFrpStatus)
+  getFrpStatus().then(applyFrpStatus).catch(() => {})
   listConvertTasks()
     .then(applyConvertTasks)
     .catch(() => {})

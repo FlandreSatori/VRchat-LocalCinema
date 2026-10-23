@@ -340,7 +340,7 @@ onUnmounted(() => {
 <template>
   <div class="mx-auto max-w-4xl space-y-4 p-6 pb-12">
     <div class="flex items-center justify-between">
-      <h1 class="text-xl font-semibold">EasyTier 组网</h1>
+      <h1 class="text-xl font-semibold">虚拟局域网</h1>
       <Button :disabled="loading || saving" @click="save">
         <Save class="h-4 w-4" />
         {{ saving ? '保存中…' : '保存配置' }}

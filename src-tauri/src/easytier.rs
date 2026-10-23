@@ -381,6 +381,135 @@ pub(crate) fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// 提权子进程写回失败原因的结果文件（UTF-8）。
+/// 由提权后的脚本写入，外层脚本读取后以十六进制回传，避免 PowerShell 以本地
+/// 代码页（GBK）写 stdout、Rust 再按 UTF-8 解码导致中文乱码。
+pub(crate) fn elevation_result_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("elevate-result.txt")
+}
+
+/// 以管理员权限运行 PowerShell 子进程的包装脚本。
+///
+/// 输出协议为**纯 ASCII**（`ERR|KIND|HEX` 中 HEX 是 UTF-8 字节的十六进制），
+/// 因此不受控制台代码页影响：
+/// - `OK`
+/// - `ERR|ELEVATE|<hex>`：提权启动失败（UAC 被取消/拒绝等）
+/// - `ERR|EXIT|<code>[|<hex>]`：子进程非零退出，hex 为结果文件中的原因
+/// - `ERR|MSG|<hex>`：子进程退出码为 0，但结果文件给出了失败原因
+pub(crate) fn elevation_wrapper(child_args: &[String], result_file: &Path) -> String {
+    let template = r#"$ErrorActionPreference = 'Stop'
+$resultFile = '@@RESULT@@'
+try {
+  Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath 'powershell' -ArgumentList @(@@ARGS@@) -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+  $code = 0
+  if ($null -ne $p) { $code = $p.ExitCode }
+  $detail = ''
+  if (Test-Path -LiteralPath $resultFile) { $detail = [IO.File]::ReadAllText($resultFile, [Text.Encoding]::UTF8).Trim() }
+  $hx = ''
+  if ($detail.Length -gt 0) { $hx = [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($detail)).Replace('-','') }
+  if ($code -ne 0) {
+    if ($hx.Length -gt 0) { Write-Output ('ERR|EXIT|' + $code + '|' + $hx) } else { Write-Output ('ERR|EXIT|' + $code) }
+  } elseif ($hx.Length -gt 0) {
+    Write-Output ('ERR|MSG|' + $hx)
+  } else {
+    Write-Output 'OK'
+  }
+} catch {
+  $hx = [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($_.Exception.Message)).Replace('-','')
+  Write-Output ('ERR|ELEVATE|' + $hx)
+  exit 1
+}
+"#;
+    // Start-Process 的 -ArgumentList 用逗号分隔的 @(...) 数组传参，逐项单引号转义
+    let args = child_args
+        .iter()
+        .map(|a| ps_quote(a))
+        .collect::<Vec<_>>()
+        .join(",");
+    template
+        .replace("@@RESULT@@", &result_file.to_string_lossy().replace('\'', "''"))
+        .replace("@@ARGS@@", &args)
+}
+
+/// 十六进制串还原为文本（非法十六进制返回空串）
+fn decode_hex_detail(hex_str: &str) -> String {
+    match hex::decode(hex_str.trim()) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// 是否为用户主动取消授权（中英文系统提示不一致，做多重匹配）
+fn is_user_cancel(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    text.contains("取消")
+        || lower.contains("cancel")
+        || lower.contains("1223")
+        || lower.contains("0x800704c7")
+}
+
+/// 解析 PowerShell 脚本输出（OK / ERR 协议），返回可读的中文错误
+fn parse_ps_output(stdout: &str) -> AppResult<()> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line == "OK" {
+            return Ok(());
+        }
+        let Some(rest) = line.strip_prefix("ERR|") else {
+            continue;
+        };
+        let mut parts = rest.splitn(3, '|');
+        let kind = parts.next().unwrap_or("").trim();
+        match kind {
+            "ELEVATE" => {
+                let detail = decode_hex_detail(parts.next().unwrap_or(""));
+                return Err(AppError::Msg(if is_user_cancel(&detail) {
+                    "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string()
+                } else if detail.is_empty() {
+                    "无法以管理员权限启动（未获取到具体原因）；若始终没有弹出 UAC 授权窗口，请检查系统 UAC 设置，或以管理员身份运行本程序".to_string()
+                } else {
+                    format!(
+                        "无法完成管理员授权：{}；若始终没有弹出 UAC 授权窗口，请检查系统 UAC 设置，或以管理员身份运行本程序",
+                        detail
+                    )
+                }));
+            }
+            "EXIT" => {
+                let code = parts.next().unwrap_or("").trim();
+                let detail = decode_hex_detail(parts.next().unwrap_or(""));
+                return Err(AppError::Msg(if detail.is_empty() {
+                    format!("管理员授权执行失败（退出码 {}），未获取到具体原因", code)
+                } else {
+                    format!("管理员授权执行失败：{}（退出码 {}）", detail, code)
+                }));
+            }
+            "MSG" => {
+                let detail = decode_hex_detail(parts.next().unwrap_or(""));
+                return Err(AppError::Msg(format!("管理员授权执行失败：{}", detail)));
+            }
+            "CANCEL" => {
+                return Err(AppError::Msg(
+                    "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string(),
+                ));
+            }
+            // 兼容旧格式 ERR|文本（无类型前缀）
+            _ => {
+                let msg = rest.trim();
+                return Err(AppError::Msg(if is_user_cancel(msg) {
+                    "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string()
+                } else {
+                    format!("管理员授权执行失败: {}", msg)
+                }));
+            }
+        }
+    }
+    Err(AppError::Msg(
+        "未收到管理员授权结果：若桌面上没有出现 UAC 授权窗口，请按 Alt+Tab 或查看任务栏（窗口可能被主界面遮挡）；也可以改用「以管理员身份运行」后重试"
+            .to_string(),
+    ))
+}
+
 /// 运行外层 PowerShell 脚本并解析 OK/ERR 输出
 pub(crate) async fn run_powershell_script(script: &str) -> AppResult<()> {
     let mut cmd = tokio::process::Command::new("powershell");
@@ -396,23 +525,7 @@ pub(crate) async fn run_powershell_script(script: &str) -> AppResult<()> {
         .output()
         .await
         .map_err(|e| AppError::Msg(format!("执行 PowerShell 失败: {}", e)))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line == "OK" {
-            return Ok(());
-        }
-        if let Some(msg) = line.strip_prefix("ERR|") {
-            let msg = msg.trim();
-            let canceled = msg.contains("取消") || msg.to_ascii_lowercase().contains("cancel");
-            return Err(AppError::Msg(if canceled {
-                "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string()
-            } else {
-                format!("管理员授权执行失败: {}", msg)
-            }));
-        }
-    }
-    Err(AppError::Msg("管理员授权执行无响应，请重试".to_string()))
+    parse_ps_output(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// run.ps1 路径（数据目录下 easytier/run.ps1，参数变化仅重写此文件）
@@ -541,9 +654,16 @@ async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
     );
     let encoded = encode_powershell_command(&script);
 
-    let wrapper = format!(
-        "try {{ $p = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand',{}) -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($p.ExitCode -ne 0) {{ Write-Output ('ERR|注册脚本执行失败（退出码 ' + $p.ExitCode + '）') }} else {{ Write-Output 'OK' }} }} catch {{ Write-Output ('ERR|' + $_.Exception.Message); exit 1 }}",
-        ps_quote(&encoded)
+    let wrapper = elevation_wrapper(
+        &[
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-EncodedCommand".to_string(),
+            encoded,
+        ],
+        &elevation_result_path(data_dir),
     );
     run_powershell_script(&wrapper).await
 }
@@ -1257,6 +1377,48 @@ mod tests {
         assert_eq!(base64_encode(b""), "");
         // 'A' = 0x41 → UTF-16LE 为 41 00 → Base64 "QQA="
         assert_eq!(encode_powershell_command("A"), "QQA=");
+    }
+
+    #[test]
+    fn test_parse_ps_output_hex_detail_no_mojibake() {
+        // PowerShell 以 GBK 写 stdout 时中文会被 Rust 按 UTF-8 解码成乱码；
+        // 协议改为 ASCII + UTF-8 字节的十六进制后必须能还原出原文
+        let detail = "必须为管理员";
+        let hx: String = detail.as_bytes().iter().map(|b| format!("{:02X}", b)).collect();
+        let err = parse_ps_output(&format!("ERR|EXIT|1|{}\r\n", hx))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(detail), "错误信息应还原为中文: {}", err);
+        assert!(err.contains("退出码 1"), "{}", err);
+        assert!(parse_ps_output("OK\r\n").is_ok());
+        assert!(parse_ps_output("noise\nOK\n").is_ok());
+    }
+
+    #[test]
+    fn test_parse_ps_output_user_cancel() {
+        for msg in [
+            "操作已被用户取消。",
+            "The operation was canceled by the user",
+            "0x800704C7",
+        ] {
+            let hx: String = msg.as_bytes().iter().map(|b| format!("{:02X}", b)).collect();
+            let err = parse_ps_output(&format!("ERR|ELEVATE|{}", hx))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("已取消管理员授权"), "{}", err);
+        }
+    }
+
+    #[test]
+    fn test_elevation_wrapper_ascii_protocol() {
+        let args = vec!["-File".to_string(), "C:\\data\\火\\a.ps1".to_string()];
+        let w = elevation_wrapper(&args, Path::new("C:\\data\\elevate-result.txt"));
+        assert!(w.contains("'C:\\data\\火\\a.ps1'"));
+        assert!(w.contains("@('-File','C:\\data\\火\\a.ps1')"));
+        assert!(w.contains("[BitConverter]::ToString"));
+        assert!(w.contains("ERR|EXIT|"));
+        // 输出协议与脚本本身都不含中文，stdout 永远是 ASCII
+        assert!(w.contains("$resultFile = 'C:\\data\\elevate-result.txt'"));
     }
 
     #[test]
