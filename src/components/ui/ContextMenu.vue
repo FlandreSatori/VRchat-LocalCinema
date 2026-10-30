@@ -12,6 +12,13 @@ import type { MenuEntry } from '../../lib/menu'
 defineProps<{
   items: MenuEntry[]
 }>()
+
+// 延后到下一帧执行：先让菜单关闭、焦点归还，再打开对话框或回调
+function runEntry(entry: MenuEntry) {
+  if (entry.type !== 'item') return
+  const run = entry.onSelect
+  if (run) setTimeout(run, 0)
+}
 </script>
 
 <template>
@@ -29,7 +36,7 @@ defineProps<{
             v-else
             :disabled="entry.disabled"
             :title="entry.title"
-            @select="() => setTimeout(() => entry.onSelect?.(), 0)"
+            @select="runEntry(entry)"
             class="flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none transition-colors data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50"
             :class="entry.danger ? 'text-destructive data-[highlighted]:bg-destructive/10' : ''"
           >

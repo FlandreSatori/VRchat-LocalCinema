@@ -74,6 +74,37 @@ fn thumb_dir_of(state: &AppState) -> PathBuf {
     }
 }
 
+/// 设置变更审计：比较保存前后的配置，返回发生变化的字段名。
+/// `roomPassword`、`launchParams` 等敏感值统一打码，避免凭据写入日志。
+fn changed_settings_keys(old: &Settings, new: &Settings) -> Vec<String> {
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => map.iter_mut().for_each(|(k, v)| {
+                if matches!(k.as_str(), "roomPassword" | "launchParams") {
+                    *v = serde_json::Value::String("<已隐藏>".into());
+                } else {
+                    redact(v);
+                }
+            }),
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+
+    let mut before = serde_json::to_value(old).unwrap_or(serde_json::Value::Null);
+    let mut after = serde_json::to_value(new).unwrap_or(serde_json::Value::Null);
+    redact(&mut before);
+    redact(&mut after);
+    let (Some(before), Some(after)) = (before.as_object(), after.as_object()) else {
+        return Vec::new();
+    };
+    after
+        .iter()
+        .filter(|(k, v)| before.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 #[tauri::command]
 pub async fn get_traffic_stats(
     state: State<'_, AppState>,
@@ -162,6 +193,16 @@ pub async fn save_settings(
         .store(settings.stream_buffer_kb as usize, Ordering::Relaxed);
     settings.save(&state.paths.settings_file)?;
 
+    let changed = changed_settings_keys(&old, &settings);
+    tracing::info!(
+        "[操作] 保存设置: {}",
+        if changed.is_empty() {
+            "无字段变化".to_string()
+        } else {
+            changed.join(", ")
+        }
+    );
+
     if autostart_changed {
         let manager = app.autolaunch();
         let r = if settings.autostart {
@@ -192,6 +233,7 @@ pub async fn save_settings(
 pub async fn reset_settings(app: AppHandle, state: State<'_, AppState>) -> AppResult<Settings> {
     let defaults = Settings::default();
     save_settings(app, state, defaults.clone()).await?;
+    tracing::info!("[操作] 恢复默认设置");
     Ok(defaults)
 }
 
@@ -206,6 +248,15 @@ pub async fn start_server(app: AppHandle, state: State<'_, AppState>) -> AppResu
     let settings = state.current_settings();
     let server = state.server.clone();
     let r = server.start(&settings.bind_ip(), settings.port).await;
+    match &r {
+        Ok(_) => tracing::info!("[操作] 启动 HTTP 服务: {}:{}", settings.bind_ip(), settings.port),
+        Err(e) => tracing::warn!(
+            "[操作] 启动 HTTP 服务失败: {}:{} 错误={}",
+            settings.bind_ip(),
+            settings.port,
+            e
+        ),
+    }
     AppState::emit_status(&app, &server);
     r.map(|_| server.status())
 }
@@ -218,6 +269,7 @@ pub async fn stop_server(app: AppHandle, state: State<'_, AppState>) -> AppResul
     state.server.stop();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     AppState::emit_status(&app, &state.server);
+    tracing::info!("[操作] 停止 HTTP 服务");
     Ok(state.server.status())
 }
 
@@ -229,6 +281,19 @@ pub async fn restart_server(app: AppHandle, state: State<'_, AppState>) -> AppRe
     server.stop();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let result = server.start(&settings.bind_ip(), settings.port).await;
+    match &result {
+        Ok(_) => tracing::info!(
+            "[操作] 重启 HTTP 服务: {}:{}",
+            settings.bind_ip(),
+            settings.port
+        ),
+        Err(e) => tracing::warn!(
+            "[操作] 重启 HTTP 服务失败: {}:{} 错误={}",
+            settings.bind_ip(),
+            settings.port,
+            e
+        ),
+    }
     AppState::emit_status(&app, &server);
     if result.is_err() {
         state.tunnel.stop(&app).await?;
@@ -350,7 +415,8 @@ fn spawn_probe_task(app: AppHandle, id: String) {
                 file_size,
                 probe.as_ref().map(|(i, r)| (i, r)),
             ) {
-                Ok(v) => v,
+                Ok(Some(updated)) => Some(updated),
+                Ok(None) => None,
                 Err(e) => {
                     tracing::error!("更新媒体信息失败: {}", e);
                     None
@@ -494,6 +560,11 @@ pub async fn import_files(
             spawn_probe_task(app.clone(), item.id.clone());
         }
     }
+    tracing::info!(
+        "[操作] 导入媒体: 新增 {} 个，跳过 {} 个",
+        result.items.len(),
+        result.skipped.len()
+    );
     Ok(result)
 }
 
@@ -589,7 +660,7 @@ pub async fn import_online_video(
     };
     let _ = app.emit("media-updated", &item);
     tracing::info!(
-        "已导入在线视频: {} ({}) 质量={} 大小={}",
+        "[操作] 导入在线视频: {} ({}) 质量={} 大小={}",
         item.title,
         key,
         link.quality,
@@ -633,7 +704,9 @@ pub async fn refresh_media(
     state: State<'_, AppState>,
     id: String,
 ) -> AppResult<MediaItem> {
-    refresh_media_internal(&app, &state, &id).await
+    let item = refresh_media_internal(&app, &state, &id).await?;
+    tracing::info!("[操作] 刷新媒体信息: {}", item.title);
+    Ok(item)
 }
 
 #[tauri::command]
@@ -648,6 +721,9 @@ pub async fn remove_media(state: State<'_, AppState>, id: String) -> AppResult<(
             let thumb_path = thumb_dir_of(&state).join(thumb);
             let _ = std::fs::remove_file(thumb_path);
         }
+        tracing::info!("[操作] 删除媒体: {}（{}）", item.title, item.file_name);
+    } else {
+        tracing::warn!("[操作] 删除媒体: 条目不存在 id={}", id);
     }
     Ok(())
 }
@@ -691,6 +767,7 @@ pub async fn set_custom_thumbnail(
             .ok_or_else(|| AppError::Msg("媒体条目不存在".to_string()))?
     };
     let _ = app.emit("media-updated", &updated);
+    tracing::info!("[操作] 设置自定义封面: {}", updated.title);
     Ok(updated)
 }
 
@@ -757,6 +834,7 @@ pub async fn build_media_url(
         let (bvid, cid) = crate::bilibili::parse_online_key(&item.file_path)
             .ok_or_else(|| AppError::Msg("在线视频条目缺少 B 站分 P 信息".to_string()))?;
         let link = crate::bilibili::resolve_play_url(&bvid, cid).await?;
+        tracing::info!("[操作] 生成播放链接: {}（局域网·B站直链）", item.title);
         return Ok(link.url);
     }
     let lan_ip = resolve_lan_ip(&state).await;
@@ -765,7 +843,9 @@ pub async fn build_media_url(
         port: settings.port,
         lan_ip,
     };
-    url_builder::build_media_url(&item, &input).map_err(AppError::Msg)
+    let url = url_builder::build_media_url(&item, &input).map_err(AppError::Msg)?;
+    tracing::info!("[操作] 生成播放链接: {}（{:?}）", item.title, mode);
+    Ok(url)
 }
 
 #[tauri::command]
@@ -793,19 +873,25 @@ pub async fn open_in_player(
         &PathBuf::from(player.trim()),
         &settings.default_player_args,
         &PathBuf::from(&item.file_path),
-    )
+    )?;
+    tracing::info!("[操作] 外部播放器打开: {}（{}）", item.title, player.trim());
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn open_with_system_default(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let item = get_item_checked(&state, &id)?;
-    external_player::open_with_default(&PathBuf::from(&item.file_path))
+    external_player::open_with_default(&PathBuf::from(&item.file_path))?;
+    tracing::info!("[操作] 系统默认程序打开: {}", item.title);
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn open_in_folder(state: State<'_, AppState>, id: String) -> AppResult<()> {
     let item = get_item_checked(&state, &id)?;
-    external_player::reveal_in_folder(&PathBuf::from(&item.file_path))
+    external_player::reveal_in_folder(&PathBuf::from(&item.file_path))?;
+    tracing::info!("[操作] 在资源管理器中定位: {}", item.title);
+    Ok(())
 }
 
 fn get_item_checked(state: &State<'_, AppState>, id: &str) -> AppResult<MediaItem> {
@@ -828,7 +914,9 @@ fn get_item_checked(state: &State<'_, AppState>, id: &str) -> AppResult<MediaIte
 pub async fn open_url(app: AppHandle, url: String) -> AppResult<()> {
     app.opener()
         .open_url(&url, None::<&str>)
-        .map_err(|e| AppError::Msg(format!("打开链接失败: {}", e)))
+        .map_err(|e| AppError::Msg(format!("打开链接失败: {}", e)))?;
+    tracing::info!("[操作] 打开链接: {}", url);
+    Ok(())
 }
 
 #[tauri::command]
@@ -853,6 +941,7 @@ pub async fn mark_disclaimer_accepted(state: State<'_, AppState>) -> AppResult<(
     // 创建免责声明标记文件
     let marker_file = state.paths.data_dir.join(".disclaimer_accepted");
     std::fs::write(marker_file, "")?;
+    tracing::info!("[操作] 已确认免责声明");
     Ok(())
 }
 
@@ -873,6 +962,7 @@ pub async fn is_running_in_temp_dir() -> AppResult<bool> {
 /// 退出应用（与托盘菜单「退出」一致：先停掉后台服务再强制结束进程）
 #[tauri::command]
 pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
+    tracing::info!("[操作] 退出应用");
     crate::exit_app(&app, &state);
     Ok(())
 }
@@ -882,6 +972,7 @@ pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> AppResult<(
 pub async fn hide_to_tray(app: AppHandle) -> AppResult<()> {
     if let Some(window) = app.get_webview_window("main") {
         window.hide().map_err(|e| AppError::Msg(e.to_string()))?;
+        tracing::info!("[操作] 最小化到系统托盘");
     }
     Ok(())
 }
@@ -891,7 +982,9 @@ pub async fn open_data_dir(app: AppHandle, state: State<'_, AppState>) -> AppRes
     let dir = state.paths.data_dir.clone();
     app.opener()
         .open_path(dir.to_string_lossy().as_ref(), None::<&str>)
-        .map_err(|e| AppError::Msg(format!("打开配置目录失败: {}", e)))
+        .map_err(|e| AppError::Msg(format!("打开配置目录失败: {}", e)))?;
+    tracing::info!("[操作] 打开数据目录: {}", dir.display());
+    Ok(())
 }
 
 /// 打开任意数据目录（不存在时先创建），供「关于」界面的各数据路径一键打开
@@ -903,7 +996,9 @@ pub async fn open_dir(app: AppHandle, path: String) -> AppResult<()> {
     }
     app.opener()
         .open_path(dir.to_string_lossy().as_ref(), None::<&str>)
-        .map_err(|e| AppError::Msg(format!("打开目录失败: {}", e)))
+        .map_err(|e| AppError::Msg(format!("打开目录失败: {}", e)))?;
+    tracing::info!("[操作] 打开目录: {}", dir.display());
+    Ok(())
 }
 
 #[tauri::command]
@@ -928,6 +1023,7 @@ pub async fn clear_thumbnail_cache(state: State<'_, AppState>) -> AppResult<u64>
             }
         }
     }
+    tracing::info!("[操作] 清理封面缓存: 删除 {} 个未引用文件", removed);
     Ok(removed)
 }
 
@@ -1002,7 +1098,9 @@ pub async fn open_convert_dir(app: AppHandle, state: State<'_, AppState>) -> App
     std::fs::create_dir_all(&dir)?;
     app.opener()
         .open_path(dir.to_string_lossy().as_ref(), None::<&str>)
-        .map_err(|e| AppError::Msg(format!("打开转码目录失败: {}", e)))
+        .map_err(|e| AppError::Msg(format!("打开转码目录失败: {}", e)))?;
+    tracing::info!("[操作] 打开转码目录: {}", dir.display());
+    Ok(())
 }
 
 /// 一键清除全部转码缓存：
@@ -1053,6 +1151,12 @@ pub async fn clear_convert_cache(_app: AppHandle, state: State<'_, AppState>) ->
     }
     std::fs::create_dir_all(&converted)?;
 
+    tracing::info!(
+        "[操作] 清理转码缓存: 文件 {} 个，释放 {} 字节，移除记录 {} 条",
+        c1 + c2,
+        b1 + b2,
+        removed_records
+    );
     Ok(ClearConvertCacheResult {
         removed_files: c1 + c2,
         freed_bytes: b1 + b2,
@@ -1093,6 +1197,11 @@ pub async fn clear_download_temp(state: State<'_, AppState>) -> AppResult<ClearD
             }
         }
     }
+    tracing::info!(
+        "[操作] 清理下载临时文件: 文件 {} 个，释放 {} 字节",
+        removed_files,
+        freed_bytes
+    );
     Ok(ClearDownloadTempResult {
         removed_files,
         freed_bytes,
@@ -1160,6 +1269,7 @@ pub async fn download_component(
 
     let status = components::status(kind, &settings, &paths);
     let _ = app.emit("component-installed", &status);
+    tracing::info!("[操作] 内置组件安装完成: {}", kind.id());
     Ok(status)
 }
 
@@ -1169,7 +1279,9 @@ pub async fn open_component_page(app: AppHandle, kind: String) -> AppResult<()> 
     let kind = ComponentKind::parse(&kind)?;
     app.opener()
         .open_url(kind.manual_url(), None::<&str>)
-        .map_err(|e| AppError::Msg(format!("打开下载页失败: {}", e)))
+        .map_err(|e| AppError::Msg(format!("打开下载页失败: {}", e)))?;
+    tracing::info!("[操作] 打开组件下载页: {}", kind.id());
+    Ok(())
 }
 
 // ===== Cloudflare 快速隧道（无需组网即可公网分享） =====
@@ -1196,13 +1308,17 @@ pub async fn start_tunnel(app: AppHandle, state: State<'_, AppState>) -> AppResu
     if state.frp.status().running {
         let _ = state.frp.stop(&app).await;
     }
-    state.tunnel.start(&app, &bin, state.server.status().port).await
+    let status = state.tunnel.start(&app, &bin, state.server.status().port).await?;
+    tracing::info!("[操作] 启动 Cloudflare 隧道");
+    Ok(status)
 }
 
 #[tauri::command]
 pub async fn stop_tunnel(app: AppHandle, state: State<'_, AppState>) -> AppResult<TunnelStatus> {
     let _network = state.network_operation.lock().await;
-    state.tunnel.stop(&app).await
+    let status = state.tunnel.stop(&app).await?;
+    tracing::info!("[操作] 停止 Cloudflare 隧道");
+    Ok(status)
 }
 
 /// 生成某条媒体的公网隧道播放链接（需隧道已启动）
@@ -1225,11 +1341,13 @@ pub async fn build_tunnel_url(state: State<'_, AppState>, id: String) -> AppResu
     if !url_builder::valid_basename(&item.file_name) {
         return Err(AppError::Msg("文件名不能映射为播放 URL".to_string()));
     }
-    Ok(format!(
+    let url = format!(
         "{}/{}",
         base.trim_end_matches('/'),
         url_builder::encode_segment(&item.file_name)
-    ))
+    );
+    tracing::info!("[操作] 生成公网隧道链接: {}", item.title);
+    Ok(url)
 }
 
 // ===== frp 公网隧道（SakuraFrp 等服务，本程序只负责启停 frpc） =====
@@ -1259,16 +1377,23 @@ pub async fn start_frp(app: AppHandle, state: State<'_, AppState>) -> AppResult<
     if state.tunnel.status().running {
         let _ = state.tunnel.stop(&app).await;
     }
-    state
+    let result = state
         .frp
         .start(&app, &bin, &settings.frp, state.server.status().port)
-        .await
+        .await;
+    match &result {
+        Ok(_) => tracing::info!("[操作] 启动 frp 隧道"),
+        Err(e) => tracing::warn!("[操作] 启动 frp 隧道失败: {}", e),
+    }
+    result
 }
 
 #[tauri::command]
 pub async fn stop_frp(app: AppHandle, state: State<'_, AppState>) -> AppResult<FrpStatus> {
     let _network = state.network_operation.lock().await;
-    state.frp.stop(&app).await
+    let status = state.frp.stop(&app).await?;
+    tracing::info!("[操作] 停止 frp 隧道");
+    Ok(status)
 }
 
 /// frpc 运行输出（最近一块），供「公网隧道」页展示
@@ -1341,6 +1466,11 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
     args.push("--file-log-level".to_string());
     args.push("info".to_string());
     let status = state.easytier.start(&core, args).await?;
+    tracing::info!(
+        "[操作] 启动 EasyTier 组网: 房间={} 成员={}",
+        cfg.room_name,
+        cfg.member_name
+    );
     // 缓存本机虚拟 IP（配置未指定时由 build URL 时按需查询 route）
     let configured_ip = cfg.ipv4.trim().split('/').next().unwrap_or("").to_string();
     state.easytier.set_virtual_ip(
@@ -1358,6 +1488,7 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
 pub async fn stop_easytier(app: AppHandle, state: State<'_, AppState>) -> AppResult<EasytierStatus> {
     let _network = state.network_operation.lock().await;
     state.easytier.stop().await;
+    tracing::info!("[操作] 停止 EasyTier 组网");
     // 局域网监听是启动组网时自动切换的 → 停止组网后自动恢复为本地模式；
     // 若局域网模式是用户手动设置（forced_lan 未置位）则保持不变。
     if state.easytier_forced_lan.swap(false, Ordering::SeqCst) {
@@ -1408,6 +1539,7 @@ pub async fn reset_network_adapter(
     state: State<'_, AppState>,
 ) -> AppResult<EasytierStatus> {
     let was_running = state.easytier.status().running;
+    tracing::info!("[操作] 重置网络适配器（组网运行中={}）", was_running);
     state.easytier.stop().await;
     match easytier::uninstall_tun_adapter().await {
         Ok(0) => tracing::info!("没有需要卸载的 EasyTier 虚拟网卡"),
@@ -1669,7 +1801,7 @@ pub async fn download_peer_media_task(
             hash.map(|h| h.to_lowercase()),
         )
         .map_err(AppError::Msg)?;
-    tracing::info!("加入下载任务: {} <- {}:{}{}", safe_name, ip, port, id);
+    tracing::info!("[操作] 加入下载任务: {} <- {}:{}{}", safe_name, ip, port, id);
     emit_convert_tasks(&app);
     spawn_download_worker(app, task.id.clone(), cancel_flag, pause_flag);
     Ok(task)
@@ -1686,6 +1818,7 @@ pub async fn download_task_pause(
         .convert_queue
         .pause_download(&task_id)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 暂停下载任务: {}", task_id);
     emit_convert_tasks(&app);
     Ok(())
 }
@@ -1701,6 +1834,7 @@ pub async fn download_task_resume(
         .convert_queue
         .resume_download(&task_id)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 继续下载任务: {}", task_id);
     emit_convert_tasks(&app);
     spawn_download_worker(app, task_id, cancel_flag, pause_flag);
     Ok(())
@@ -2511,10 +2645,12 @@ pub async fn transcode_media(
         return Err(AppError::Msg("该视频正在边转边播，请等待完成或先取消".into()));
     }
     let options = options.unwrap_or_default();
+    let title = item.title.clone();
     let task = state
         .convert_queue
         .enqueue(id, item.title, overwrite.unwrap_or(false), options)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 加入转码任务: {}", title);
     emit_convert_tasks(&app);
     Ok(task)
 }
@@ -2601,6 +2737,7 @@ pub async fn generate_sample(
         };
         let _ = app.emit("sample-done", &event);
     });
+    tracing::info!("[操作] 生成视频样本: {}", item.title);
     Ok(())
 }
 
@@ -2733,10 +2870,12 @@ pub async fn segment_transcode(
     if first_ms < 10_000 {
         return Err(AppError::Msg("第一段时长过短（至少 10 秒）".into()));
     }
+    let title = item.title.clone();
     let task = state
         .convert_queue
         .enqueue_segment(id, item.title, overwrite.unwrap_or(false), first_ms, options.unwrap_or_default())
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 加入分段转码任务: {}（首段 {} ms）", title, first_ms);
     emit_convert_tasks(&app);
     Ok(task)
 }
@@ -2770,6 +2909,7 @@ pub async fn convert_task_start(
         .convert_queue
         .start_now(&task_id)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 开始转码任务: {}", task_id);
     emit_convert_tasks(&app);
     Ok(())
 }
@@ -2790,6 +2930,7 @@ pub async fn convert_task_cancel(
         .convert_queue
         .cancel(&task_id)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 取消任务: {}", task_id);
     // 已暂停的下载没有执行器在跑，取消时由命令清理 .part 临时文件；
     // 运行中的下载由执行器在感知取消后自行清理
     if let Some(t) = before {
@@ -2816,6 +2957,7 @@ pub async fn convert_task_remove(
         .convert_queue
         .remove(&task_id)
         .map_err(AppError::Msg)?;
+    tracing::info!("[操作] 移除任务记录: {}", task_id);
     emit_convert_tasks(&app);
     Ok(())
 }
@@ -2824,6 +2966,7 @@ pub async fn convert_task_remove(
 #[tauri::command]
 pub async fn convert_task_clear(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     state.convert_queue.clear_finished();
+    tracing::info!("[操作] 清除已结束的任务记录");
     emit_convert_tasks(&app);
     Ok(())
 }
@@ -3595,7 +3738,7 @@ pub async fn make_hls(
                 let _ = app.emit("media-updated", &u);
             }
         }
-        tracing::info!("边转边播（HLS）已可播放：/{}", playlist_name);
+        tracing::info!("[操作] 边转边播（HLS）已可播放：/{}", playlist_name);
 
         // 链接已就绪，允许后续重新生成；后台任务完成时幂等移除
         state.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -3620,6 +3763,7 @@ pub async fn make_hls(
 
     if let Err(e) = result {
         state.hls_jobs.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        tracing::warn!("[操作] 边转边播（HLS）启动失败: {} 错误={}", id, e);
         return Err(e);
     }
     result
@@ -3693,21 +3837,35 @@ pub async fn create_folder(
     name: String,
     parent_id: Option<String>,
 ) -> AppResult<crate::media_library::Folder> {
-    Ok(state
+    let folder = state
         .db
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .create_folder(&name, parent_id.as_deref())?)
+        .create_folder(&name, parent_id.as_deref())?;
+    tracing::info!("[操作] 新建文件夹: {}", folder.name);
+    Ok(folder)
 }
 
 #[tauri::command]
 pub async fn rename_folder(state: State<'_, AppState>, id: String, name: String) -> AppResult<()> {
-    Ok(state.db.lock().unwrap_or_else(|e| e.into_inner()).rename_folder(&id, &name)?)
+    state
+        .db
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rename_folder(&id, &name)?;
+    tracing::info!("[操作] 重命名文件夹: {}", name);
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_folder(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    Ok(state.db.lock().unwrap_or_else(|e| e.into_inner()).delete_folder(&id)?)
+    state
+        .db
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .delete_folder(&id)?;
+    tracing::info!("[操作] 删除文件夹: id={}", id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3716,7 +3874,12 @@ pub async fn rename_media(
     id: String,
     name: String,
 ) -> AppResult<MediaItem> {
-    let item = state.db.lock().unwrap_or_else(|e| e.into_inner()).rename_media(&id, &name)?;
+    let item = state
+        .db
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rename_media(&id, &name)?;
+    tracing::info!("[操作] 重命名媒体: {}", name);
     Ok(item)
 }
 
@@ -3730,6 +3893,11 @@ pub async fn move_media(
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
         db.set_media_folder(&id, folder_id.as_deref())?;
         let item = db.get(&id)?.ok_or_else(|| AppError::Msg("媒体条目不存在".into()))?;
+        tracing::info!(
+            "[操作] 移动媒体: {} -> {}",
+            item.title,
+            folder_id.as_deref().unwrap_or("根目录")
+        );
         Ok(item)
     }
 }
