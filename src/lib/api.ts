@@ -467,7 +467,7 @@ export function transcodeStreamingCopy(
   return invoke('transcode_media', {
     id, overwrite: false, options: {
       videoMode: 'av1', audioMode: 'aac', includeAudio: true, subtitleMode: 'drop',
-      resolution, crf: 28, preset: '10', pixFmt: 'yuv420p',
+      resolution, crf: 24, preset: '8', pixFmt: 'yuv420p',
       audioBitrate: '160k', audioChannels: 2, faststart: true,
       maxVideoBitrate: `${kbps}k`, videoBufferSize: `${kbps * 2}k`,
     } satisfies TranscodeOptions,

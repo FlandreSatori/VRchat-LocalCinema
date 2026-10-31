@@ -68,8 +68,8 @@ const form = reactive<Settings>({
   downloadDir: '',
   streamBufferKb: 256,
   disablePowerThrottling: true,
-  streaming720pBitrateMbps: 3,
-  streaming1080pBitrateMbps: 6,
+  streaming720pBitrateMbps: 4,
+  streaming1080pBitrateMbps: 8,
   easytier: {
     protocols: ['tcp', 'ws'],
     peerUrl: '',
@@ -918,7 +918,7 @@ onUnmounted(() => {
           class="w-32"
           @update:model-value="setBitrate('streaming720pBitrateMbps', $event)"
         />
-        <p class="text-xs text-muted-foreground">720p 及以下源文件的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 3）</p>
+        <p class="text-xs text-muted-foreground">720p 及以下源文件的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 24）决定，不会超过此值；范围 1-100，保留两位小数（默认 4）</p>
       </div>
       <Separator />
       <div class="space-y-1.5">
@@ -932,7 +932,7 @@ onUnmounted(() => {
           class="w-32"
           @update:model-value="setBitrate('streaming1080pBitrateMbps', $event)"
         />
-        <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 28）决定，不会超过此值；范围 1-100，保留两位小数（默认 6）</p>
+        <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 24）决定，不会超过此值；范围 1-100，保留两位小数（默认 8）</p>
       </div>
     </CollapsibleCard>
 

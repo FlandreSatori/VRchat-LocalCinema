@@ -89,11 +89,11 @@ fn default_disable_power_throttling() -> bool {
 }
 
 fn default_streaming_720p_bitrate_mbps() -> f64 {
-    3.0
+    4.0
 }
 
 fn default_streaming_1080p_bitrate_mbps() -> f64 {
-    6.0
+    8.0
 }
 
 /// EasyTier 组网配置，对应 easytier-core 的命令行参数
