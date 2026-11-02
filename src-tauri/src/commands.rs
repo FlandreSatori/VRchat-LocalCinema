@@ -781,27 +781,58 @@ pub async fn get_network_interfaces() -> AppResult<Vec<NetInterface>> {
     Ok(network_interfaces::list_ipv4_interfaces())
 }
 
-/// 解析「局域网模式」使用的 IP：手动指定网卡优先，其次 EasyTier 虚拟 IP，最后物理网卡
-async fn resolve_lan_ip(state: &State<'_, AppState>) -> Option<String> {
+/// 解析「局域网模式」使用的 IP：
+/// 1. 用户手动指定的网卡 IP 优先；
+/// 2. EasyTier 运行中：用 EasyTier 报告的本机虚拟 IP，在网卡列表中匹配唯一一张虚拟网卡；
+///    尚未就绪或匹配不到时返回明确错误，绝不静默回退到物理网卡（否则链接对组网内其他成员不可达）；
+/// 3. EasyTier 未运行：回退到物理网卡（普通局域网共享场景）。
+async fn resolve_lan_ip(state: &State<'_, AppState>) -> AppResult<String> {
     let settings = state.current_settings();
     let manual = settings.lan_adapter_ip.trim().to_string();
     if !manual.is_empty() {
-        return Some(manual);
+        return Ok(manual);
     }
     if state.easytier.status().running {
-        if let Some(ip) = state.easytier.cached_virtual_ip() {
-            return Some(ip);
-        }
-        // 配置未指定虚拟 IP 时，从 easytier-cli route 查询自身并缓存
-        let (cli, _) = components::easytier_cli_binary(&settings, &state.paths);
-        if let Some(cli) = cli {
-            if let Some(ip) = easytier::probe_virtual_ip(&cli).await {
-                state.easytier.set_virtual_ip(Some(ip.clone()));
-                return Some(ip);
+        let virtual_ip = match state.easytier.cached_virtual_ip() {
+            Some(ip) => Some(ip),
+            None => {
+                // 配置未指定虚拟 IP（DHCP）时，从 easytier-cli 查询本机节点 IP 并缓存
+                let (cli, _) = components::easytier_cli_binary(&settings, &state.paths);
+                match cli {
+                    Some(cli) => easytier::probe_virtual_ip(&cli).await,
+                    None => None,
+                }
+            }
+        };
+        let Some(ip) = virtual_ip else {
+            return Err(AppError::Msg(
+                "EasyTier 尚未就绪（尚未获得本机虚拟 IP），请等待组网完成后再复制局域网链接".to_string(),
+            ));
+        };
+        state.easytier.set_virtual_ip(Some(ip.clone()));
+        // 用 EasyTier 报告的本机 IP 反查网卡：多张 et_* 网卡时只有当前网络的网卡配置了这个 IP
+        match network_interfaces::find_adapter_by_ip(
+            &network_interfaces::list_ipv4_interfaces(),
+            &ip,
+        ) {
+            Ok(_) => return Ok(ip),
+            Err(network_interfaces::AdapterMatchError::NotFound) => {
+                return Err(AppError::Msg(format!(
+                    "未找到与 EasyTier 虚拟 IP {} 匹配的网卡，EasyTier 可能尚未就绪，请稍后重试",
+                    ip
+                )));
+            }
+            Err(network_interfaces::AdapterMatchError::Ambiguous) => {
+                return Err(AppError::Msg(format!(
+                    "有多张网卡同时使用 EasyTier 虚拟 IP {}，无法唯一确定绑定网卡，请稍后重试",
+                    ip
+                )));
             }
         }
     }
-    network_interfaces::first_lan_ipv4().filter(|s| !s.is_empty())
+    network_interfaces::first_lan_ipv4()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Msg("未检测到可用的局域网 IPv4 地址，请确认已连接局域网".to_string()))
 }
 
 #[tauri::command]
@@ -837,7 +868,11 @@ pub async fn build_media_url(
         tracing::info!("[操作] 生成播放链接: {}（局域网·B站直链）", item.title);
         return Ok(link.url);
     }
-    let lan_ip = resolve_lan_ip(&state).await;
+    let lan_ip = if mode == UrlMode::Lan {
+        Some(resolve_lan_ip(&state).await?)
+    } else {
+        None
+    };
     let input = UrlInput {
         mode,
         port: settings.port,
@@ -1618,6 +1653,7 @@ async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResu
         )
     };
     let result_path = crate::easytier::elevation_result_path(data_dir);
+    let started_path = crate::easytier::elevation_started_path(data_dir);
     let script = format!(
         "$ErrorActionPreference = 'Stop'\n$out = {}\ntry {{\n{}}} catch {{\n  $m = $_.Exception.Message\n  if (-not $m) {{ $m = ($_ | Out-String) }}\n  [IO.File]::WriteAllText($out, $m, (New-Object System.Text.UTF8Encoding $false))\n  exit 1\n}}\nWrite-Output 'OK'\n",
         crate::easytier::ps_quote(&result_path.to_string_lossy()),
@@ -1639,9 +1675,11 @@ async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResu
             encoded,
         ],
         &result_path,
+        &started_path,
     );
-    let result = crate::easytier::run_powershell_script(&wrapper).await;
+    let result = crate::easytier::run_powershell_script(&wrapper, Some(&started_path)).await;
     let _ = std::fs::remove_file(&result_path);
+    let _ = std::fs::remove_file(&started_path);
     match result {
         Ok(()) => {
             tracing::info!(
@@ -3750,9 +3788,7 @@ pub async fn make_hls(
 
         let host = match mode {
             UrlMode::Localhost => "127.0.0.1".to_string(),
-            UrlMode::Lan => resolve_lan_ip(&state).await.ok_or_else(|| {
-                AppError::Msg("未检测到可用的局域网 IPv4 地址，请确认已连接局域网".into())
-            })?,
+            UrlMode::Lan => resolve_lan_ip(&state).await?,
             UrlMode::Easytier => {
                 return Err(AppError::Msg("该地址模式已停用，请使用本地模式或局域网模式".into()))
             }
@@ -3814,9 +3850,7 @@ pub async fn build_hls_url(
     let settings = state.current_settings();
     let host = match mode {
         UrlMode::Localhost => "127.0.0.1".to_string(),
-        UrlMode::Lan => resolve_lan_ip(&state).await.ok_or_else(|| {
-            AppError::Msg("未检测到可用的局域网 IPv4 地址，请确认已连接局域网".into())
-        })?,
+        UrlMode::Lan => resolve_lan_ip(&state).await?,
         UrlMode::Easytier => {
             return Err(AppError::Msg("该地址模式已停用，请使用本地模式或局域网模式".into()))
         }

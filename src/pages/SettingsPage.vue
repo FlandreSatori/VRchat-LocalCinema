@@ -643,7 +643,7 @@ onUnmounted(() => {
         </div>
       </div>
       <p class="text-xs text-muted-foreground">
-        本地模式仅允许本机访问；局域网模式会自动选择本机可用的物理网卡地址，其他同网络设备可访问。
+        本地模式仅允许本机访问；局域网模式优先使用 EasyTier 虚拟网卡地址（未启动 EasyTier 时使用物理网卡），其他同网络设备可访问。
       </p>
       <p v-if="!form.allowPeerView" class="text-xs text-amber-600 dark:text-amber-500">
         局域网模式需先开启下方「允许其他人查看我的媒体库」；未开启时服务只监听本机地址。
@@ -671,7 +671,7 @@ onUnmounted(() => {
         <Select :model-value="form.lanAdapterIp" :options="adapterOptions" class="w-full" @update:model-value="setLanAdapter" />
       </div>
       <p class="text-xs text-muted-foreground">
-        局域网模式默认自动选地址：EasyTier 组网运行时优先使用虚拟 IP，未运行时使用物理网卡地址；也可在此手动指定网卡。
+        局域网模式默认自动选地址：EasyTier 组网运行时优先使用虚拟 IP（组网未就绪时会提示稍后重试，不会回退到物理网卡）；未运行时使用物理网卡地址；也可在此手动指定网卡。
       </p>
     </CollapsibleCard>
 

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -402,6 +403,17 @@ pub(crate) fn elevation_result_path(data_dir: &Path) -> PathBuf {
     data_dir.join("elevate-result.txt")
 }
 
+/// 提权进程启动后的标记文件：外层脚本在用户确认 UAC 后写入提权进程 PID，
+/// 外层 Rust 据此把等待阶段从「等 UAC 确认」切换为「等提权脚本执行」。
+pub(crate) fn elevation_started_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("elevate-started.txt")
+}
+
+/// 等待用户确认 UAC 授权的时间上限（超过即判定超时，提示重试）
+pub(crate) const UAC_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 用户确认后，提权脚本自身执行的时间上限（防火墙放行、计划任务注册通常数秒完成）
+pub(crate) const ELEVATED_WORK_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// 以管理员权限运行 PowerShell 子进程的包装脚本。
 ///
 /// 输出协议为**纯 ASCII**（`ERR|KIND|HEX` 中 HEX 是 UTF-8 字节的十六进制），
@@ -410,14 +422,38 @@ pub(crate) fn elevation_result_path(data_dir: &Path) -> PathBuf {
 /// - `ERR|ELEVATE|<hex>`：提权启动失败（UAC 被取消/拒绝等）
 /// - `ERR|EXIT|<code>[|<hex>]`：子进程非零退出，hex 为结果文件中的原因
 /// - `ERR|MSG|<hex>`：子进程退出码为 0，但结果文件给出了失败原因
-pub(crate) fn elevation_wrapper(child_args: &[String], result_file: &Path) -> String {
+/// - `ERR|TIMEOUT|WORK`：已获得授权，但提权脚本在 `@@WORK_MS@@` 内未结束（已尽力终止）
+pub(crate) fn elevation_wrapper(
+    child_args: &[String],
+    result_file: &Path,
+    started_file: &Path,
+) -> String {
     let template = r#"$ErrorActionPreference = 'Stop'
 $resultFile = '@@RESULT@@'
+$startedFile = '@@STARTED@@'
 try {
   Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
-  $p = Start-Process -FilePath 'powershell' -ArgumentList @(@@ARGS@@) -Verb RunAs -WindowStyle Hidden -Wait -PassThru
+  Remove-Item -LiteralPath $startedFile -Force -ErrorAction SilentlyContinue
+  $p = Start-Process -FilePath 'powershell' -ArgumentList @(@@ARGS@@) -Verb RunAs -WindowStyle Hidden -PassThru
+  $childId = 0
+  if ($null -ne $p) { $childId = $p.Id }
+  # 走到这里说明 UAC 已确认：写入 PID 标记，外层据此延长后续执行的等待时限
+  [IO.File]::WriteAllText($startedFile, [string]$childId, (New-Object System.Text.ASCIIEncoding))
   $code = 0
-  if ($null -ne $p) { $code = $p.ExitCode }
+  if ($childId -ne 0) {
+    try {
+      if (-not $p.WaitForExit(@@WORK_MS@@)) {
+        Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue
+        Write-Output 'ERR|TIMEOUT|WORK'
+        exit 1
+      }
+      $code = $p.ExitCode
+    } catch {
+      # 无法通过句柄等待提权进程时退化为阻塞等待，由外层超时兜底
+      $p.WaitForExit()
+      $code = $p.ExitCode
+    }
+  }
   $detail = ''
   if (Test-Path -LiteralPath $resultFile) { $detail = [IO.File]::ReadAllText($resultFile, [Text.Encoding]::UTF8).Trim() }
   $hx = ''
@@ -445,6 +481,8 @@ try {
         .join(",");
     template
         .replace("@@RESULT@@", &result_file.to_string_lossy().replace('\'', "''"))
+        .replace("@@STARTED@@", &started_file.to_string_lossy().replace('\'', "''"))
+        .replace("@@WORK_MS@@", &ELEVATED_WORK_TIMEOUT.as_millis().to_string())
         .replace("@@ARGS@@", &args)
 }
 
@@ -504,6 +542,17 @@ fn parse_ps_output(stdout: &str) -> AppResult<()> {
                 let detail = decode_hex_detail(parts.next().unwrap_or(""));
                 return Err(AppError::Msg(format!("管理员授权执行失败：{}", detail)));
             }
+            "TIMEOUT" => {
+                let phase = parts.next().unwrap_or("").trim();
+                return Err(AppError::Msg(if phase == "WORK" {
+                    format!(
+                        "管理员操作执行超时（{} 秒），请重试；若反复超时请手动检查 Windows 防火墙或计划任务",
+                        ELEVATED_WORK_TIMEOUT.as_secs()
+                    )
+                } else {
+                    format!("等待管理员确认超时（{} 秒），请重试", UAC_CONSENT_TIMEOUT.as_secs())
+                }));
+            }
             "CANCEL" => {
                 return Err(AppError::Msg(
                     "已取消管理员授权，无法继续（该操作需要管理员权限）".to_string(),
@@ -527,7 +576,27 @@ fn parse_ps_output(stdout: &str) -> AppResult<()> {
 }
 
 /// 运行外层 PowerShell 脚本并解析 OK/ERR 输出
-pub(crate) async fn run_powershell_script(script: &str) -> AppResult<()> {
+///
+/// 等待分两段计时，避免把「等用户确认 UAC」和「提权脚本真正执行」混为一个时限：
+/// - 确认阶段：`UAC_CONSENT_TIMEOUT`（30 秒），从启动外层脚本开始计时；
+/// - 执行阶段：外层脚本在用户确认后写入 `started` 标记文件（内容为提权进程 PID），
+///   此后改用 `ELEVATED_WORK_TIMEOUT`（120 秒）计时。
+///
+/// 超时后会尽力终止外层脚本与已启动的提权进程，并向上返回带「超时」字样的错误。
+pub(crate) async fn run_powershell_script(script: &str, started: Option<&Path>) -> AppResult<()> {
+    run_powershell_script_with(script, started, UAC_CONSENT_TIMEOUT, ELEVATED_WORK_TIMEOUT).await
+}
+
+async fn run_powershell_script_with(
+    script: &str,
+    started: Option<&Path>,
+    consent_timeout: Duration,
+    work_timeout: Duration,
+) -> AppResult<()> {
+    // 清掉上一轮遗留的标记，避免被误判为「本轮已确认授权」
+    if let Some(path) = started {
+        let _ = std::fs::remove_file(path);
+    }
     let mut cmd = tokio::process::Command::new("powershell");
     cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
         .stdin(Stdio::null())
@@ -537,11 +606,90 @@ pub(crate) async fn run_powershell_script(script: &str) -> AppResult<()> {
     {
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let output = cmd
-        .output()
-        .await
+    let mut child = cmd
+        .spawn()
         .map_err(|e| AppError::Msg(format!("执行 PowerShell 失败: {}", e)))?;
-    parse_ps_output(&String::from_utf8_lossy(&output.stdout))
+    let wrapper_pid = child.id();
+
+    // stdout 需要读取（协议输出）；stderr 也必须持续消费，避免管道写满阻塞子进程
+    let mut stdout = child.stdout.take().expect("stdout configured as piped");
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf).await;
+        });
+    }
+    let wait_task = tokio::spawn(async move { child.wait().await });
+
+    let mut deadline = Instant::now() + consent_timeout;
+    let mut consented = false;
+    let mut elevated_pid: Option<u32> = None;
+    let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut timed_out = false;
+    loop {
+        ticker.tick().await;
+        if wait_task.is_finished() {
+            break;
+        }
+        if !consented {
+            if let Some(path) = started {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    consented = true;
+                    elevated_pid = text.trim().parse::<u32>().ok().filter(|pid| *pid > 0);
+                    deadline = Instant::now() + work_timeout;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+    }
+
+    if timed_out {
+        if let Some(pid) = wrapper_pid {
+            kill_pid(pid).await;
+        }
+        if let Some(pid) = elevated_pid {
+            kill_pid(pid).await;
+        }
+        let _ = wait_task.await;
+        return Err(AppError::Msg(if consented {
+            format!("管理员操作执行超时（{} 秒），请重试", work_timeout.as_secs())
+        } else {
+            format!("等待管理员确认超时（{} 秒），请重试", consent_timeout.as_secs())
+        }));
+    }
+
+    match wait_task.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(AppError::Msg(format!("等待 PowerShell 退出失败: {}", e))),
+        Err(e) => return Err(AppError::Msg(format!("PowerShell 进程异常: {}", e))),
+    }
+    let stdout = stdout_task.await.unwrap_or_default();
+    parse_ps_output(&stdout)
+}
+
+/// 尽力终止指定进程（超时兜底；提权进程可能因权限不足无法终止，失败时忽略）
+async fn kill_pid(pid: u32) {
+    let mut cmd = tokio::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let _ = cmd.status().await;
 }
 
 /// run.ps1 路径（数据目录下 easytier/run.ps1，参数变化仅重写此文件）
@@ -680,8 +828,9 @@ async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
             encoded,
         ],
         &elevation_result_path(data_dir),
+        &elevation_started_path(data_dir),
     );
-    run_powershell_script(&wrapper).await
+    run_powershell_script(&wrapper, Some(&elevation_started_path(data_dir))).await
 }
 
 /// 将脚本编码为 PowerShell `-EncodedCommand` 所需的 Base64（UTF-16LE，含 BOM 无关）。
@@ -1264,12 +1413,53 @@ $devs | ForEach-Object {
     Ok(removed)
 }
 
-/// 从 `easytier-cli route` 输出解析本机虚拟 IPv4（路由表包含自身节点）
-pub async fn probe_virtual_ip(cli: &Path) -> Option<String> {
-    let raw = run_cli(cli, "route").await.ok()?;
-    for line in raw.lines() {
+/// 表格行的列切分：兼容 `easytier-cli` 的竖线表格与旧版的多空格对齐表格
+fn split_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    if trimmed.contains('|') {
+        // 保留首尾空列，保证列位置与表头一致
+        trimmed.split('|').map(|c| c.trim().to_string()).collect()
+    } else {
+        split_columns(trimmed)
+    }
+}
+
+fn is_plain_ipv4(s: &str) -> bool {
+    let s = s.trim();
+    s.split('.').count() == 4
+        && s.split('.')
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 解析 `easytier-cli -o json node info`：`ipv4_addr` 是 EasyTier 报告的本机虚拟 IPv4
+pub fn parse_node_info_ipv4(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let ip = value.get("ipv4_addr")?.as_str()?.trim();
+    if is_plain_ipv4(ip) {
+        Some(ip.to_string())
+    } else {
+        None
+    }
+}
+
+/// 解析 `easytier-cli route` 表格，按本机标记（`next_hop_hostname = Local`）取本机虚拟 IPv4。
+/// 不能直接取第一行：route 表包含虚拟网络内的全部节点，第一行可能是其他成员。
+pub fn parse_route_local_ipv4(text: &str) -> Option<String> {
+    let mut header: Option<Vec<String>> = None;
+    for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("ipv4") {
+        if trimmed.is_empty() {
+            continue;
+        }
+        if header.is_none() {
+            if trimmed.to_ascii_lowercase().contains("hostname") {
+                header = Some(
+                    split_table_row(trimmed)
+                        .into_iter()
+                        .map(|c| c.to_ascii_lowercase())
+                        .collect(),
+                );
+            }
             continue;
         }
         if trimmed
@@ -1278,20 +1468,38 @@ pub async fn probe_virtual_ip(cli: &Path) -> Option<String> {
         {
             continue;
         }
-        let cols = split_columns(trimmed);
-        for col in &cols {
-            // 形如 10.126.126.1 或 10.126.126.1/24
-            let ip = col.split('/').next().unwrap_or(col);
-            if ip.split('.').count() == 4
-                && ip
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-            {
-                return Some(ip.to_string());
-            }
+        let h = header.as_ref()?;
+        let cols = split_table_row(trimmed);
+        let find = |key: &str| -> Option<String> {
+            h.iter()
+                .position(|c| c.contains(key))
+                .and_then(|i| cols.get(i).cloned())
+        };
+        let is_local = find("next_hop_hostname")
+            .map(|v| v.eq_ignore_ascii_case("local"))
+            .unwrap_or(false);
+        if !is_local {
+            continue;
+        }
+        let ip = find("ipv4").unwrap_or_default();
+        let ip = ip.split('/').next().unwrap_or("").trim();
+        if is_plain_ipv4(ip) {
+            return Some(ip.to_string());
         }
     }
     None
+}
+
+/// 查询本机虚拟 IPv4：优先 `node info` 的 `ipv4_addr`（自带本机标识），
+/// 旧版 CLI 不支持时回退到 route 表中 `Local` 那一行。
+pub async fn probe_virtual_ip(cli: &Path) -> Option<String> {
+    if let Ok(json) = run_cli_args(cli, &["-o", "json", "node", "info"]).await {
+        if let Some(ip) = parse_node_info_ipv4(&json) {
+            return Some(ip);
+        }
+    }
+    let raw = run_cli(cli, "route").await.ok()?;
+    parse_route_local_ipv4(&raw)
 }
 
 /// 生成默认成员名（主机名）
@@ -1332,6 +1540,50 @@ mod tests {
     fn test_parse_route_hosts_empty() {
         assert!(parse_route_hosts("").is_empty());
         assert!(parse_route_hosts("no table here").is_empty());
+    }
+
+    #[test]
+    fn test_parse_node_info_ipv4() {
+        // 实测 `easytier-cli -o json node info` 输出（节选）：ipv4_addr 为本机虚拟 IP
+        let raw = r#"{
+          "peer_id": 713292696,
+          "ipv4_addr": "10.126.126.5",
+          "hostname": "LC-PROBE",
+          "inst_id": "5cd07990-1af7-4c0f-a188-2f37c9f18828"
+        }"#;
+        assert_eq!(parse_node_info_ipv4(raw), Some("10.126.126.5".to_string()));
+        // 尚未分配（DHCP 未就绪 / 无 tun）时为空字符串，不能当成有效 IP
+        assert_eq!(
+            parse_node_info_ipv4(r#"{"ipv4_addr": ""}"#),
+            None
+        );
+        assert_eq!(parse_node_info_ipv4("not json"), None);
+    }
+
+    #[test]
+    fn test_parse_route_local_ipv4_uses_local_marker_not_first_row() {
+        // 第一行是其他成员，本机行由 next_hop_hostname = Local 标记
+        let raw = "\
+| ipv4 | hostname | proxy_cidrs | next_hop_ipv4 | next_hop_hostname | next_hop_lat | path_len | path_latency | next_hop_ipv4_lat_first | next_hop_hostname_lat_first | path_len_lat_first | path_latency_lat_first | version |\n\
+|------|----------|-------------|---------------|-------------------|--------------|----------|--------------|-------------------------|-----------------------------|--------------------|------------------------|---------|\n\
+| 10.126.126.2/24 | LivingRoom-PC |  | 10.126.126.2 | LivingRoom-PC | 3 | 1 | 3 | 10.126.126.2 | LivingRoom-PC | 1 | 3 | 2.6.4 |\n\
+| 10.126.126.5/24 | LC-PROBE |  | - | Local | 0 | 0 | 0 | - | Local | 0 | 0 | 2.6.4 |";
+        assert_eq!(
+            parse_route_local_ipv4(raw),
+            Some("10.126.126.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_route_local_ipv4_not_ready_returns_none() {
+        // 本机行尚未获得虚拟 IP（实测 no-tun / DHCP 未就绪时 ipv4 列为空）：
+        // 必须返回 None，不能退而取其他成员的 IP
+        let raw = "\
+| ipv4 | hostname | proxy_cidrs | next_hop_ipv4 | next_hop_hostname | next_hop_lat | path_len | path_latency | next_hop_ipv4_lat_first | next_hop_hostname_lat_first | path_len_lat_first | path_latency_lat_first | version |\n\
+|------|----------|-------------|---------------|-------------------|--------------|----------|--------------|-------------------------|-----------------------------|--------------------|------------------------|---------|\n\
+| 10.126.126.2/24 | LivingRoom-PC |  | 10.126.126.2 | LivingRoom-PC | 3 | 1 | 3 | 10.126.126.2 | LivingRoom-PC | 1 | 3 | 2.6.4 |\n\
+|      | LC-PROBE |             | -             | Local             | 0            | 0        | 0            | -                       | Local                       | 0                  | 0                      | 2.6.4 |";
+        assert_eq!(parse_route_local_ipv4(raw), None);
     }
 
     #[test]
@@ -1476,13 +1728,22 @@ mod tests {
     #[test]
     fn test_elevation_wrapper_ascii_protocol() {
         let args = vec!["-File".to_string(), "C:\\data\\火\\a.ps1".to_string()];
-        let w = elevation_wrapper(&args, Path::new("C:\\data\\elevate-result.txt"));
+        let w = elevation_wrapper(
+            &args,
+            Path::new("C:\\data\\elevate-result.txt"),
+            Path::new("C:\\data\\elevate-started.txt"),
+        );
         assert!(w.contains("'C:\\data\\火\\a.ps1'"));
         assert!(w.contains("@('-File','C:\\data\\火\\a.ps1')"));
         assert!(w.contains("[BitConverter]::ToString"));
         assert!(w.contains("ERR|EXIT|"));
         // 输出协议与脚本本身都不含中文，stdout 永远是 ASCII
         assert!(w.contains("$resultFile = 'C:\\data\\elevate-result.txt'"));
+        assert!(w.contains("$startedFile = 'C:\\data\\elevate-started.txt'"));
+        // 授权确认后先写 PID 标记，再按执行时限等待；超时输出新的 ASCII 协议标记
+        assert!(w.contains("WriteAllText($startedFile, [string]$childId"));
+        assert!(w.contains("WaitForExit(120000)"));
+        assert!(w.contains("ERR|TIMEOUT|WORK"));
     }
 
     #[test]
@@ -1491,7 +1752,11 @@ mod tests {
         // 否则 -File 会收到被空格截断的路径而失败
         let path = "C:\\Users\\张三\\AppData\\Roaming\\VRchat LocalCinema\\data\\firewall-rule.ps1";
         let args = vec!["-File".to_string(), path.to_string()];
-        let w = elevation_wrapper(&args, Path::new("C:\\data\\elevate-result.txt"));
+        let w = elevation_wrapper(
+            &args,
+            Path::new("C:\\data\\elevate-result.txt"),
+            Path::new("C:\\data\\elevate-started.txt"),
+        );
         assert!(
             w.contains(&format!("@('-File','\"{}\"')", path)),
             "含空格的路径参数应被双引号包裹: {}",
@@ -1499,8 +1764,87 @@ mod tests {
         );
         // 不含空白的参数保持原样，不额外加引号
         let plain = vec!["-EncodedCommand".to_string(), "QUJD".to_string()];
-        let w2 = elevation_wrapper(&plain, Path::new("C:\\data\\elevate-result.txt"));
+        let w2 = elevation_wrapper(
+            &plain,
+            Path::new("C:\\data\\elevate-result.txt"),
+            Path::new("C:\\data\\elevate-started.txt"),
+        );
         assert!(w2.contains("@('-EncodedCommand','QUJD')"), "{}", w2);
+    }
+
+    #[test]
+    fn test_parse_ps_output_timeout_protocol() {
+        let err = parse_ps_output("ERR|TIMEOUT|WORK\r\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("超时"), "{}", err);
+        let err = parse_ps_output("ERR|TIMEOUT\r\n").unwrap_err().to_string();
+        assert!(err.contains("等待管理员确认超时"), "{}", err);
+        // 协议与限时长度保持一致
+        assert_eq!(UAC_CONSENT_TIMEOUT, Duration::from_secs(30));
+        assert!(ELEVATED_WORK_TIMEOUT >= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_powershell_consent_timeout_kills_process() {
+        // 不依赖真实 UAC：用一个故意长时间不返回的 PowerShell 子进程验证确认阶段超时。
+        // 生产使用 30 秒上限，这里用短时限验证同一代码路径，避免测试耗时 30 秒。
+        let dir = std::env::temp_dir().join(format!("lc-ps-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late.flag");
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "Start-Sleep -Seconds 8; Set-Content -LiteralPath {} -Value 'x'",
+            ps_quote(&marker.to_string_lossy())
+        );
+        let started_at = Instant::now();
+        let err = run_powershell_script_with(
+            &script,
+            None,
+            Duration::from_millis(1200),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("等待管理员确认超时"), "{}", err);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(6),
+            "超时未生效: {:?}",
+            started_at.elapsed()
+        );
+        // 进程被终止后，不会在稍后写出标记文件
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!marker.exists(), "超时后 PowerShell 子进程仍在运行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_powershell_work_phase_uses_longer_timeout() {
+        // 模拟「用户已确认授权」：脚本自行写入标记文件（PID 0 表示无需终止提权进程），
+        // 之后长时间不返回，验证确认后改用执行时限而不是继续沿用 30 秒确认时限。
+        let dir = std::env::temp_dir().join(format!("lc-ps-work-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started.txt");
+        let script = format!(
+            "Start-Sleep -Milliseconds 300; Set-Content -LiteralPath {} -Value 0; Start-Sleep -Seconds 8",
+            ps_quote(&started.to_string_lossy())
+        );
+        let started_at = Instant::now();
+        let err = run_powershell_script_with(
+            &script,
+            Some(&started),
+            Duration::from_secs(30),
+            Duration::from_millis(1200),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("管理员操作执行超时"), "{}", err);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(6),
+            "执行阶段超时未生效: {:?}",
+            started_at.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
