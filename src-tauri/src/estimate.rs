@@ -717,7 +717,8 @@ mod tests {
         };
         let a = probe_args("movie.mkv", &o, Some(Path::new("sub.ass")), 20.0, 45);
         let text = a.join(" ");
-        assert!(text.contains("libaom-av1"));
+        // transcode.rs 的 AV1 编码器已由 libaom-av1 改为 SVT-AV1，估算需复用真实编码器参数
+        assert!(text.contains("libsvtav1"));
         assert!(text.contains("subtitles=sub.ass"));
         assert!(text.contains("-f null -"));
         assert!(!text.contains("-map 0:2"));

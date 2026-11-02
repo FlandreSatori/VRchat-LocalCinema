@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Copy, Check, ExternalLink, Laptop, Globe, Cloud, Loader2 } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
+import { Copy, Check, ExternalLink, Laptop, Globe, Cloud, Loader2, ArrowRight } from 'lucide-vue-next'
 import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import Dialog from './ui/Dialog.vue'
 import Button from './ui/Button.vue'
@@ -15,7 +16,7 @@ import {
   type MediaItem,
   type UrlMode,
 } from '../lib/api'
-import { loadSettings, convertTaskStore, tunnelStore, lanListenAvailable, lanUnavailableReason } from '../lib/store'
+import { loadSettings, convertTaskStore, tunnelStore, lanListenAvailable, lanUnavailableReason, settingsCache, focusSettingsGroup } from '../lib/store'
 import { maybeRemindAfterCopy } from '../lib/copyReminder'
 import { toast, errMsg } from '../lib/toast'
 import { cn } from '../lib/utils'
@@ -39,6 +40,7 @@ interface SegmentEntry {
 
 const mode = ref<LinkMode>('localhost')
 const format = ref<'whole' | 'segment'>('whole')
+const router = useRouter()
 const url = ref('')
 const urlError = ref('')
 const segments = ref<SegmentEntry[]>([])
@@ -75,6 +77,14 @@ const modeHint = computed(() => {
 /// 局域网模式依赖服务实际绑定到局域网；未生效时生成的局域网链接其他设备必然连不上，故不可选
 const lanAvailable = lanListenAvailable
 const lanDisabledHint = lanUnavailableReason
+const allowPeerView = computed(() => settingsCache.value?.allowPeerView ?? false)
+
+/// 一键直达「设置 · 媒体库」分组：关闭本窗口 → 切到设置页 → 展开并滚动定位到该分组
+function goEnablePeerView() {
+  emit('update:open', false)
+  focusSettingsGroup('library')
+  void router.push('/settings')
+}
 
 function modeUnavailable(v: LinkMode): boolean {
   return v === 'lan' && !lanAvailable.value
@@ -266,9 +276,19 @@ async function openInBrowser() {
           </button>
         </div>
         <p class="mt-2 text-xs text-muted-foreground">{{ modeHint }}</p>
-        <p v-if="!lanAvailable" class="mt-1 text-xs text-amber-600 dark:text-amber-500">
-          {{ lanDisabledHint }}
-        </p>
+        <div v-if="!lanAvailable" class="mt-1 space-y-1.5 text-xs text-amber-600 dark:text-amber-500">
+          <p>{{ lanDisabledHint }}</p>
+          <!-- 仅在「允许其他人查看我的媒体库」未开启时提供直达入口；服务重启中等其它原因不显示 -->
+          <button
+            v-if="!allowPeerView"
+            type="button"
+            class="inline-flex cursor-pointer items-center gap-1 rounded-md border border-amber-600/40 bg-amber-600/10 px-2 py-1 font-medium transition-colors hover:bg-amber-600/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            @click="goEnablePeerView"
+          >
+            点击前往设置开启
+            <ArrowRight class="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       <div v-if="!isOnline">

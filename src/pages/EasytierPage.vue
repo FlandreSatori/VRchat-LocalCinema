@@ -405,7 +405,7 @@ onUnmounted(() => {
         </div>
       </div>
       <p v-if="!allowPeerView" class="mt-3 text-xs text-amber-600 dark:text-amber-500">
-        启动组网前请先在「设置 · HTTP 服务」开启「允许其他人查看我的媒体库」：组网媒体共享需要局域网监听。
+        启动组网前请先开启「允许其他人查看我的媒体库」。
       </p>
       <p class="mt-3 text-xs text-muted-foreground">
         重置网卡会停止组网、卸载 EasyTier 虚拟网卡设备并清理本地缓存；若组网正在进行，会自动重启并重装网卡（需要管理员权限）。

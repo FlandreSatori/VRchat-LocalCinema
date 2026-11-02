@@ -83,7 +83,7 @@ const listenOptions = [
 
 function selectListenMode(value: ListenMode) {
   if (value === 'lan' && !allowPeerView.value) {
-    toast.info('请先在「设置 · HTTP 服务」开启「允许其他人查看我的媒体库」，再切换到局域网模式')
+    toast.info('请先开启「允许其他人查看我的媒体库」，再切换局域网模式')
     return
   }
   void setListenMode(value === 'lan')
@@ -445,7 +445,7 @@ onUnmounted(() => {
               :disabled="listenBusy || (opt.value === 'lan' && !allowPeerView)"
               :title="
                 opt.value === 'lan' && !allowPeerView
-                  ? '需先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」'
+                  ? '需先开启「允许其他人查看我的媒体库」'
                   : opt.title
               "
               @click="selectListenMode(opt.value)"

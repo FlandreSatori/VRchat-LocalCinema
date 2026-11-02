@@ -1419,7 +1419,7 @@ pub async fn start_easytier(app: AppHandle, state: State<'_, AppState>) -> AppRe
     // 否则成员之间（包括查看自己的媒体库）无法连接。
     if !settings.allow_peer_view {
         return Err(AppError::Msg(
-            "组网媒体共享需要开放局域网访问：请先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」，再启动组网"
+            "组网媒体共享需要开放局域网访问：请先在「设置 · 媒体库」中开启「允许其他人查看我的媒体库」，再启动组网"
                 .to_string(),
         ));
     }
@@ -1603,6 +1603,7 @@ const FIREWALL_RULE_NAME: &str = "VRchat-LocalCinema Media Library";
 ///
 /// 提权子脚本把失败原因写入结果文件（UTF-8），由外层脚本以十六进制回传，
 /// 避免 PowerShell 以本地代码页（GBK）写 stdout、Rust 按 UTF-8 解码导致中文乱码。
+/// 脚本内容以 `-EncodedCommand` 内联传入，不落地到用户可写目录。
 async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResult<()> {
     let name = crate::easytier::ps_quote(FIREWALL_RULE_NAME);
     let body = if allow {
@@ -1622,20 +1623,24 @@ async fn apply_firewall_rule(data_dir: &Path, port: u16, allow: bool) -> AppResu
         crate::easytier::ps_quote(&result_path.to_string_lossy()),
         body
     );
-    let path = data_dir.join("firewall-rule.ps1");
-    crate::easytier::write_utf8_bom(&path, &script)?;
+    // 与注册计划任务一致：脚本以 -EncodedCommand 内联传入提权进程，不落地到用户可写目录，
+    // 避免「先写文件、再提权执行」之间的替换窗口（TOCTOU / 本地提权）。
+    // Base64 为纯 ASCII，因此也不受数据目录含空格/中文影响。
+    // 旧版本可能在 data_dir 遗留 firewall-rule.ps1，此处顺手清理。
+    let _ = std::fs::remove_file(data_dir.join("firewall-rule.ps1"));
+    let encoded = crate::easytier::encode_powershell_command(&script);
     let wrapper = crate::easytier::elevation_wrapper(
         &[
             "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
             "-ExecutionPolicy".to_string(),
             "Bypass".to_string(),
-            "-File".to_string(),
-            path.to_string_lossy().to_string(),
+            "-EncodedCommand".to_string(),
+            encoded,
         ],
         &result_path,
     );
     let result = crate::easytier::run_powershell_script(&wrapper).await;
-    let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&result_path);
     match result {
         Ok(()) => {

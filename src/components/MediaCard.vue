@@ -324,7 +324,14 @@ const menuItems = computed<MenuEntry[]>(() => {
   }
   return [
     { type: 'item', label: '复制本机 URL', icon: Copy, onSelect: () => copyUrl('localhost', '本机 URL') },
-    { type: 'item', label: '复制局域网 URL', icon: Copy, onSelect: () => copyUrl('lan', '局域网 URL') },
+    {
+      type: 'item',
+      label: '复制局域网 URL',
+      icon: Copy,
+      disabled: !lanListenAvailable.value,
+      title: lanListenAvailable.value ? '同一局域网内的设备可访问' : lanUnavailableReason.value,
+      onSelect: () => copyUrl('lan', '局域网 URL'),
+    },
     { type: 'separator' },
     { type: 'item', label: '系统默认播放器打开', icon: Play, onSelect: openDefault },
     { type: 'item', label: '使用指定播放器打开', icon: MonitorPlay, onSelect: openPlayer },

@@ -381,6 +381,20 @@ pub(crate) fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// 为 `Start-Process -ArgumentList` 的元素补双引号。
+///
+/// `Start-Process` 把数组元素用空格拼接成子进程命令行，且不会还原每个元素的边界，
+/// 因此含空白（空格/制表符）的路径参数必须自带双引号，否则会被拆成多个参数
+/// （典型现象：`-File` 收到被空格截断的路径，报「没有 .ps1 扩展名」）。
+/// 这里只做命令行层双引号包裹，PowerShell 层转义仍由 [`ps_quote`] 负责。
+fn quote_start_process_arg(s: &str) -> String {
+    if s.chars().any(char::is_whitespace) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// 提权子进程写回失败原因的结果文件（UTF-8）。
 /// 由提权后的脚本写入，外层脚本读取后以十六进制回传，避免 PowerShell 以本地
 /// 代码页（GBK）写 stdout、Rust 再按 UTF-8 解码导致中文乱码。
@@ -421,10 +435,12 @@ try {
   exit 1
 }
 "#;
-    // Start-Process 的 -ArgumentList 用逗号分隔的 @(...) 数组传参，逐项单引号转义
+    // Start-Process 的 -ArgumentList 用逗号分隔的 @(...) 数组传参，逐项单引号转义。
+    // 注意：Start-Process 会把数组元素用空格拼接成命令行，且不会为元素补引号，
+    // 所以含空白的参数（如带空格的脚本路径）必须自带双引号，否则会被拆成多个参数。
     let args = child_args
         .iter()
-        .map(|a| ps_quote(a))
+        .map(|a| ps_quote(&quote_start_process_arg(a)))
         .collect::<Vec<_>>()
         .join(",");
     template
@@ -670,7 +686,7 @@ async fn register_task_elevated(data_dir: &Path) -> AppResult<()> {
 
 /// 将脚本编码为 PowerShell `-EncodedCommand` 所需的 Base64（UTF-16LE，含 BOM 无关）。
 /// 内联传参可完全规避引号/编码问题，且无需落地脚本文件。
-fn encode_powershell_command(script: &str) -> String {
+pub(crate) fn encode_powershell_command(script: &str) -> String {
     let utf16: Vec<u8> = script
         .encode_utf16()
         .flat_map(|unit| unit.to_le_bytes())
@@ -1380,6 +1396,54 @@ mod tests {
     }
 
     #[test]
+    fn test_encoded_command_inline_script_with_spaced_and_chinese_paths() {
+        // 防火墙放行脚本改为 -EncodedCommand 内联传入（不落地 .ps1），
+        // 用等价脚本验证「编码 → 执行 → 写结果文件」链路：
+        // 结果文件路径含空格、含中文时都必须正常，且目录内不应出现脚本文件
+        let base = std::env::temp_dir().join(format!("lc-enc-{}", std::process::id()));
+        for sub in ["带 空格", "中文目录"] {
+            let dir = base.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mark = dir.join("mark 结果.txt");
+            let script = format!(
+                "$ErrorActionPreference = 'Stop'\n$out = {}\ntry {{ [IO.File]::WriteAllText($out, 'OK', (New-Object System.Text.UTF8Encoding $false)) }} catch {{ exit 1 }}\nWrite-Output 'ENC-OK'\n",
+                ps_quote(&mark.to_string_lossy())
+            );
+            let encoded = encode_powershell_command(&script);
+            let output = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    &encoded,
+                ])
+                .output()
+                .expect("启动 powershell 失败");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "内联脚本执行失败（{}）: {}",
+                sub, stdout
+            );
+            assert!(stdout.contains("ENC-OK"), "{}", stdout);
+            assert_eq!(std::fs::read_to_string(&mark).unwrap().trim(), "OK");
+            let has_ps1 = std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|x| x.to_string_lossy().eq_ignore_ascii_case("ps1"))
+                        .unwrap_or(false)
+                });
+            assert!(!has_ps1, "内联执行不应在数据目录落地 .ps1 脚本文件");
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn test_parse_ps_output_hex_detail_no_mojibake() {
         // PowerShell 以 GBK 写 stdout 时中文会被 Rust 按 UTF-8 解码成乱码；
         // 协议改为 ASCII + UTF-8 字节的十六进制后必须能还原出原文
@@ -1419,6 +1483,24 @@ mod tests {
         assert!(w.contains("ERR|EXIT|"));
         // 输出协议与脚本本身都不含中文，stdout 永远是 ASCII
         assert!(w.contains("$resultFile = 'C:\\data\\elevate-result.txt'"));
+    }
+
+    #[test]
+    fn test_elevation_wrapper_quotes_args_with_spaces() {
+        // Start-Process 用空格拼接 -ArgumentList，含空格的路径必须自带双引号，
+        // 否则 -File 会收到被空格截断的路径而失败
+        let path = "C:\\Users\\张三\\AppData\\Roaming\\VRchat LocalCinema\\data\\firewall-rule.ps1";
+        let args = vec!["-File".to_string(), path.to_string()];
+        let w = elevation_wrapper(&args, Path::new("C:\\data\\elevate-result.txt"));
+        assert!(
+            w.contains(&format!("@('-File','\"{}\"')", path)),
+            "含空格的路径参数应被双引号包裹: {}",
+            w
+        );
+        // 不含空白的参数保持原样，不额外加引号
+        let plain = vec!["-EncodedCommand".to_string(), "QUJD".to_string()];
+        let w2 = elevation_wrapper(&plain, Path::new("C:\\data\\elevate-result.txt"));
+        assert!(w2.contains("@('-EncodedCommand','QUJD')"), "{}", w2);
     }
 
     #[test]

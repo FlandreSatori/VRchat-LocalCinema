@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use app_lib::http_server::HttpServer;
 use app_lib::media_library::Db;
-use app_lib::settings::{Settings, UrlMode};
+use app_lib::settings::{ListenMode, Settings, UrlMode};
 use app_lib::url_builder::{build_media_url, UrlInput};
 
 fn setup() -> (HttpServer, app_lib::media_library::MediaItem, PathBufWrap, String) {
@@ -419,11 +419,21 @@ fn test_settings_persistence() {
 
     std::fs::write(&file, r#"{"listenMode":"custom","defaultUrlMode":"easytier","customIp":"10.0.0.1","port":23456,"defaultPlayerPath":"player.exe","defaultPlayerArgs":"{path}"}"#).unwrap();
     let migrated = Settings::load(&file).unwrap();
-    assert_eq!(migrated.bind_ip(), "0.0.0.0");
-    assert_eq!(migrated.default_url_mode, UrlMode::Lan);
+    // 旧配置的 custom 模式会被迁移为局域网模式；但「允许其他人查看我的媒体库」
+    // 未开启时局域网监听不生效，监听模式与默认链接模式统一回落为本地
+    assert_eq!(migrated.listen_mode, ListenMode::Loopback);
+    assert_eq!(migrated.bind_ip(), "127.0.0.1");
+    assert_eq!(migrated.default_url_mode, UrlMode::Localhost);
     assert_eq!(migrated.port, 23456);
     assert_eq!(migrated.default_player_path, "player.exe");
     assert_eq!(migrated.default_player_args, "{path}");
+
+    // 开启「允许其他人查看我的媒体库」后，旧 custom 配置迁移为局域网监听
+    std::fs::write(&file, r#"{"listenMode":"custom","allowPeerView":true,"port":23456}"#).unwrap();
+    let migrated_lan = Settings::load(&file).unwrap();
+    assert_eq!(migrated_lan.listen_mode, ListenMode::Lan);
+    assert_eq!(migrated_lan.bind_ip(), "0.0.0.0");
+    assert_eq!(migrated_lan.default_url_mode, UrlMode::Lan);
     std::fs::write(&file, r#"{"listenMode":"loopback","defaultUrlMode":"lan"}"#).unwrap();
     let local = Settings::load(&file).unwrap();
     assert_eq!(local.bind_ip(), "127.0.0.1");

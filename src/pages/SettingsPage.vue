@@ -41,7 +41,7 @@ import {
   type UrlMode,
 } from '../lib/api'
 import type { UnlistenFn } from '@tauri-apps/api/event'
-import { settingsCache, mediaStore, largeMediaItems } from '../lib/store'
+import { settingsCache, mediaStore, largeMediaItems, settingsFocus, consumeSettingsFocus, type SettingsGroup } from '../lib/store'
 import { toast, errMsg } from '../lib/toast'
 import { confirmDialog } from '../lib/confirm'
 import { formatSize } from '../lib/format'
@@ -176,6 +176,28 @@ const openGroup = ref('library')
 function setGroup(id: string, open: boolean) {
   openGroup.value = open ? id : ''
 }
+
+/// 从「复制链接」等入口跳转过来时的目标分组：展开 + 滚动定位 + 短暂高亮，帮助用户一眼找到
+const highlightGroup = ref<SettingsGroup | ''>('')
+let highlightTimer: number | null = null
+
+function applyFocus(group: SettingsGroup | '') {
+  if (!group) return
+  // 直接展开目标分组；已展开时保持展开，不会被折叠
+  openGroup.value = group
+  highlightGroup.value = group
+  if (highlightTimer !== null) window.clearTimeout(highlightTimer)
+  highlightTimer = window.setTimeout(() => {
+    highlightTimer = null
+    highlightGroup.value = ''
+  }, 1800)
+  void nextTick(() => {
+    document.getElementById(`settings-group-${group}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
+// 设置页已在当前页时，点击入口会自增 tick，这里直接展开并定位
+watch(() => settingsFocus.tick, () => applyFocus(consumeSettingsFocus()))
 /// 遮罩仅在保存耗时较长（如重启 HTTP 服务）时出现，避免每次修改都闪遮罩
 const applyingOpen = ref(false)
 /// 首次加载完成前不自动保存，避免把占位初始值写进配置
@@ -538,6 +560,8 @@ async function doClearConvertCache() {
 let unlistenProgress: UnlistenFn | null = null
 
 onMounted(async () => {
+  // 从其它页面跳转过来时，挂载后消费一次目标分组：展开并滚动定位
+  applyFocus(consumeSettingsFocus())
   try {
     const [s, paths, detected] = await Promise.all([
       getSettings(),
@@ -568,6 +592,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unlistenProgress?.()
+  if (highlightTimer !== null) window.clearTimeout(highlightTimer)
 })
 </script>
 
@@ -590,7 +615,10 @@ onUnmounted(() => {
     </div>
 
     <CollapsibleCard
+      id="settings-group-library"
       title="媒体库"
+      class="scroll-mt-4"
+      :class="highlightGroup === 'library' ? 'ring-2 ring-primary/70' : ''"
       :accent="openGroup === 'library'"
       :open="openGroup === 'library'"
       @update:open="(v) => setGroup('library', v)"
@@ -648,7 +676,10 @@ onUnmounted(() => {
     </CollapsibleCard>
 
     <CollapsibleCard
+      id="settings-group-cache"
       title="数据缓存"
+      class="scroll-mt-4"
+      :class="highlightGroup === 'cache' ? 'ring-2 ring-primary/70' : ''"
       :accent="openGroup === 'cache'"
       :open="openGroup === 'cache'"
       @update:open="(v) => setGroup('cache', v)"
@@ -713,7 +744,10 @@ onUnmounted(() => {
     </CollapsibleCard>
 
     <CollapsibleCard
+      id="settings-group-components"
       title="内置组件"
+      class="scroll-mt-4"
+      :class="highlightGroup === 'components' ? 'ring-2 ring-primary/70' : ''"
       :accent="openGroup === 'components'"
       :open="openGroup === 'components'"
       @update:open="(v) => setGroup('components', v)"
@@ -863,7 +897,10 @@ onUnmounted(() => {
     </CollapsibleCard>
 
     <CollapsibleCard
+      id="settings-group-system"
       title="系统"
+      class="scroll-mt-4"
+      :class="highlightGroup === 'system' ? 'ring-2 ring-primary/70' : ''"
       :accent="openGroup === 'system'"
       :open="openGroup === 'system'"
       @update:open="(v) => setGroup('system', v)"
@@ -902,7 +939,10 @@ onUnmounted(() => {
     </CollapsibleCard>
 
     <CollapsibleCard
+      id="settings-group-transcode"
       title="一键压制"
+      class="scroll-mt-4"
+      :class="highlightGroup === 'transcode' ? 'ring-2 ring-primary/70' : ''"
       :accent="openGroup === 'transcode'"
       :open="openGroup === 'transcode'"
       @update:open="(v) => setGroup('transcode', v)"

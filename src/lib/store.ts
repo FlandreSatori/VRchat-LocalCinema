@@ -63,11 +63,37 @@ export const lanListenAvailable = computed(() => {
 })
 
 /// 局域网链接不可用时的原因说明（禁用项的悬停提示与说明文字共用）
-export const lanUnavailableReason = computed(() =>
-  settingsCache.value?.listenMode === 'lan'
-    ? '服务尚未绑定到局域网地址（可能正在重启），请稍候；若持续如此请在「设置 · HTTP 服务」检查监听配置'
-    : '需要开放局域网访问：请先在「设置 · HTTP 服务」中开启「允许其他人查看我的媒体库」，再切换到局域网模式（左下角快捷开关或设置页）'
-)
+export const lanUnavailableReason = computed(() => {
+  const s = settingsCache.value
+  if (s?.listenMode === 'lan') return '服务尚未绑定到局域网地址，请稍候重试'
+  // 已开启开关但仍停留在本地监听：需要用户再切换监听模式，否则提示会与实际状态不符
+  if (s?.allowPeerView) return '已开启「允许其他人查看我的媒体库」，但当前仍是本地监听；请在「设置 · 媒体库」切换到局域网模式'
+  return '未开启「允许其他人查看我的媒体库」，开启后才能使用局域网链接'
+})
+
+/// 设置页的折叠分组标识（与 SettingsPage 的 openGroup 取值一致）
+export type SettingsGroup = 'library' | 'cache' | 'components' | 'system' | 'transcode'
+
+/// 跨页面跳转到设置页时的目标分组：点击后切页并展开、滚动定位该分组。
+/// tick 每次请求自增，设置页已在当前页时也能重复触发；pending 用于页面挂载时消费一次。
+export const settingsFocus = reactive<{ group: SettingsGroup | ''; tick: number; pending: boolean }>({
+  group: '',
+  tick: 0,
+  pending: false,
+})
+
+export function focusSettingsGroup(group: SettingsGroup) {
+  settingsFocus.group = group
+  settingsFocus.pending = true
+  settingsFocus.tick++
+}
+
+/// 消费一次待处理的目标分组（页面挂载或收到 tick 变化时调用），避免留下持久状态
+export function consumeSettingsFocus(): SettingsGroup | '' {
+  if (!settingsFocus.pending) return ''
+  settingsFocus.pending = false
+  return settingsFocus.group
+}
 
 export const tunnelStore = reactive<TunnelStatus>({
   running: false,
