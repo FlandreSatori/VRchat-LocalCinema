@@ -241,7 +241,8 @@ pub struct Settings {
     #[serde(default = "default_streaming_1080p_bitrate_mbps", rename = "streaming1080pBitrateMbps")]
     pub streaming_1080p_bitrate_mbps: f64,
     /// 转码时优先使用的编码器类型：auto（自动检测）/ nvenc / qsv / amf / software（强制软编）
-    #[serde(default)]
+    /// 未设置时不写入配置，前端按默认值「自动检测」展示
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_preference: Option<EncoderPreference>,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,

@@ -4,7 +4,6 @@
 //! 转码时根据用户选择和探测结果将软件编码器参数映射为硬件编码器参数。
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::process::Command;
 
 /// 用户在设置中选择的编码器偏好
@@ -254,19 +253,16 @@ impl HwEncoderMapper {
         }
     }
 
-    /// 映射像素格式（软件编码器 → 硬件编码器）
-    /// yuv420p → nv12 | yuv420p10le → p010le
+    /// 将目标位深映射到硬件编码器支持的 4:2:0 像素格式。
     pub fn map_pix_fmt(&self, software_pix_fmt: &str) -> String {
-        match software_pix_fmt {
-            "yuv420p" => "nv12".to_string(),
-            "yuv420p10le" => {
-                match self.hw_type {
-                    HwEncoder::Nvenc | HwEncoder::Qsv => "p010le",
-                    HwEncoder::Amf => "p010",
-                }
-                .to_string()
+        if software_pix_fmt.contains("10") {
+            match self.hw_type {
+                HwEncoder::Nvenc | HwEncoder::Qsv => "p010le",
+                HwEncoder::Amf => "p010",
             }
-            _ => software_pix_fmt.to_string(), // 保持原样
+            .to_string()
+        } else {
+            "nv12".to_string()
         }
     }
 }

@@ -3065,6 +3065,7 @@ async fn run_queued_transcode(
         None,
         &state.hwaccel_caps,
         encoder_pref,
+        item.width.zip(item.height),
     );
 
     let progress_app = app.clone();
@@ -3078,7 +3079,7 @@ async fn run_queued_transcode(
         &ffmpeg,
         &args,
         item.duration_ms,
-        Some(cancel),
+        Some(cancel.clone()),
         sub_cwd.as_deref(),
         move |progress| {
             if let Some(pct) = progress.percent {
@@ -3100,6 +3101,24 @@ async fn run_queued_transcode(
         },
     )
     .await;
+    let result = match result {
+        Err(hw_error) if encoder_pref != crate::hwaccel::EncoderPreference::Software => {
+            if let Some(fallback_args) = crate::transcode::software_fallback_args(&args) {
+                tracing::warn!("硬件编码失败，改用软件编码重试: {}", hw_error);
+                run_ffmpeg_with_progress(
+                    &ffmpeg,
+                    &fallback_args,
+                    item.duration_ms,
+                    Some(cancel),
+                    sub_cwd.as_deref(),
+                    |_| {},
+                ).await
+            } else {
+                Err(hw_error)
+            }
+        }
+        result => result,
+    };
 
     if let Err(e) = result {
         // 失败时清理临时产物；非覆盖模式下 dest 为原子占位空文件，一并移除（覆盖模式需保留原文件）
@@ -3256,6 +3275,7 @@ async fn transcode_segment(
         dur_sec,
         &state.hwaccel_caps,
         encoder_pref,
+        source.width.zip(source.height),
     );
     if options.burn_subtitles() && subtitle_file.as_deref().is_some() {
         align_segment_subtitles(&mut args, start_sec.unwrap_or(0.0));
@@ -3298,6 +3318,24 @@ async fn transcode_segment(
         },
     )
     .await;
+    let result = match result {
+        Err(hw_error) if encoder_pref != crate::hwaccel::EncoderPreference::Software => {
+            if let Some(fallback_args) = crate::transcode::software_fallback_args(&args) {
+                tracing::warn!("分段硬件编码失败，改用软件编码重试: {}", hw_error);
+                run_ffmpeg_with_progress(
+                    ffmpeg,
+                    &fallback_args,
+                    pass_duration_ms,
+                    Some(cancel.clone()),
+                    sub_cwd.as_deref(),
+                    |_| {},
+                ).await
+            } else {
+                Err(hw_error)
+            }
+        }
+        result => result,
+    };
     if let Err(e) = result {
         // 失败时清理临时产物；非覆盖模式下 dest 为原子占位空文件，一并移除（覆盖模式需保留原文件）
         let _ = std::fs::remove_file(&part);

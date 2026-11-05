@@ -397,11 +397,53 @@ fn svtav1_preset(preset: &str) -> Option<i32> {
     })
 }
 
-/// 构建转码参数。
-///
-/// `subtitle_file` 为烧录模式时预先抽出的字幕文件路径；`None` 表示不烧录。
-/// **注意**：烧录模式下本函数只把字幕「文件名」写进 `subtitles` 滤镜，调用方必须同时
-/// 以 [`subtitle_filter_cwd`] 的返回值作为 ffmpeg 进程的工作目录，否则滤镜会找不到字幕文件。
+/// 将硬件编码参数转换为对应的软件编码参数，供硬件编码执行失败时重试。
+pub fn software_fallback_args(args: &[String]) -> Option<Vec<String>> {
+    let codec_index = args.iter().position(|arg| arg == "-c:v")? + 1;
+    let hw_codec = args.get(codec_index)?;
+    let sw_codec = if hw_codec.starts_with("h264_") {
+        "libx264"
+    } else if hw_codec.starts_with("hevc_") {
+        "libx265"
+    } else if hw_codec.starts_with("av1_") {
+        "libsvtav1"
+    } else {
+        return None;
+    };
+
+    let quality = args.iter().position(|arg| matches!(arg.as_str(), "-cq:v" | "-global_quality:v" | "-qp_i"))
+        .and_then(|index| args.get(index + 1))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(22)
+        .saturating_sub(2);
+    let mut fallback = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-c:v" {
+            fallback.extend(["-c:v".into(), sw_codec.into(), "-crf".into(), quality.to_string()]);
+            index += 2;
+        } else if ["-preset", "-rc:v", "-cq:v", "-global_quality:v", "-qp_i", "-qp_p"].contains(&arg.as_str()) {
+            index += 2;
+        } else if arg == "-crf" {
+            index += 2;
+        } else if arg == "-pix_fmt" {
+            let pix_fmt = args.get(index + 1).map(String::as_str).unwrap_or("nv12");
+            let software_pix_fmt = match pix_fmt {
+                "nv12" => "yuv420p",
+                "p010" | "p010le" => "yuv420p10le",
+                _ => pix_fmt,
+            };
+            fallback.extend(["-pix_fmt".into(), software_pix_fmt.into()]);
+            index += 2;
+        } else {
+            fallback.push(arg.clone());
+            index += 1;
+        }
+    }
+    Some(fallback)
+}
+
 pub fn build_args(
     input: &str,
     dest: &Path,
@@ -411,6 +453,7 @@ pub fn build_args(
     dur_sec: Option<f64>,
     hwaccel_caps: &HwAccelCapabilities,
     encoder_pref: EncoderPreference,
+    video_size: Option<(u32, u32)>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["-y".into()];
     if let Some(s) = start_sec {
@@ -432,10 +475,30 @@ pub fn build_args(
         o.burn_subtitles() && o.subtitle_graphic() && o.subtitle_stream.is_some();
     if graphic_burn {
         let idx = o.subtitle_stream.unwrap();
+        // 位图字幕（PGS 等）的画布尺寸可能与视频不一致（如 1920x1080 字幕叠到
+        // 1920x1036 视频），个别帧尺寸还会中途变化。直接 overlay 会让滤镜中途重建，
+        // 输出帧时间戳错乱，mp4 封装时报 "pts/dts pair unsupported"。
+        // 先缩放到固定视频尺寸，保证字幕输入帧属性始终一致。
+        let sub_chain = match video_size {
+            Some((w, h)) if w > 0 && h > 0 => format!(
+                "[0:{}]scale={}:{}:flags=bilinear,format=yuva420p[sub]",
+                idx, w, h
+            ),
+            _ => {
+                tracing::warn!(
+                    "图形字幕烧录：未获取到视频尺寸，无法归一化字幕画布（字幕流 0:{}）",
+                    idx
+                );
+                format!("[0:{}]format=yuva420p[sub]", idx)
+            }
+        };
+        if let Some((w, h)) = video_size {
+            tracing::info!("图形字幕烧录：字幕流 0:{} 归一化到 {}x{} 后叠加", idx, w, h);
+        }
         // 先 overlay（两者尺寸一致）再缩放，避免字幕位图与缩放后画面错位
         let fc = match &scale_filter {
-            Some(sc) => format!("[0:v][0:{}]overlay[ov];[ov]{}[v]", idx, sc),
-            None => format!("[0:v][0:{}]overlay[v]", idx),
+            Some(sc) => format!("{};[0:v][sub]overlay[ov];[ov]{}[v]", sub_chain, sc),
+            None => format!("{};[0:v][sub]overlay[v]", sub_chain),
         };
         args.extend(["-filter_complex".into(), fc]);
         args.extend(["-map".into(), "[v]".into()]);
@@ -642,6 +705,22 @@ mod tests {
     }
 
     #[test]
+    fn hardware_args_fall_back_to_software_encoder_options() {
+        let args = vec![
+            "-c:v".into(), "hevc_qsv".into(),
+            "-preset".into(), "medium".into(),
+            "-global_quality:v".into(), "26".into(),
+            "-pix_fmt".into(), "p010le".into(),
+            "-i".into(), "input.mkv".into(),
+        ];
+        let fallback = software_fallback_args(&args).unwrap();
+        assert_eq!(fallback, vec![
+            "-c:v", "libx265", "-crf", "24",
+            "-pix_fmt", "yuv420p10le", "-i", "input.mkv",
+        ]);
+    }
+
+    #[test]
     fn burn_forces_video_reencode() {
         let mut o = base();
         o.video_mode = Some("copy".into());
@@ -656,7 +735,7 @@ mod tests {
         o.max_video_bitrate = Some("6000k".into());
         o.video_buffer_size = Some("12000k".into());
         o.keyframe_interval = Some(120);
-        let args = build_args("in.mkv", &PathBuf::from("out.mp4"), &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
+        let args = build_args("in.mkv", &PathBuf::from("out.mp4"), &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software, None);
         let joined = args.join(" ");
         assert!(joined.contains("-maxrate 6000k"));
         assert!(joined.contains("-bufsize 12000k"));
@@ -670,7 +749,7 @@ mod tests {
         o.audio_mode = Some("aac".into());
         o.audio_bitrate = Some("256k".into());
         let dest = PathBuf::from("out.mp4");
-        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
+        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software, None);
         let joined = args.join(" ");
         assert!(joined.contains("-c:v copy"));
         assert!(joined.contains("-c:a aac"));
@@ -686,11 +765,38 @@ mod tests {
         o.video_mode = Some("copy".into());
         let dest = PathBuf::from("out.mp4");
         let sub = PathBuf::from(r"C:\Temp\sub.srt");
-        let args = build_args("in.mkv", &dest, &o, Some(&sub), None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
+        let args = build_args("in.mkv", &dest, &o, Some(&sub), None, None, &HwAccelCapabilities::default(), EncoderPreference::Software, None);
         let joined = args.join(" ");
         assert!(joined.contains("-c:v libx264"), "burn 必须重编码: {}", joined);
         assert!(joined.contains("subtitles=sub.srt"), "只应传字幕文件名: {}", joined);
         assert!(!joined.contains("-c:s"), "烧录模式不内嵌字幕轨: {}", joined);
+    }
+
+    #[test]
+    fn args_graphic_subtitle_scaled_to_video_size() {
+        let mut o = base();
+        o.subtitle_mode = Some("burn".into());
+        o.subtitle_stream = Some(2);
+        o.subtitle_graphic = Some(true);
+        let dest = PathBuf::from("out.mp4");
+        let args = build_args(
+            "in.mkv",
+            &dest,
+            &o,
+            None,
+            None,
+            None,
+            &HwAccelCapabilities::default(),
+            EncoderPreference::Software,
+            Some((1920, 1036)),
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("[0:2]scale=1920:1036:flags=bilinear,format=yuva420p[sub];[0:v][sub]overlay[v]"),
+            "图形字幕应先归一化画布再 overlay: {}",
+            joined
+        );
+        assert!(!joined.contains("-vf"), "图形字幕走 filter_complex: {}", joined);
     }
 
     #[test]
@@ -699,13 +805,13 @@ mod tests {
         o.subtitle_mode = Some("embed".into());
         o.subtitle_stream = Some(3);
         let dest = PathBuf::from("out.mp4");
-        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
+        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software, None);
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:3"));
         assert!(joined.contains("-c:s mov_text"));
 
         let o2 = base();
-        let args2 = build_args("in.mkv", &dest, &o2, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
+        let args2 = build_args("in.mkv", &dest, &o2, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software, None);
         assert!(args2.join(" ").contains("-sn"));
     }
 

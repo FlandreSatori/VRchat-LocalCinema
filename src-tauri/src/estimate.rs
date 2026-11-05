@@ -432,7 +432,7 @@ fn probe_args(
         video.subtitle_stream = None;
     }
     video.faststart = Some(false);
-    let mut args = transcode::build_args(input, Path::new("-"), &video, sub, Some(start), None, &crate::hwaccel::HwAccelCapabilities::default(), crate::hwaccel::EncoderPreference::Software);
+    let mut args = transcode::build_args(input, Path::new("-"), &video, sub, Some(start), None, &crate::hwaccel::HwAccelCapabilities::default(), crate::hwaccel::EncoderPreference::Software, None);
     args.pop();
     // 恢复原片字幕时间，再恢复样本内时间，与分段执行路径相同。
     if video.burn_subtitles() {
