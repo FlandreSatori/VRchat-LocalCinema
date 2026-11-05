@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
+use crate::hwaccel::HwAccelCapabilities;
 use crate::settings::{AppPaths, Settings};
 
 /// FFmpeg 官方下载页（手动下载入口）
@@ -269,6 +270,34 @@ pub struct ComponentStatus {
     pub missing: Vec<String>,
     /// 是否为内置来源（随包分发或自动下载）
     pub builtin: bool,
+}
+
+/// 探测 FFmpeg 支持的硬件编码器能力
+/// 
+/// 在启动时调用，将结果存储到 AppState 供转码时使用。
+/// 失败时返回空能力集（回退到纯软件编码）。
+pub fn detect_hwaccel(settings: &Settings, paths: &AppPaths) -> HwAccelCapabilities {
+    let (ffmpeg_path, _source) = ffmpeg_binary(settings, paths);
+    let Some(ffmpeg) = ffmpeg_path else {
+        tracing::warn!("未找到 FFmpeg，跳过硬件编码器探测");
+        return HwAccelCapabilities::default();
+    };
+    
+    match HwAccelCapabilities::detect(ffmpeg.to_str().unwrap_or("ffmpeg")) {
+        Ok(caps) => {
+            tracing::info!(
+                "硬件编码器探测完成: H.264={}, H.265={}, AV1={}",
+                caps.h264.len(),
+                caps.h265.len(),
+                caps.av1.len()
+            );
+            caps
+        }
+        Err(e) => {
+            tracing::warn!("硬件编码器探测失败（将回退到软件编码）: {}", e);
+            HwAccelCapabilities::default()
+        }
+    }
 }
 
 fn probe_version(args: &[&str], path: &Path) -> Option<String> {

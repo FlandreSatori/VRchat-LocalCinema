@@ -95,6 +95,8 @@ export interface Settings {
   streaming720pBitrateMbps: number
   /** 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数） */
   streaming1080pBitrateMbps: number
+  /** 转码时优先使用的编码器类型：auto / nvenc / qsv / amf / software */
+  encoderPreference?: 'auto' | 'nvenc' | 'qsv' | 'amf' | 'software'
   easytier: EasytierConfig
   frp: FrpConfig
 }

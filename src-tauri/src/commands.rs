@@ -14,6 +14,7 @@ use crate::error::{AppError, AppResult};
 use crate::external_player::{self, PlayerInfo};
 use crate::frp::FrpStatus;
 use crate::http_server::{HttpServer, ServerStatus};
+use crate::hwaccel::HwAccelCapabilities;
 use crate::logger::LogEntry;
 use crate::logger::RecentLogs;
 use crate::media_library::{Db, MediaItem, MediaStatus, MediaSummary};
@@ -53,6 +54,8 @@ pub struct AppState {
     pub convert_queue: crate::convert_queue::ConvertQueue,
     /// 正在进行的 HLS 转码任务（媒体 id）
     pub hls_jobs: RwLock<HashSet<String>>,
+    /// 硬件编码器能力探测结果（启动时探测，转码时使用）
+    pub hwaccel_caps: HwAccelCapabilities,
 }
 
 impl AppState {
@@ -3052,6 +3055,7 @@ async fn run_queued_transcode(
     let part = transcode_part_path(&dest);
 
     let (options, subtitle_file) = prepare_transcode_options(state, &ffmpeg, &item, &task.options, cancel.clone()).await;
+    let encoder_pref = state.current_settings().encoder_preference.unwrap_or_default();
     let args = crate::transcode::build_args(
         &item.file_path,
         &part,
@@ -3059,6 +3063,8 @@ async fn run_queued_transcode(
         subtitle_file.as_deref(),
         None,
         None,
+        &state.hwaccel_caps,
+        encoder_pref,
     );
 
     let progress_app = app.clone();
@@ -3240,6 +3246,7 @@ async fn transcode_segment(
 ) -> AppResult<MediaItem> {
     let part = transcode_part_path(dest);
     let (options, subtitle_file) = prepare_transcode_options(state, ffmpeg, source, &task.options, cancel.clone()).await;
+    let encoder_pref = state.current_settings().encoder_preference.unwrap_or_default();
     let mut args = crate::transcode::build_args(
         &source.file_path,
         &part,
@@ -3247,6 +3254,8 @@ async fn transcode_segment(
         subtitle_file.as_deref(),
         start_sec,
         dur_sec,
+        &state.hwaccel_caps,
+        encoder_pref,
     );
     if options.burn_subtitles() && subtitle_file.as_deref().is_some() {
         align_segment_subtitles(&mut args, start_sec.unwrap_or(0.0));

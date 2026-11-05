@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::hwaccel::{EncoderPreference, HwAccelCapabilities};
+
 /// 可直拷进 MP4 的视频编码（其余一律重编码）
 pub const COPYABLE_VIDEO: &[&str] = &["h264", "hevc", "vp9", "av1", "mpeg4"];
 /// 可直拷进 MP4 的音频编码（DTS / TrueHD 等 MP4 不支持，必须转 AAC）
@@ -407,6 +409,8 @@ pub fn build_args(
     subtitle_file: Option<&Path>,
     start_sec: Option<f64>,
     dur_sec: Option<f64>,
+    hwaccel_caps: &HwAccelCapabilities,
+    encoder_pref: EncoderPreference,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec!["-y".into()];
     if let Some(s) = start_sec {
@@ -460,25 +464,60 @@ pub fn build_args(
     // ===== 视频编码 =====
     let vmode = o.effective_video_mode();
     let reencode = vmode != "copy";
-    match vmode {
-        "h265" | "hevc" => {
-            args.extend(["-c:v".into(), "libx265".into()]);
+    
+    // 根据用户偏好和硬件能力选择编码器
+    let (encoder_name, hw_mapper) = if vmode == "copy" {
+        ("copy".to_string(), None)
+    } else {
+        match vmode {
+            "h265" | "hevc" => {
+                if let Some((hw_type, hw_enc)) = hwaccel_caps.choose_h265(encoder_pref) {
+                    tracing::info!("H.265 使用硬件编码器: {} ({})", hw_enc, hw_type.as_str());
+                    (hw_enc, Some(crate::hwaccel::HwEncoderMapper::new(hw_type)))
+                } else {
+                    if encoder_pref != EncoderPreference::Auto && encoder_pref != EncoderPreference::Software {
+                        tracing::warn!("未找到 H.265 硬件编码器 (偏好: {})，回退到软件编码", encoder_pref.as_str());
+                    }
+                    ("libx265".to_string(), None)
+                }
+            }
+            "av1" => {
+                if let Some((hw_type, hw_enc)) = hwaccel_caps.choose_av1(encoder_pref) {
+                    tracing::info!("AV1 使用硬件编码器: {} ({})", hw_enc, hw_type.as_str());
+                    (hw_enc, Some(crate::hwaccel::HwEncoderMapper::new(hw_type)))
+                } else {
+                    if encoder_pref != EncoderPreference::Auto && encoder_pref != EncoderPreference::Software {
+                        tracing::warn!("未找到 AV1 硬件编码器 (偏好: {})，回退到软件编码", encoder_pref.as_str());
+                    }
+                    ("libsvtav1".to_string(), None)
+                }
+            }
+            _ => {
+                // H.264
+                if let Some((hw_type, hw_enc)) = hwaccel_caps.choose_h264(encoder_pref) {
+                    tracing::info!("H.264 使用硬件编码器: {} ({})", hw_enc, hw_type.as_str());
+                    (hw_enc, Some(crate::hwaccel::HwEncoderMapper::new(hw_type)))
+                } else {
+                    if encoder_pref != EncoderPreference::Auto && encoder_pref != EncoderPreference::Software {
+                        tracing::warn!("未找到 H.264 硬件编码器 (偏好: {})，回退到软件编码", encoder_pref.as_str());
+                    }
+                    ("libx264".to_string(), None)
+                }
+            }
         }
-        "av1" => {
-            // libaom-av1 速度极慢，改用 SVT-AV1（同画质下快 1~2 个数量级）
-            args.extend(["-c:v".into(), "libsvtav1".into()]);
-        }
-        "copy" => {
-            args.extend(["-c:v".into(), "copy".into()]);
-        }
-        _ => {
-            args.extend(["-c:v".into(), "libx264".into()]);
-        }
-    }
+    };
+    args.extend(["-c:v".into(), encoder_name.clone()]);
     if reencode {
-        // -keyint_min / -sc_threshold 是 x264 / x265 私有选项，AV1 编码器不支持
-        let x26x = matches!(vmode, "h264" | "h265" | "hevc");
-        if x26x {
+        let is_hw = hw_mapper.is_some();
+        // x264/x265 私有选项,硬件编码器和 AV1 编码器不支持
+        let x26x = matches!(vmode, "h264" | "h265" | "hevc") && !is_hw;
+        
+        // Preset 参数
+        if let Some(ref mapper) = hw_mapper {
+            let sw_preset = o.preset.as_deref().unwrap_or("medium");
+            let hw_preset = mapper.map_preset(sw_preset);
+            args.extend(["-preset".into(), hw_preset]);
+        } else if x26x {
             let preset = o.preset.as_deref().unwrap_or("medium");
             args.extend(["-preset".into(), preset.to_string()]);
         } else if vmode == "av1" {
@@ -486,15 +525,30 @@ pub fn build_args(
             let preset = o.preset.as_deref().and_then(svtav1_preset).unwrap_or(8);
             args.extend(["-preset".into(), preset.to_string()]);
         }
-        let crf = o.crf.unwrap_or(20).min(51);
-        args.extend(["-crf".into(), crf.to_string()]);
+        
+        // 质量参数: 硬件编码器需要映射 CRF → CQ/ICQ/QP
+        if let Some(ref mapper) = hw_mapper {
+            let crf = o.crf.unwrap_or(20).min(51);
+            let quality_args = mapper.map_quality_args(crf);
+            args.extend(quality_args);
+        } else {
+            let crf = o.crf.unwrap_or(20).min(51);
+            args.extend(["-crf".into(), crf.to_string()]);
+        }
+        
+        // 像素格式
         let pix = o.pix_fmt.as_deref().unwrap_or(if vmode == "h265" || vmode == "hevc" {
             "yuv420p10le"
         } else {
             "yuv420p"
         });
         if pix != "auto" {
-            args.extend(["-pix_fmt".into(), pix.to_string()]);
+            let pix_mapped = if let Some(ref mapper) = hw_mapper {
+                mapper.map_pix_fmt(pix)
+            } else {
+                pix.to_string()
+            };
+            args.extend(["-pix_fmt".into(), pix_mapped]);
         }
         if let Some(maxrate) = &o.max_video_bitrate {
             args.extend(["-maxrate".into(), maxrate.clone()]);
@@ -602,7 +656,7 @@ mod tests {
         o.max_video_bitrate = Some("6000k".into());
         o.video_buffer_size = Some("12000k".into());
         o.keyframe_interval = Some(120);
-        let args = build_args("in.mkv", &PathBuf::from("out.mp4"), &o, None, None, None);
+        let args = build_args("in.mkv", &PathBuf::from("out.mp4"), &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
         let joined = args.join(" ");
         assert!(joined.contains("-maxrate 6000k"));
         assert!(joined.contains("-bufsize 12000k"));
@@ -616,7 +670,7 @@ mod tests {
         o.audio_mode = Some("aac".into());
         o.audio_bitrate = Some("256k".into());
         let dest = PathBuf::from("out.mp4");
-        let args = build_args("in.mkv", &dest, &o, None, None, None);
+        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
         let joined = args.join(" ");
         assert!(joined.contains("-c:v copy"));
         assert!(joined.contains("-c:a aac"));
@@ -632,7 +686,7 @@ mod tests {
         o.video_mode = Some("copy".into());
         let dest = PathBuf::from("out.mp4");
         let sub = PathBuf::from(r"C:\Temp\sub.srt");
-        let args = build_args("in.mkv", &dest, &o, Some(&sub), None, None);
+        let args = build_args("in.mkv", &dest, &o, Some(&sub), None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
         let joined = args.join(" ");
         assert!(joined.contains("-c:v libx264"), "burn 必须重编码: {}", joined);
         assert!(joined.contains("subtitles=sub.srt"), "只应传字幕文件名: {}", joined);
@@ -645,13 +699,13 @@ mod tests {
         o.subtitle_mode = Some("embed".into());
         o.subtitle_stream = Some(3);
         let dest = PathBuf::from("out.mp4");
-        let args = build_args("in.mkv", &dest, &o, None, None, None);
+        let args = build_args("in.mkv", &dest, &o, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
         let joined = args.join(" ");
         assert!(joined.contains("-map 0:3"));
         assert!(joined.contains("-c:s mov_text"));
 
         let o2 = base();
-        let args2 = build_args("in.mkv", &dest, &o2, None, None, None);
+        let args2 = build_args("in.mkv", &dest, &o2, None, None, None, &HwAccelCapabilities::default(), EncoderPreference::Software);
         assert!(args2.join(" ").contains("-sn"));
     }
 

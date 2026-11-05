@@ -9,6 +9,7 @@ pub mod error;
 pub mod external_player;
 pub mod frp;
 pub mod http_server;
+pub mod hwaccel;
 pub mod logger;
 pub mod media_library;
 pub mod network_interfaces;
@@ -206,6 +207,8 @@ pub fn run() {
                 traffic_stats.clone(),
             );
 
+            let hwaccel_caps = components::detect_hwaccel(&settings_fixed, &paths);
+
             let state = AppState {
                 paths: paths.clone(),
                 settings: RwLock::new(settings_fixed.clone()),
@@ -223,6 +226,7 @@ pub fn run() {
                 frp: frp::FrpManager::new(),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
+                hwaccel_caps,
             };
             app.manage(state);
             app.manage(estimate::EstimateState::default());

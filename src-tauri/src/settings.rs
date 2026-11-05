@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
+use crate::hwaccel::EncoderPreference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -239,6 +240,9 @@ pub struct Settings {
     /// 一键压制 1080p 峰值码率（Mbps，范围 1-100，保留两位小数）
     #[serde(default = "default_streaming_1080p_bitrate_mbps", rename = "streaming1080pBitrateMbps")]
     pub streaming_1080p_bitrate_mbps: f64,
+    /// 转码时优先使用的编码器类型：auto（自动检测）/ nvenc / qsv / amf / software（强制软编）
+    #[serde(default)]
+    pub encoder_preference: Option<EncoderPreference>,
     /// EasyTier 组网配置
     pub easytier: EasytierConfig,
     /// frp 公网隧道配置
@@ -272,6 +276,7 @@ impl Default for Settings {
             disable_power_throttling: default_disable_power_throttling(),
             streaming_720p_bitrate_mbps: default_streaming_720p_bitrate_mbps(),
             streaming_1080p_bitrate_mbps: default_streaming_1080p_bitrate_mbps(),
+            encoder_preference: None,
             easytier: EasytierConfig::default(),
             frp: FrpConfig::default(),
         }

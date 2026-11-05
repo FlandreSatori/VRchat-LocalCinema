@@ -70,6 +70,7 @@ const form = reactive<Settings>({
   disablePowerThrottling: true,
   streaming720pBitrateMbps: 4,
   streaming1080pBitrateMbps: 8,
+  encoderPreference: 'auto',
   easytier: {
     protocols: ['tcp', 'ws'],
     peerUrl: '',
@@ -973,6 +974,22 @@ onUnmounted(() => {
           @update:model-value="setBitrate('streaming1080pBitrateMbps', $event)"
         />
         <p class="text-xs text-muted-foreground">高于 720p 源文件（含降采样到 1080p）的瞬时码率上限（峰值上限，非平均码率）。实际码率由画质（CRF，默认 24）决定，不会超过此值；范围 1-100，保留两位小数（默认 8）</p>
+      </div>
+      <Separator />
+      <div class="space-y-1.5">
+        <Label>编码器偏好</Label>
+        <Select
+          v-model="form.encoderPreference"
+          :options="[
+            { label: '自动检测', value: 'auto' },
+            { label: 'NVIDIA NVENC（硬件加速）', value: 'nvenc' },
+            { label: 'Intel QSV（硬件加速）', value: 'qsv' },
+            { label: 'AMD AMF（硬件加速）', value: 'amf' },
+            { label: '软件编码', value: 'software' },
+          ]"
+          class="w-full"
+        />
+        <p class="text-xs text-muted-foreground">转码时优先使用的编码器类型。自动检测模式会优先使用可用的硬件编码器（NVENC > QSV > AMF），硬件编码器不可用时自动回退到软件编码</p>
       </div>
     </CollapsibleCard>
 
