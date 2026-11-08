@@ -3156,7 +3156,7 @@ async fn run_queued_transcode(
             }
             Err(e) => {
                 tracing::error!("转码产物入库失败: {}", e);
-                None
+                return Err(e.into());
             }
         }
     };

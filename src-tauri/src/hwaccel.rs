@@ -1,7 +1,8 @@
 //! 硬件视频编码器检测与参数映射。
 //!
-//! 启动时通过 `ffmpeg -encoders` 探测可用的硬件编码器（NVENC / QSV / AMF），
-//! 转码时根据用户选择和探测结果将软件编码器参数映射为硬件编码器参数。
+//! 启动时通过 `ffmpeg -encoders` 找到候选硬件编码器，再实际打开一次编码器确认
+//! 当前机器可用（NVENC / QSV / AMF）；转码时根据用户选择和探测结果将软件编码器
+//! 参数映射为硬件编码器参数。
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -79,8 +80,50 @@ pub struct HwAccelCapabilities {
     pub av1: Vec<String>,
 }
 
+fn probe_encoder(ffmpeg_path: &str, encoder: &str) -> bool {
+    Command::new(ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=1280x720:d=0.04",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            encoder,
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .map(|output| {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(
+                    encoder,
+                    status = ?output.status,
+                    error = %stderr.trim(),
+                    "硬件编码器单帧探测失败"
+                );
+            }
+            output.status.success()
+        })
+        .unwrap_or_else(|error| {
+            tracing::debug!(encoder, %error, "硬件编码器单帧探测进程启动失败");
+            false
+        })
+}
+
 impl HwAccelCapabilities {
-    /// 检测所有可用的硬件编码器（调用 `ffmpeg -encoders` 并解析输出）
+    /// 检测所有可用的硬件编码器。
+    ///
+    /// `ffmpeg -encoders` 只表示当前 FFmpeg 构建包含该编码器，并不表示当前 GPU
+    /// 支持它。对每个候选编码器实际执行一次单帧编码，避免把不支持的 AMF/NVENC
+    /// 编码器误判为可用。
     pub fn detect(ffmpeg_path: &str) -> anyhow::Result<Self> {
         let output = Command::new(ffmpeg_path)
             .args(["-encoders", "-hide_banner"])
@@ -91,33 +134,34 @@ impl HwAccelCapabilities {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut caps = Self::default();
-
+        let mut candidates = Vec::new();
         for line in stdout.lines() {
-            let line = line.trim();
-            // 跳过标题行和分隔符
-            if line.starts_with("------") || line.starts_with("Encoders:") {
-                continue;
-            }
-            // 编码器行格式: " V..... h264_nvenc           NVIDIA NVENC H.264 encoder"
-            // 第一列是类型标志，第二列是编码器名称
-            let parts: Vec<&str> = line.split_whitespace().collect();
+            let parts: Vec<&str> = line.trim().split_whitespace().collect();
             if parts.len() < 2 {
                 continue;
             }
             let encoder_name = parts[1];
+            if (encoder_name.contains("h264")
+                || encoder_name.contains("hevc")
+                || encoder_name.contains("h265")
+                || encoder_name.contains("av1"))
+                && (encoder_name.contains("nvenc")
+                    || encoder_name.contains("qsv")
+                    || encoder_name.contains("amf"))
+            {
+                candidates.push(encoder_name.to_string());
+            }
+        }
 
-            if encoder_name.contains("h264") {
-                if encoder_name.contains("nvenc") || encoder_name.contains("qsv") || encoder_name.contains("amf") {
-                    caps.h264.push(encoder_name.to_string());
-                }
-            } else if encoder_name.contains("hevc") || encoder_name.contains("h265") {
-                if encoder_name.contains("nvenc") || encoder_name.contains("qsv") || encoder_name.contains("amf") {
-                    caps.h265.push(encoder_name.to_string());
-                }
-            } else if encoder_name.contains("av1") {
-                if encoder_name.contains("nvenc") || encoder_name.contains("qsv") || encoder_name.contains("amf") {
-                    caps.av1.push(encoder_name.to_string());
+        let mut caps = Self::default();
+        for encoder in candidates {
+            if probe_encoder(ffmpeg_path, &encoder) {
+                if encoder.contains("h264") {
+                    caps.h264.push(encoder);
+                } else if encoder.contains("hevc") || encoder.contains("h265") {
+                    caps.h265.push(encoder);
+                } else if encoder.contains("av1") {
+                    caps.av1.push(encoder);
                 }
             }
         }
