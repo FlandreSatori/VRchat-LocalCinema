@@ -31,6 +31,7 @@ use tauri_plugin_autostart::ManagerExt;
 
 use commands::AppState;
 use http_server::HttpServer;
+use hwaccel::HwAccelCapabilities;
 use settings::CloseBehavior;
 
 /// 统一退出入口：停掉后台服务后强制结束进程。
@@ -207,7 +208,8 @@ pub fn run() {
                 traffic_stats.clone(),
             );
 
-            let hwaccel_caps = components::detect_hwaccel(&settings_fixed, &paths);
+            let (hwaccel_caps_tx, hwaccel_caps_rx) =
+                tokio::sync::watch::channel::<Option<Arc<HwAccelCapabilities>>>(None);
 
             let state = AppState {
                 paths: paths.clone(),
@@ -226,13 +228,29 @@ pub fn run() {
                 frp: frp::FrpManager::new(),
                 convert_queue: convert_queue::ConvertQueue::default(),
                 hls_jobs: RwLock::new(std::collections::HashSet::new()),
-                hwaccel_caps,
+                hwaccel_caps: hwaccel_caps_rx,
             };
             app.manage(state);
             app.manage(estimate::EstimateState::default());
 
-            // 转码队列执行器
+            // 转码队列执行器；硬件探测未完成前，worker 保持队列任务为 Queued。
             commands::spawn_convert_worker(app.handle().clone());
+
+            // 每次启动重新探测硬件编码能力。同步 FFmpeg 调用放到 blocking 线程，
+            // 不阻塞 HTTP 服务、媒体读取和其他异步启动流程。
+            let settings_for_probe = settings_fixed.clone();
+            let paths_for_probe = paths.clone();
+            tauri::async_runtime::spawn(async move {
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    components::detect_hwaccel(&settings_for_probe, &paths_for_probe)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("硬件编码器探测后台任务失败: {}", e);
+                    HwAccelCapabilities::default()
+                });
+                let _ = hwaccel_caps_tx.send(Some(Arc::new(result)));
+            });
 
             // 自动启动 HTTP 服务
             let handle = app.handle().clone();

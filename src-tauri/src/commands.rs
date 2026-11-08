@@ -54,13 +54,25 @@ pub struct AppState {
     pub convert_queue: crate::convert_queue::ConvertQueue,
     /// 正在进行的 HLS 转码任务（媒体 id）
     pub hls_jobs: RwLock<HashSet<String>>,
-    /// 硬件编码器能力探测结果（启动时探测，转码时使用）
-    pub hwaccel_caps: HwAccelCapabilities,
+    /// 硬件编码器能力探测结果；启动期间未完成时，转码入口等待此结果。
+    pub hwaccel_caps: tokio::sync::watch::Receiver<Option<Arc<HwAccelCapabilities>>>,
 }
 
 impl AppState {
     pub fn current_settings(&self) -> Settings {
         self.settings.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    async fn wait_for_hwaccel_caps(&self) -> Arc<HwAccelCapabilities> {
+        let mut receiver = self.hwaccel_caps.clone();
+        loop {
+            if let Some(caps) = receiver.borrow_and_update().clone() {
+                return caps;
+            }
+            if receiver.changed().await.is_err() {
+                return Arc::new(HwAccelCapabilities::default());
+            }
+        }
     }
 
     fn emit_status(app: &AppHandle, server: &HttpServer) {
@@ -3055,6 +3067,7 @@ async fn run_queued_transcode(
     let part = transcode_part_path(&dest);
 
     let (options, subtitle_file) = prepare_transcode_options(state, &ffmpeg, &item, &task.options, cancel.clone()).await;
+    let hwaccel_caps = state.wait_for_hwaccel_caps().await;
     let encoder_pref = state.current_settings().encoder_preference.unwrap_or_default();
     let args = crate::transcode::build_args(
         &item.file_path,
@@ -3063,7 +3076,7 @@ async fn run_queued_transcode(
         subtitle_file.as_deref(),
         None,
         None,
-        &state.hwaccel_caps,
+        &hwaccel_caps,
         encoder_pref,
         item.width.zip(item.height),
     );
@@ -3265,6 +3278,7 @@ async fn transcode_segment(
 ) -> AppResult<MediaItem> {
     let part = transcode_part_path(dest);
     let (options, subtitle_file) = prepare_transcode_options(state, ffmpeg, source, &task.options, cancel.clone()).await;
+    let hwaccel_caps = state.wait_for_hwaccel_caps().await;
     let encoder_pref = state.current_settings().encoder_preference.unwrap_or_default();
     let mut args = crate::transcode::build_args(
         &source.file_path,
@@ -3273,7 +3287,7 @@ async fn transcode_segment(
         subtitle_file.as_deref(),
         start_sec,
         dur_sec,
-        &state.hwaccel_caps,
+        &hwaccel_caps,
         encoder_pref,
         source.width.zip(source.height),
     );
@@ -3495,10 +3509,12 @@ async fn run_queued_segment_transcode(
 pub fn spawn_convert_worker(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             let Some(state) = app.try_state::<AppState>() else {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                 continue;
             };
+            state.wait_for_hwaccel_caps().await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             let Some((task, cancel_flag)) = state.convert_queue.take_next() else {
                 continue;
             };
@@ -3585,6 +3601,7 @@ pub async fn make_hls(
     }
 
     let result = (|| async {
+        state.wait_for_hwaccel_caps().await;
         let item = get_item_checked(&state, &id)?;
         let settings = state.current_settings();
         let (ffmpeg, _) = components::ffmpeg_binary(&settings, &state.paths);

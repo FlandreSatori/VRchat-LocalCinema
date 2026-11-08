@@ -7,6 +7,12 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// 用户在设置中选择的编码器偏好
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -81,7 +87,10 @@ pub struct HwAccelCapabilities {
 }
 
 fn probe_encoder(ffmpeg_path: &str, encoder: &str) -> bool {
-    Command::new(ffmpeg_path)
+    let mut command = Command::new(ffmpeg_path);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
         .args([
             "-hide_banner",
             "-loglevel",
@@ -125,7 +134,10 @@ impl HwAccelCapabilities {
     /// 支持它。对每个候选编码器实际执行一次单帧编码，避免把不支持的 AMF/NVENC
     /// 编码器误判为可用。
     pub fn detect(ffmpeg_path: &str) -> anyhow::Result<Self> {
-        let output = Command::new(ffmpeg_path)
+        let mut command = Command::new(ffmpeg_path);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let output = command
             .args(["-encoders", "-hide_banner"])
             .output()?;
 
